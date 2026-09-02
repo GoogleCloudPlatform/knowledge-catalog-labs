@@ -59,9 +59,12 @@ DEFAULT_DATASET_ID = os.environ.get(
     "BIGQUERY_DATASET_ID", "retail_synthetic_data"
 )
 
-KNOWLEDGE_JSON_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "../knowledge_insights.json")
-)
+_candidate_paths = [
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../../knowledge_insights.json")),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../knowledge_insights.json")),
+    os.path.abspath("knowledge_insights.json"),
+]
+KNOWLEDGE_JSON_PATH = next((p for p in _candidate_paths if os.path.exists(p)), _candidate_paths[0])
 
 
 def handle_refresh_lineage_cache():

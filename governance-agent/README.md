@@ -61,27 +61,16 @@ uv run python -m metadata_propagation.ui.gradio_app
 - **Settings**: Toggle OAuth/ADC modes for specific user actions.
 
 ### 2. 🐳 Deployment (Docker & Cloud Run)
-For production or headless environments, the app is container-ready.
 
-**Local Docker**:
-```bash
-# 1. Build
-docker build -t steward-app .
+For all deployment steps (local Docker and production Cloud Run), please refer to the comprehensive **[Deployment Guide](DEPLOYMENT_GUIDE.md)**.
 
-# 2. Run (with local GCP credentials)
-docker run -p 7860:7860 \
-  --env-file .env \
-  -v ~/.config/gcloud:/root/.config/gcloud \
-  -e GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json \
-  steward-app
-```
-
-**Cloud Run Deployment**:
-```bash
-chmod +x deploy.sh
-./deploy.sh
-```
-*Note: Ensure your Service URL is added to the Authorized Redirect URIs in your GCP OAuth Client credentials.*
+Key sections covered:
+* **[Local Docker Run](DEPLOYMENT_GUIDE.md#-local-docker-run)**: Building and testing the container locally.
+* **[Automated Cloud Run Deployment (`deploy.sh`)](DEPLOYMENT_GUIDE.md#method-1-automated-script-deploysh--recommended)**: Automated Artifact Registry and Cloud Run setup.
+* **[Direct Source Deploy (`gcloud run deploy --source`)](DEPLOYMENT_GUIDE.md#method-2-direct-source-deploy-gcloud-run-deploy---source)**: Build and deploy via Cloud Build without requiring Docker locally.
+* **[Service Account IAM Roles](DEPLOYMENT_GUIDE.md#2-configure-cloud-run-service-account--iam-roles)**: Required permissions for BigQuery, Dataplex, Lineage, and Vertex AI.
+* **[Authentication & OAuth Modes](DEPLOYMENT_GUIDE.md#-authentication-modes)**: Running with Service Account ADC (`BYPASS_OAUTH=true`) vs Google OAuth (see also [OAUTH_SETUP_GUIDE.md](OAUTH_SETUP_GUIDE.md)).
+* **[Production Sizing & Troubleshooting](DEPLOYMENT_GUIDE.md#️-production-sizing--best-practices)**: Sizing recommendations and troubleshooting common deployment errors.
 
 ### 3. Steward CLI (Headless)
 The CLI is designed for automation and quick scans.
@@ -142,7 +131,6 @@ When using the `--document` flag with the `apply`, `policy-propagate`, or `gloss
     ```bash
     uv run python -m metadata_propagation.steward_cli apply --dataset retail_syn_data --table transactions --context-mode datastore --datastore-id my-datastore-id
     ```
-```
 
 ### 3. Data Integration Scripts
 - **Generate Data**: `uv run python -m metadata_propagation.data_generation.generate_data` (Creates tables + lineage).
