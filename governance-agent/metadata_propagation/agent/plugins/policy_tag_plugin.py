@@ -320,15 +320,25 @@ class PolicyTagPlugin(BasePlugin):
                     resolved_tag = allowed_tags_map.get(
                         doc_rec["Proposed Tag"], doc_rec["Proposed Tag"]
                     )
+                    if resolved_tag and resolved_tag.startswith("projects/"):
+                        reader_count = self.get_policy_tag_reader_count(
+                            resolved_tag
+                        )
+                        masking_count = self.get_policy_tag_data_policy_count(
+                            resolved_tag
+                        )
+                        access_summary = f"{reader_count} Readers, {masking_count} Masking Policies"
+                    else:
+                        access_summary = "N/A (Tag not in taxonomy)"
                     col_recs.append(
                         {
                             "Target Column": field.name,
-                            "Source Table": "Document",
+                            "Source Table": f"Document ({context_mode.upper()})",
                             "Source Column": "N/A",
                             "Policy Tags": resolved_tag,
                             "Recommendation": "Apply (Found in Doc)",
                             "Logic": "Explicitly labeled in document",
-                            "Access Summary": "N/A",
+                            "Access Summary": access_summary,
                         }
                     )
                 elif context_mode == "datastore":

@@ -638,6 +638,8 @@ class GlossaryPlugin(BasePlugin):
                                     {
                                         "Column": col_name,
                                         "Suggested Term": term["display_name"],
+                                        "Term Status": "✅ Existing in Glossary",
+                                        "Source": "🔗 Dataplex Lineage",
                                         "Confidence": final_confidence,
                                         "Rationale": f"Propagated via Lineage from {src_entity} (Verified Dataplex Catalog Link)",
                                         "Term ID": term_id,
@@ -677,25 +679,52 @@ class GlossaryPlugin(BasePlugin):
                             f"  [FOUND RAG] Glossary recommendation found for '{col_name}'."
                         )
 
-                    term_display = doc_rec["Proposed Term"]
+                    raw_term = doc_rec["Proposed Term"]
+                    clean_display = str(raw_term).strip().strip("'\"")
+                    rationale = doc_rec["Rationale"]
+
+                    # 1. Exact case-insensitive match against Dataplex terms
                     matched_term = next(
                         (
                             t
                             for t in all_terms
-                            if t["display_name"] == term_display
+                            if t["display_name"].strip().lower()
+                            == clean_display.lower()
                         ),
                         None,
                     )
-                    term_id = (
-                        matched_term["name"] if matched_term else term_display
-                    )
+
+                    # 2. Semantic/Lexical fallback match against Dataplex terms if document term wording differs
+                    if not matched_term and all_terms:
+                        sugs = self._similarity_engine.get_ranked_suggestions(
+                            {"name": col_name, "description": clean_display},
+                            all_terms,
+                        )
+                        if sugs and sugs[0]["confidence"] >= 0.45:
+                            best_sug = sugs[0]
+                            matched_term = {
+                                "name": best_sug["term_name"],
+                                "display_name": best_sug["display_name"],
+                            }
+                            rationale += f" (Mapped doc term '{clean_display}' -> '{best_sug['display_name']}')"
+
+                    if matched_term:
+                        term_display = matched_term["display_name"]
+                        term_status = "✅ Existing in Glossary"
+                        term_id = matched_term["name"]
+                    else:
+                        term_display = clean_display
+                        term_status = "✨ New (Auto-Create)"
+                        term_id = "(Auto-generated on Apply)"
 
                     col_recs.append(
                         {
                             "Column": col_name,
                             "Suggested Term": term_display,
+                            "Term Status": term_status,
+                            "Source": f"📄 Document ({context_mode.upper()})",
                             "Confidence": doc_rec["Confidence"],
-                            "Rationale": doc_rec["Rationale"],
+                            "Rationale": rationale,
                             "Term ID": term_id,
                         }
                     )
@@ -738,8 +767,11 @@ class GlossaryPlugin(BasePlugin):
                     {
                         "Column": col_name,
                         "Suggested Term": sug["display_name"],
+                        "Term Status": "✅ Existing in Glossary",
+                        "Source": "🧠 Semantic Match",
                         "Confidence": sug["confidence"],
-                        "Rationale": f"Lexical: {sug['signals']['lexical']}, Semantic: {sug['signals']['semantic']}",
+                        "Rationale": sug.get("rationale")
+                        or f"Lexical: {sug['signals']['lexical']}, Semantic: {sug['signals']['semantic']}",
                         "Term ID": term_id,
                     }
                 )
@@ -821,12 +853,91 @@ class GlossaryPlugin(BasePlugin):
         )
         return None
 
+    def _ensure_term_resource_name(
+        self, term_id_or_display: str, column_name: str, term_display: str = ""
+    ) -> tuple[str, bool, str]:
+        """Ensures term_id_or_display is a valid Dataplex resource path, resolving or creating the term if needed.
+        Returns (resource_name, was_auto_created, display_name).
+        """
+        import re
+
+        if term_id_or_display and term_id_or_display.startswith("projects/"):
+            return (
+                term_id_or_display,
+                False,
+                term_display or term_id_or_display.split("/")[-1],
+            )
+
+        target_name = (
+            term_display
+            if (
+                not term_id_or_display
+                or term_id_or_display == "(Auto-generated on Apply)"
+            )
+            else term_id_or_display
+        )
+        clean_display = (
+            re.sub(r"^(✨\s*\[NEW\]\s*|NEW_TERM:)", "", str(target_name))
+            .strip()
+            .strip("'\"")
+        )
+        all_terms = self._glossary_client.get_all_terms()
+
+        # 1. Exact case-insensitive match
+        for t in all_terms:
+            if t["display_name"].strip().lower() == clean_display.lower():
+                return t["name"], False, t["display_name"]
+
+        # 2. Similarity fallback
+        if all_terms and self._similarity_engine:
+            sugs = self._similarity_engine.get_ranked_suggestions(
+                {"name": column_name, "description": clean_display}, all_terms
+            )
+            if sugs and sugs[0]["confidence"] >= 0.45:
+                return sugs[0]["term_name"], False, sugs[0]["display_name"]
+
+        # 3. Auto-create missing term in the first available glossary
+        glossaries = self._glossary_client.list_glossaries()
+        if glossaries:
+            glossary_name = glossaries[0]["name"]
+            term_slug = (
+                re.sub(r"[^a-z0-9-]", "-", clean_display.lower()).strip("-")[
+                    :60
+                ]
+            )
+            try:
+                bg_client = dataplex_v1.BusinessGlossaryServiceClient(
+                    credentials=get_credentials(self.project_id)
+                )
+                term = dataplex_v1.GlossaryTerm(
+                    display_name=clean_display,
+                    description=f"Auto-created glossary term for column {column_name}",
+                    parent=glossary_name,
+                )
+                created = bg_client.create_glossary_term(
+                    parent=glossary_name, term=term, term_id=term_slug
+                )
+                logger.info(
+                    f"Auto-created missing Dataplex Glossary Term: {created.name}"
+                )
+                return created.name, True, clean_display
+            except Exception as e:
+                # If already exists, return the deterministic path
+                candidate_path = f"{glossary_name}/terms/{term_slug}"
+                logger.info(
+                    f"Using glossary term path: {candidate_path} ({e})"
+                )
+                return candidate_path, False, clean_display
+
+        return term_id_or_display, False, clean_display
+
     def apply_terms(
         self, dataset_id: str, table_id: str, updates: list[dict[str, str]]
-    ):
+    ) -> dict[str, Any]:
         """
         Applies glossary terms to columns using native Dataplex EntryLinks.
         updates: List of {'column': str, 'term_id': str, 'term_display': str}
+        Returns dict with applied count and list of newly created terms.
         """
         self._ensure_initialized()
         client = dataplex_v1.CatalogServiceClient(
@@ -847,17 +958,26 @@ class GlossaryPlugin(BasePlugin):
             "projects/dataplex-types/locations/global/entryLinkTypes/definition"
         )
 
+        created_terms = []
+        applied_count = 0
+
         for up in updates:
             column = up["column"]
-            term_resource_name = up[
-                "term_id"
-            ]  # This is the Business Glossary resource name
+            raw_term_id = up["term_id"]
+            term_display = up.get("term_display", "")
+            term_resource_name, was_created, clean_name = (
+                self._ensure_term_resource_name(
+                    raw_term_id, column, term_display=term_display
+                )
+            )
+            if was_created and clean_name not in created_terms:
+                created_terms.append(clean_name)
 
             # Resolve to Catalog Entry Name
             term_entry_name = self._resolve_term_entry_name(term_resource_name)
             if not term_entry_name:
                 logger.error(
-                    f"Skipping {column}: Could not resolve glossary term to Catalog Entry."
+                    f"Skipping {column}: Could not resolve glossary term to Catalog Entry ({term_resource_name})."
                 )
                 continue
 
@@ -896,11 +1016,13 @@ class GlossaryPlugin(BasePlugin):
                         entry_link_id=entry_link_id,
                         entry_link=link,
                     )
+                    applied_count += 1
                     logger.info(
                         f"Created native link for {column} -> {up['term_display']} in @bigquery group"
                     )
                 except Exception as e:
                     if "already exists" in str(e).lower():
+                        applied_count += 1
                         logger.info(
                             f"Link for {column} already exists, skipping."
                         )
@@ -911,6 +1033,8 @@ class GlossaryPlugin(BasePlugin):
                 logger.error(f"Failed to create EntryLink for {column}: {e}")
                 # We continue with other updates even if one fails
                 continue
+
+        return {"applied_count": applied_count, "created_terms": created_terms}
 
     def scan_for_missing_glossary_terms(self, dataset_id: str) -> pd.DataFrame:
         """

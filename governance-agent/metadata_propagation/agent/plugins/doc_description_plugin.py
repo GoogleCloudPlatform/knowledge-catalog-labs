@@ -69,31 +69,35 @@ class DocDescriptionPlugin(BasePlugin):
                 raise FileNotFoundError(f"Document file not found: '{path}'")
 
         if self.mode == "rag":
-            for path in doc_path:
-                self._rag_engine.load_document(path, force_refresh=force_refresh)
+            self._rag_engine.load_documents_parallel(
+                doc_path, force_refresh=force_refresh
+            )
         elif self.mode == "direct":
             self.full_text = ""
             import os
+            from concurrent.futures import ThreadPoolExecutor
 
-            for path in doc_path:
+            def _read_or_extract(path: str) -> str:
                 ext = os.path.splitext(path)[1].lower()
                 if ext in [".txt", ".md"]:
                     with open(path, encoding="utf-8") as f:
-                        content = f.read()
-                        if content.strip():
-                            self.full_text += content + "\n"
-
+                        return f.read()
                 elif ext in [".pdf", ".xlsx", ".png", ".jpg", ".jpeg"]:
-                    # Use RAGEngine to extract text via Gemini
-                    extracted = self._rag_engine._extract_text_via_gemini(path)
-                    if extracted.strip():
-                        self.full_text += extracted + "\n"
+                    return self._rag_engine._extract_text_via_gemini(
+                        path, force_refresh=force_refresh
+                    )
                 elif ext == ".docx":
                     raise ValueError(
                         "DOCX files are not supported directly by Gemini in this setup. Please convert to PDF or TXT first."
                     )
-                else:
-                    raise ValueError(f"Unsupported file extension: {ext}")
+                return ""
+
+            with ThreadPoolExecutor(max_workers=min(len(doc_path), 5)) as executor:
+                extracted_texts = list(executor.map(_read_or_extract, doc_path))
+
+            for content in extracted_texts:
+                if content and content.strip():
+                    self.full_text += content + "\n"
 
         elif self.mode == "datastore" and datastore_id:
             # Fail Fast: Verify DataStore exists

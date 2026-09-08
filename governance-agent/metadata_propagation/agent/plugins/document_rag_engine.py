@@ -57,6 +57,70 @@ class DocumentRAGEngine:
                 logger.error(f"Failed to initialize GenAI Client: {e}")
         return self._client
 
+    def load_documents_parallel(
+        self,
+        file_paths: list[str],
+        chunk_size: int = 1000,
+        chunk_overlap: int = 200,
+        force_refresh: bool = False,
+    ):
+        """Loads and extracts multiple documents concurrently in parallel."""
+        if not file_paths:
+            return
+
+        if len(file_paths) == 1:
+            self.load_document(
+                file_paths[0],
+                chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                force_refresh=force_refresh,
+            )
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        logger.info(
+            f"Extracting {len(file_paths)} documents in parallel via ThreadPoolExecutor..."
+        )
+
+        def _extract_single(path: str) -> tuple[str, str]:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in [".txt", ".pdf", ".md", ".xlsx", ".png", ".jpg", ".jpeg"]:
+                return path, self._extract_text_via_gemini(
+                    path, force_refresh=force_refresh
+                )
+            elif ext == ".docx":
+                raise ValueError(
+                    "DOCX files are not supported directly by Gemini in this setup. Please convert to PDF or TXT first."
+                )
+            else:
+                raise ValueError(f"Unsupported file extension: {ext}")
+
+        all_new_chunks = []
+        with ThreadPoolExecutor(max_workers=min(len(file_paths), 5)) as executor:
+            extracted_results = list(executor.map(_extract_single, file_paths))
+
+        for path, text in extracted_results:
+            if not text:
+                logger.error(f"No text extracted from document: {path}")
+                continue
+            new_chunks = self._chunk_text(text, chunk_size, chunk_overlap)
+            all_new_chunks.extend(new_chunks)
+            logger.info(
+                f"Created {len(new_chunks)} chunks from document '{os.path.basename(path)}'."
+            )
+
+        self.chunks.extend(all_new_chunks)
+        if all_new_chunks:
+            logger.info(
+                f"Generating embeddings for {len(all_new_chunks)} total chunks..."
+            )
+            new_embeddings = self.embedder.get_embeddings(
+                all_new_chunks, task_type="RETRIEVAL_DOCUMENT"
+            )
+            self.embeddings.extend(new_embeddings)
+            logger.info("Embeddings generated successfully.")
+
     def load_document(
         self, file_path: str, chunk_size: int = 1000, chunk_overlap: int = 200, force_refresh: bool = False
     ):
@@ -103,6 +167,7 @@ class DocumentRAGEngine:
     def _extract_text_via_gemini(self, file_path: str, force_refresh: bool = False) -> str:
         """Uses Gemini to extract text and format as Markdown, with hash-based caching."""
         import hashlib
+        import re
 
         try:
             with open(file_path, "rb") as f:
@@ -131,13 +196,23 @@ class DocumentRAGEngine:
                 except Exception:
                     pass
 
-        base_name = os.path.basename(file_path)
-        cached_path = os.path.join(cache_dir, f"{base_name}.{file_hash}.md")
+        raw_base = os.path.basename(file_path)
+        clean_base = re.sub(r"^[0-9a-f]{8}_", "", raw_base)
+        cached_path = os.path.join(cache_dir, f"{clean_base}.{file_hash}.md")
 
-        if not force_refresh and os.path.exists(cached_path):
-            logger.info(f"Found cached Markdown file: {cached_path}")
-            with open(cached_path, encoding="utf-8") as f:
-                return f.read()
+        # Check clean_base cache path or any existing cache file with the same MD5 hash
+        if not force_refresh:
+            if os.path.exists(cached_path):
+                logger.info(f"Found cached Markdown file: {cached_path}")
+                with open(cached_path, encoding="utf-8") as f:
+                    return f.read()
+            # Also check if any file ending with .{file_hash}.md exists in cache_dir
+            for c_file in os.listdir(cache_dir):
+                if c_file.endswith(f".{file_hash}.md"):
+                    found_c_path = os.path.join(cache_dir, c_file)
+                    logger.info(f"Found cached Markdown file by hash: {found_c_path}")
+                    with open(found_c_path, encoding="utf-8") as f:
+                        return f.read()
 
         logger.info(
             f"Extracting structured governance data via Gemini: {file_path}"

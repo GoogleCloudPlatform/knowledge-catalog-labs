@@ -4,7 +4,12 @@ import os
 os.environ["GRPC_DNS_RESOLVER"] = "native"
 os.environ["GRPC_IPv6"] = "off"
 
+import html
 import logging
+import re
+import shutil
+import tempfile
+import uuid
 
 import fastapi
 import gradio as gr
@@ -52,8 +57,21 @@ from metadata_propagation.dataplex_integration.dq_propagation import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Fetch Project ID from environment or default
-DEFAULT_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "governance-agent")
+# Fetch Project ID from environment or ADC default
+def _resolve_default_project():
+    if os.environ.get("GOOGLE_CLOUD_PROJECT"):
+        return os.environ["GOOGLE_CLOUD_PROJECT"]
+    try:
+        import google.auth
+        _, proj = google.auth.default()
+        if proj:
+            return proj
+    except Exception:
+        pass
+    return "data-governance-agent-dev"
+
+
+DEFAULT_PROJECT_ID = _resolve_default_project()
 DEFAULT_LOCATION = "europe-west1"
 DEFAULT_DATASET_ID = os.environ.get(
     "BIGQUERY_DATASET_ID", "retail_synthetic_data"
@@ -65,6 +83,196 @@ _candidate_paths = [
     os.path.abspath("knowledge_insights.json"),
 ]
 KNOWLEDGE_JSON_PATH = next((p for p in _candidate_paths if os.path.exists(p)), _candidate_paths[0])
+
+# --- Unstructured Document Context Settings & Helpers ---
+ALLOWED_DOC_EXTENSIONS = {".pdf", ".txt", ".md", ".xlsx", ".png", ".jpg", ".jpeg"}
+MAX_DOC_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB per file limit
+UPLOAD_DIR = os.path.join(tempfile.gettempdir(), "governance_agent_uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+try:
+    os.chmod(UPLOAD_DIR, 0o700)
+except Exception:
+    pass
+
+
+def format_file_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    else:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+
+
+def render_header_doc_badge(docs_state: list, selected_labels: list, context_mode: str = "rag") -> str:
+    docs_state = docs_state or []
+    selected_labels = selected_labels or []
+    total = len(docs_state)
+    active_docs = [d for d in docs_state if d.get("label") in selected_labels]
+    active_count = len(active_docs)
+
+    if total == 0:
+        return (
+            "<div class='gcp-doc-badge empty'>"
+            "📄 <b>Global Context Documents:</b> No unstructured documents uploaded. "
+            "Upload PDFs, Spreadsheets, or Markdown files in the header below to enrich AI context across all tabs."
+            "</div>"
+        )
+
+    safe_names = [f"<code>{html.escape(d.get('name', ''))}</code>" for d in active_docs]
+    names_str = ", ".join(safe_names[:4])
+    if len(safe_names) > 4:
+        names_str += f" (+{len(safe_names) - 4} more)"
+
+    status_class = "active" if active_count > 0 else "inactive"
+    mode_badge = f"<span class='gcp-mode-chip'>{html.escape(str(context_mode).upper())}</span>"
+
+    if active_count > 0:
+        return (
+            f"<div class='gcp-doc-badge {status_class}'>"
+            f"🟢 <b>Global Context Documents Active ({active_count}/{total} selected)</b> "
+            f"{mode_badge} — Active: {names_str}"
+            f"</div>"
+        )
+    else:
+        return (
+            f"<div class='gcp-doc-badge {status_class}'>"
+            f"⚪ <b>Global Context Documents ({total} uploaded, 0 selected)</b> "
+            f"— Check documents below to include them as context for the Agent."
+            f"</div>"
+        )
+
+
+def handle_doc_uploads(uploaded_files, current_docs_state, current_selected_labels, context_mode):
+    current_docs_state = list(current_docs_state or [])
+    current_selected_labels = list(current_selected_labels or [])
+
+    if not uploaded_files:
+        choices = [d["label"] for d in current_docs_state]
+        return (
+            current_docs_state,
+            gr.update(choices=choices, value=current_selected_labels),
+            render_header_doc_badge(current_docs_state, current_selected_labels, context_mode),
+        )
+
+    if not isinstance(uploaded_files, list):
+        uploaded_files = [uploaded_files]
+
+    for file_obj in uploaded_files:
+        file_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+        if not os.path.exists(file_path):
+            continue
+
+        orig_name = os.path.basename(file_path)
+        ext = os.path.splitext(orig_name)[1].lower()
+        if ext not in ALLOWED_DOC_EXTENSIONS:
+            gr.Warning(f"Skipped '{orig_name}': Unsupported extension '{ext}'.")
+            continue
+
+        size_bytes = os.path.getsize(file_path)
+        if size_bytes > MAX_DOC_SIZE_BYTES:
+            gr.Warning(f"Skipped '{orig_name}': File exceeds 20 MB limit.")
+            continue
+
+        clean_name = re.sub(r"[^a-zA-Z0-9._-]", "_", orig_name)
+        size_str = format_file_size(size_bytes)
+        label = f"{clean_name} ({size_str})"
+
+        safe_filename = f"{uuid.uuid4().hex[:8]}_{clean_name}"
+        dest_path = os.path.join(UPLOAD_DIR, safe_filename)
+        shutil.copy2(file_path, dest_path)
+        try:
+            os.chmod(dest_path, 0o600)
+        except Exception:
+            pass
+
+        replaced = False
+        for idx, existing in enumerate(current_docs_state):
+            if existing["name"] == clean_name:
+                old_label = existing["label"]
+                current_docs_state[idx] = {
+                    "label": label,
+                    "name": clean_name,
+                    "path": dest_path,
+                    "size": size_str,
+                }
+                if old_label in current_selected_labels:
+                    current_selected_labels.remove(old_label)
+                if label not in current_selected_labels:
+                    current_selected_labels.append(label)
+                replaced = True
+                break
+
+        if not replaced:
+            current_docs_state.append(
+                {
+                    "label": label,
+                    "name": clean_name,
+                    "path": dest_path,
+                    "size": size_str,
+                }
+            )
+            if label not in current_selected_labels:
+                current_selected_labels.append(label)
+
+    choices = [d["label"] for d in current_docs_state]
+    has_selected = bool(current_selected_labels)
+    return (
+        current_docs_state,
+        gr.update(choices=choices, value=current_selected_labels),
+        render_header_doc_badge(current_docs_state, current_selected_labels, context_mode),
+        gr.update(interactive=has_selected, value=has_selected),
+    )
+
+
+def update_doc_selection_badge(docs_state, selected_labels, context_mode, current_fallback_val=False):
+    has_selected = bool(selected_labels)
+    return (
+        render_header_doc_badge(docs_state, selected_labels, context_mode),
+        gr.update(interactive=has_selected, value=(current_fallback_val if has_selected else False)),
+    )
+
+
+def select_all_docs(docs_state, context_mode):
+    docs_state = docs_state or []
+    all_labels = [d["label"] for d in docs_state]
+    has_selected = bool(all_labels)
+    return (
+        gr.update(value=all_labels),
+        render_header_doc_badge(docs_state, all_labels, context_mode),
+        gr.update(interactive=has_selected, value=has_selected),
+    )
+
+
+def deselect_all_docs(docs_state, context_mode):
+    docs_state = docs_state or []
+    return (
+        gr.update(value=[]),
+        render_header_doc_badge(docs_state, [], context_mode),
+        gr.update(interactive=False, value=False),
+    )
+
+
+def clear_all_docs(context_mode):
+    return (
+        [],
+        gr.update(choices=[], value=[]),
+        render_header_doc_badge([], [], context_mode),
+        None,
+        gr.update(interactive=False, value=False),
+    )
+
+
+def get_active_doc_paths(docs_state: list | None, selected_labels: list | None) -> list[str] | None:
+    if not docs_state or not selected_labels:
+        return None
+    selected_set = set(selected_labels)
+    active_paths = [
+        d["path"]
+        for d in docs_state
+        if d.get("label") in selected_set and d.get("path") and os.path.exists(d["path"])
+    ]
+    return active_paths if active_paths else None
 
 
 def handle_refresh_lineage_cache():
@@ -82,8 +290,19 @@ def get_plugin(project_id, location):
 
 
 def get_token_from_session(request: gr.Request):
-    if request:
-        return request.session.get("google_token", {}).get("access_token")
+    if os.environ.get("BYPASS_OAUTH") == "true":
+        return None
+    if request and hasattr(request, "session"):
+        token_dict = request.session.get("google_token")
+        if isinstance(token_dict, dict):
+            import time
+
+            expires_at = token_dict.get("expires_at")
+            if expires_at and time.time() > (expires_at - 60) and not token_dict.get("refresh_token"):
+                # Remove expired token so ADC is used seamlessly
+                request.session.pop("google_token", None)
+                return None
+            return token_dict
     return None
 
 
@@ -325,10 +544,15 @@ input, textarea, select, .gr-input, .gr-box, .gr-textbox input, .gr-textbox text
     border-color: var(--gcp-border) !important;
 }
 
+.gr-table, .gr-table-container, table, .dataframe {
+    width: 100% !important;
+}
+
 th, thead th, .gr-table thead th, .dataframe thead th, 
 .gr-table th, .dataframe th, [class*="thead"] th {
     background-color: var(--gcp-header-bg) !important;
     background: var(--gcp-header-bg) !important;
+    white-space: nowrap !important;
     color: var(--gcp-text) !important;
     font-weight: 500 !important;
     text-transform: uppercase !important;
@@ -423,19 +647,75 @@ tr, .gr-table tr, .dataframe tr {
     font-weight: 500 !important;
     text-transform: uppercase !important;
 }
+
+.gcp-doc-badge {
+    border-radius: 6px !important;
+    padding: 10px 14px !important;
+    font-size: 13px !important;
+    margin-bottom: 10px !important;
+    border: 1px solid var(--gcp-border) !important;
+    background-color: var(--gcp-card-bg) !important;
+}
+.gcp-doc-badge.active {
+    border-left: 4px solid #1e8e3e !important;
+    background-color: rgba(30, 142, 62, 0.06) !important;
+}
+.gcp-doc-badge.inactive {
+    border-left: 4px solid #f9ab00 !important;
+    background-color: rgba(249, 171, 0, 0.06) !important;
+}
+.gcp-doc-badge.empty {
+    border-left: 4px solid var(--gcp-primary) !important;
+    background-color: var(--gcp-secondary-bg) !important;
+}
+.gcp-mode-chip {
+    background-color: var(--gcp-primary) !important;
+    color: #ffffff !important;
+    font-size: 11px !important;
+    font-weight: 600 !important;
+    padding: 2px 6px !important;
+    border-radius: 4px !important;
+    margin: 0 4px !important;
+}
 </style>
 """
 
 
 def analyze_and_preview(
-    project_id, location, dataset_id, target_table, request: gr.Request = None
+    project_id,
+    location,
+    dataset_id,
+    target_table,
+    docs_state=None,
+    selected_doc_labels=None,
+    context_mode="rag",
+    force_refresh=False,
+    fallback_to_llm=True,
+    request: gr.Request = None,
 ):
     token = get_token_from_session(request)
     set_oauth_token(token)
     try:
         plugin = get_plugin(project_id, location)
         summary = plugin.get_lineage_summary(dataset_id, target_table)
-        df = plugin.preview_propagation(dataset_id, target_table)
+        active_doc_paths = get_active_doc_paths(docs_state, selected_doc_labels)
+        fallback_status = "Enabled" if fallback_to_llm else "Disabled"
+        if active_doc_paths:
+            summary += (
+                f"\n\n📄 **Unstructured Context Active**: Using **{len(active_doc_paths)}** "
+                f"selected document(s) in `{str(context_mode).upper()}` mode "
+                f"| 🤖 **Gemini Fallback**: **{fallback_status}**"
+            )
+        else:
+            summary += f"\n\n🤖 **Gemini Fallback**: **{fallback_status}**"
+        df = plugin.preview_propagation(
+            dataset_id,
+            target_table,
+            document_path=active_doc_paths,
+            context_mode=context_mode,
+            fallback_to_llm=bool(fallback_to_llm),
+            force_refresh=bool(force_refresh),
+        )
         if df.empty:
             gr.Warning(f"No upstream candidates found for {target_table}.")
             return summary, pd.DataFrame(
@@ -523,6 +803,9 @@ def get_glossary_recommendations(
     min_confidence=0.5,
     cache_dataset_id=None,
     cache_table_id=None,
+    docs_state=None,
+    selected_doc_labels=None,
+    context_mode="rag",
     request: gr.Request = None,
 ):
     logger.info(
@@ -537,25 +820,53 @@ def get_glossary_recommendations(
             cache_dataset_id=cache_dataset_id,
             cache_table_id=cache_table_id,
         )
+        active_doc_paths = get_active_doc_paths(docs_state, selected_doc_labels)
         df = plugin.recommend_terms_for_table(
-            dataset_id, table_id, min_confidence=float(min_confidence)
+            dataset_id,
+            table_id,
+            doc_path=active_doc_paths,
+            context_mode=context_mode,
+            min_confidence=float(min_confidence),
         )
         if df.empty:
             gr.Info(
                 f"No glossary recommendations found for {table_id} with confidence >= {min_confidence}."
             )
-            return pd.DataFrame(
+            empty_df = pd.DataFrame(
                 columns=[
                     "Select",
                     "Column",
                     "Suggested Term",
+                    "Term Status",
+                    "Source",
                     "Confidence",
                     "Rationale",
                     "Term ID",
                 ]
             )
+            return empty_df, f"ℹ️ No glossary recommendations found for `{table_id}` with confidence >= {min_confidence}."
+
         df.insert(0, "Select", [True] * len(df))
-        return df
+        existing_count = int(
+            df["Term Status"].astype(str).str.contains("Existing", na=False).sum()
+        )
+        new_count = int(
+            df["Term Status"].astype(str).str.contains("New", na=False).sum()
+        )
+        if new_count > 0:
+            new_names = df[
+                df["Term Status"].astype(str).str.contains("New", na=False)
+            ]["Suggested Term"].tolist()
+            gr.Warning(
+                f"Heads up: {len(new_names)} recommended term(s) ({', '.join(new_names)}) do not exist in your Dataplex Business Glossary yet and will be automatically created when you click Apply."
+            )
+
+        summary_md = (
+            f"### 📊 Found **{len(df)}** Recommendations &nbsp;·&nbsp; "
+            f"✅ **{existing_count}** Existing in Dataplex Glossary &nbsp;·&nbsp; "
+            f"✨ **{new_count}** New Terms *(Will Auto-Create on Apply)*"
+        )
+        return df, summary_md
     except Exception as e:
         logger.error(f"Glossary recommendations failed: {e}")
         raise gr.Error(f"Operation failed: {e!s}")
@@ -596,7 +907,13 @@ def apply_glossary_selections(
                     "term_display": row["Suggested Term"],
                 }
             )
-        plugin.apply_terms(dataset_id, table_id, updates)
+        res = plugin.apply_terms(dataset_id, table_id, updates)
+        if isinstance(res, dict):
+            created = res.get("created_terms", [])
+            applied = res.get("applied_count", len(updates))
+            if created:
+                return f"✨ Auto-created {len(created)} new Glossary Term(s) in Dataplex ({', '.join(created)}) and successfully applied {applied} glossary terms to {table_id} in Knowledge Catalog!"
+            return f"Successfully applied {applied} glossary terms to {table_id} in Knowledge Catalog!"
         return f"Successfully applied {len(updates)} glossary terms to {table_id} in Knowledge Catalog!"
     except Exception as e:
         logger.error(f"Glossary apply failed: {e}")
@@ -618,13 +935,26 @@ def deselect_all_glossary(df):
 
 
 def get_policy_tag_recommendations(
-    project_id, location, dataset_id, table_id, request: gr.Request = None
+    project_id,
+    location,
+    dataset_id,
+    table_id,
+    docs_state=None,
+    selected_doc_labels=None,
+    context_mode="rag",
+    request: gr.Request = None,
 ):
     token = get_token_from_session(request)
     set_oauth_token(token)
     try:
         plugin = PolicyTagPlugin(project_id, location)
-        df = plugin.preview_policy_tag_propagation(dataset_id, table_id)
+        active_doc_paths = get_active_doc_paths(docs_state, selected_doc_labels)
+        df = plugin.preview_policy_tag_propagation(
+            dataset_id,
+            table_id,
+            doc_path=active_doc_paths,
+            context_mode=context_mode,
+        )
         if df.empty:
             gr.Info(f"No policy tag recommendations found for {table_id}.")
             return pd.DataFrame(
@@ -823,7 +1153,7 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
             with gr.Row():
                 config_project = gr.Dropdown(
                     label="Project ID",
-                    choices=[DEFAULT_PROJECT_ID],
+                    choices=list(dict.fromkeys([DEFAULT_PROJECT_ID, "data-governance-agent-dev", "governance-agent"])),
                     value=DEFAULT_PROJECT_ID,
                     allow_custom_value=True,
                 )
@@ -861,6 +1191,138 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
 
             refresh_lineage_btn.click(
                 handle_refresh_lineage_cache, inputs=None, outputs=None
+            )
+
+        # --- Global Unstructured Document Context (Header Level) ---
+        docs_state = gr.State([])
+        header_doc_badge = gr.HTML(render_header_doc_badge([], [], "rag"))
+
+        with gr.Accordion(
+            "📄 Global Unstructured Document Context (Upload & Select Docs for AI Context)",
+            open=True,
+        ):
+            with gr.Row():
+                with gr.Column(scale=4):
+                    doc_upload_input = gr.File(
+                        file_count="multiple",
+                        file_types=[
+                            ".pdf",
+                            ".txt",
+                            ".md",
+                            ".xlsx",
+                            ".png",
+                            ".jpg",
+                            ".jpeg",
+                        ],
+                        label="Upload Unstructured Documents (PDF, XLSX, MD, TXT, Images)",
+                    )
+                with gr.Column(scale=6):
+                    doc_checkbox_group = gr.CheckboxGroup(
+                        choices=[],
+                        value=[],
+                        label="Uploaded Documents (Check to tell Agent to use document for context)",
+                        info="Selected documents are automatically reused across Description Propagation, Glossary Recommendations, and Policy Tag Propagation.",
+                    )
+                    # Allow dynamically uploaded file labels in CheckboxGroup without static choice errors
+                    doc_checkbox_group.preprocess = lambda x: x or []
+                    with gr.Row():
+                        select_all_docs_btn = gr.Button(
+                            "Select All Docs",
+                            size="sm",
+                            elem_classes=["gr-button-secondary"],
+                        )
+                        deselect_all_docs_btn = gr.Button(
+                            "Deselect All Docs",
+                            size="sm",
+                            elem_classes=["gr-button-secondary"],
+                        )
+                        clear_docs_btn = gr.Button(
+                            "🗑️ Clear Uploaded Docs",
+                            size="sm",
+                            elem_classes=["gr-button-secondary"],
+                        )
+                    with gr.Row():
+                        doc_context_mode = gr.Dropdown(
+                            choices=["rag", "direct"],
+                            value="rag",
+                            label="Document Processing Mode",
+                            info="'rag' chunks & embeds for semantic retrieval; 'direct' injects full extracted text",
+                        )
+                        doc_fallback_to_llm = gr.Checkbox(
+                            value=False,
+                            interactive=False,
+                            label="Enable Gemini Fallback",
+                            info="Requires at least one uploaded document to be selected for context",
+                        )
+                        doc_force_refresh = gr.Checkbox(
+                            value=False,
+                            label="Force Refresh RAG Cache",
+                            info="Re-extract document markdown via Gemini even if cached",
+                        )
+
+            doc_upload_input.upload(
+                handle_doc_uploads,
+                inputs=[
+                    doc_upload_input,
+                    docs_state,
+                    doc_checkbox_group,
+                    doc_context_mode,
+                ],
+                outputs=[
+                    docs_state,
+                    doc_checkbox_group,
+                    header_doc_badge,
+                    doc_fallback_to_llm,
+                ],
+            )
+            doc_checkbox_group.change(
+                update_doc_selection_badge,
+                inputs=[
+                    docs_state,
+                    doc_checkbox_group,
+                    doc_context_mode,
+                    doc_fallback_to_llm,
+                ],
+                outputs=[header_doc_badge, doc_fallback_to_llm],
+            )
+            doc_context_mode.change(
+                update_doc_selection_badge,
+                inputs=[
+                    docs_state,
+                    doc_checkbox_group,
+                    doc_context_mode,
+                    doc_fallback_to_llm,
+                ],
+                outputs=[header_doc_badge, doc_fallback_to_llm],
+            )
+            select_all_docs_btn.click(
+                select_all_docs,
+                inputs=[docs_state, doc_context_mode],
+                outputs=[
+                    doc_checkbox_group,
+                    header_doc_badge,
+                    doc_fallback_to_llm,
+                ],
+            )
+            deselect_all_docs_btn.click(
+                deselect_all_docs,
+                inputs=[docs_state, doc_context_mode],
+                outputs=[
+                    doc_checkbox_group,
+                    header_doc_badge,
+                    doc_fallback_to_llm,
+                ],
+            )
+            clear_docs_btn.click(
+                clear_all_docs,
+                inputs=[doc_context_mode],
+                outputs=[
+                    docs_state,
+                    doc_checkbox_group,
+                    header_doc_badge,
+                    doc_upload_input,
+                    doc_fallback_to_llm,
+                ],
             )
 
         with gr.Tabs():
@@ -1044,6 +1506,11 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                         config_location,
                         global_dataset,
                         prop_table,
+                        docs_state,
+                        doc_checkbox_group,
+                        doc_context_mode,
+                        doc_force_refresh,
+                        doc_fallback_to_llm,
                     ],
                     outputs=[summary_output, preview_output],
                 )
@@ -1086,11 +1553,33 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                     )
 
                 with gr.Column(elem_classes=["gcp-card"]):
+                    glossary_summary_banner = gr.Markdown(
+                        "ℹ️ Click **Get Glossary Recommendations** to analyze table columns."
+                    )
                     recommendations_view = gr.Dataframe(
                         label="Glossary Recommendations",
                         interactive=True,
                         wrap=True,
-                        datatype=["bool", "str", "str", "number", "str", "str"],
+                        datatype=[
+                            "bool",
+                            "str",
+                            "str",
+                            "str",
+                            "str",
+                            "number",
+                            "str",
+                            "str",
+                        ],
+                        column_widths=[
+                            "7%",
+                            "11%",
+                            "15%",
+                            "13%",
+                            "11%",
+                            "9%",
+                            "18%",
+                            "16%",
+                        ],
                     )
 
                     with gr.Row():
@@ -1139,8 +1628,11 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                         confidence_slider,
                         config_cache_dataset,
                         config_cache_table,
+                        docs_state,
+                        doc_checkbox_group,
+                        doc_context_mode,
                     ],
-                    outputs=recommendations_view,
+                    outputs=[recommendations_view, glossary_summary_banner],
                 )
 
                 apply_glossary_btn.click(
@@ -1240,6 +1732,9 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                         config_location,
                         global_dataset,
                         policy_table,
+                        docs_state,
+                        doc_checkbox_group,
+                        doc_context_mode,
                     ],
                     outputs=policy_recommendations_view,
                 )

@@ -9,6 +9,8 @@ authors = [
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.11"
+# IMPORTANT: Whenever dependencies are modified, update uv.lock and regenerate requirements.txt with hashes:
+# uv export --frozen --no-dev --no-emit-project -o requirements.txt
 dependencies = [
     "gradio[oauth]>=4.0.0",
     "requests>=2.31.0",

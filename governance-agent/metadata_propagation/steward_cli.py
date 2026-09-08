@@ -500,15 +500,27 @@ def main():
             print("No recommendations found.")
         else:
             print("\nGlossary Term Recommendations:")
+            cols_to_show = [
+                c
+                for c in [
+                    "Column",
+                    "Suggested Term",
+                    "Term Status",
+                    "Confidence",
+                    "Rationale",
+                ]
+                if c in df.columns
+            ]
             widths = {
                 "Column": 18,
                 "Suggested Term": 22,
+                "Term Status": 22,
                 "Confidence": 10,
                 "Rationale": 45,
             }
             print_beautiful_table(
-                df[["Column", "Suggested Term", "Confidence", "Rationale"]],
-                widths,
+                df[cols_to_show],
+                {k: v for k, v in widths.items() if k in cols_to_show},
             )
             print(
                 "\nNote: Use the UI or a separate apply command to persist these mappings."
