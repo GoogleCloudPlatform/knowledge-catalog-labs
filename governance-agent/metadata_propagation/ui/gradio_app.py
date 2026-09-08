@@ -114,8 +114,8 @@ def render_header_doc_badge(docs_state: list, selected_labels: list, context_mod
     if total == 0:
         return (
             "<div class='gcp-doc-badge empty'>"
-            "📄 <b>Global Context Documents:</b> No unstructured documents uploaded. "
-            "Upload PDFs, Spreadsheets, or Markdown files in the header below to enrich AI context across all tabs."
+            "📄 <b>Global Context Documents:</b> No documents uploaded. "
+            "Upload PDFs, Spreadsheets, or Markdown files in the section above to enrich AI context across all tabs."
             "</div>"
         )
 
@@ -402,33 +402,45 @@ GCP_CSS = """
 
 /* --- Theme CSS Variables --- */
 :root {
-    --gcp-bg: #f8f9fa;
+    --gcp-bg: #f1f5f9;
     --gcp-card-bg: #ffffff;
     --gcp-border: #dadce0;
     --gcp-text: #202124;
-    --gcp-header-bg: #f1f3f4;
+    --gcp-header-bg: #f1f5f9;
     --gcp-primary: #1a73e8;
     --gcp-primary-hover: #1765cc;
-    --gcp-secondary-bg: #f1f3f4;
-    --gcp-secondary-hover: #e8eaed;
+    --gcp-secondary-bg: #f1f5f9;
+    --gcp-secondary-hover: #e2e8f0;
     --gcp-code-bg: rgba(0,0,0,0.05);
     --gcp-metric-value-color: #1a73e8;
     --gcp-metric-label-color: #5f6368;
+    --gcp-doc-accordion-bg: #ffffff;
+    --gcp-tab-nav-bg: #e2e8f0;
+    --gcp-tab-selected-bg: #ffffff;
+    --gcp-pill-bg: #f8fafc;
+    --gcp-pill-selected-bg: #eff6ff;
+    --gcp-pill-selected-text: #1e3a8a;
 }
 
 .dark {
-    --gcp-bg: #202124;
-    --gcp-card-bg: #2d2e30;
-    --gcp-border: #3c4043;
-    --gcp-text: #e8eaed;
-    --gcp-header-bg: #303134;
-    --gcp-primary: #8ab4f8;
-    --gcp-primary-hover: #aecbfa;
-    --gcp-secondary-bg: #3c4043;
-    --gcp-secondary-hover: #4e5256;
+    --gcp-bg: #0f172a;
+    --gcp-card-bg: #1e293b;
+    --gcp-border: #334155;
+    --gcp-text: #f8fafc;
+    --gcp-header-bg: #1e293b;
+    --gcp-primary: #60a5fa;
+    --gcp-primary-hover: #93c5fd;
+    --gcp-secondary-bg: #334155;
+    --gcp-secondary-hover: #475569;
     --gcp-code-bg: rgba(255,255,255,0.1);
-    --gcp-metric-value-color: #8ab4f8;
-    --gcp-metric-label-color: #9aa0a6;
+    --gcp-metric-value-color: #60a5fa;
+    --gcp-metric-label-color: #94a3b8;
+    --gcp-doc-accordion-bg: #1e293b;
+    --gcp-tab-nav-bg: #1e293b;
+    --gcp-tab-selected-bg: #334155;
+    --gcp-pill-bg: #1e293b;
+    --gcp-pill-selected-bg: #1e3a8a;
+    --gcp-pill-selected-text: #93c5fd;
 }
 
 /* --- Global Overrides --- */
@@ -442,7 +454,7 @@ body, .gradio-container {
     color: var(--gcp-text) !important;
 }
 
-/* --- Remove ALL Gradio Orange/Black/Low-Contrast --- */
+/* --- Map Gradio CSS variables to theme-aware GCP variables --- */
 :root, .gradio-container, body, .dark, .dark :root {
     --primary-50: var(--gcp-bg) !important;
     --primary-500: var(--gcp-primary) !important;
@@ -454,10 +466,24 @@ body, .gradio-container {
     --body-text-color: var(--gcp-text) !important;
     --block-label-text-color: var(--gcp-text) !important;
     --input-text-color: var(--gcp-text) !important;
+    --input-background-fill: var(--gcp-card-bg) !important;
+    --input-background-fill-focus: var(--gcp-card-bg) !important;
+    --input-background-fill-hover: var(--gcp-secondary-bg) !important;
+    --table-even-background-fill: var(--gcp-card-bg) !important;
+    --table-odd-background-fill: var(--gcp-secondary-bg) !important;
+    --table-row-focus: var(--gcp-pill-selected-bg) !important;
+    --border-color-primary: var(--gcp-border) !important;
     --button-primary-text-color: #ffffff !important;
     --button-secondary-text-color: var(--gcp-text) !important;
     --background-fill-primary: var(--gcp-card-bg) !important;
-    --background-fill-secondary: var(--gcp-bg) !important;
+    --background-fill-secondary: var(--gcp-secondary-bg) !important;
+    --checkbox-label-background-fill: var(--gcp-pill-bg) !important;
+    --checkbox-label-background-fill-hover: var(--gcp-secondary-bg) !important;
+    --checkbox-label-background-fill-selected: var(--gcp-pill-selected-bg) !important;
+    --checkbox-label-text-color: var(--gcp-text) !important;
+    --checkbox-label-text-color-selected: var(--gcp-pill-selected-text) !important;
+    --checkbox-background-color: var(--gcp-card-bg) !important;
+    --checkbox-border-color: var(--gcp-border) !important;
 }
 
 /* Ensure text readability on main containers */
@@ -468,15 +494,13 @@ body, .gradio-container, p, span, div, h1, h2, h3, h4, h5, h6 {
 /* Specific enforcement for Primary Buttons - White Text on Blue */
 .primary, .gr-button-primary, button.primary, .lg.primary, .sm.primary,
 button[variant="primary"], .gr-button-primary *, button.primary *,
-.gradio-container button.primary, .gradio-container .primary {
-    color: #ffffff !important;
-    fill: #ffffff !important;
+button[variant="primary"] *, [class*="primary"] span, [class*="primary"] div {
     background-color: var(--gcp-primary) !important;
-}
-
-.primary span, .gr-button-primary span, button.primary span,
-.primary div, .gr-button-primary div, button.primary div {
+    background: var(--gcp-primary) !important;
     color: #ffffff !important;
+    border-color: var(--gcp-primary) !important;
+    font-weight: 500 !important;
+    fill: #ffffff !important;
 }
 
 .primary:hover, .gr-button-primary:hover, button.primary:hover {
@@ -498,33 +522,46 @@ input, textarea, select, .gr-input, .gr-box, .gr-textbox input, .gr-textbox text
     background-color: var(--gcp-card-bg) !important;
     color: var(--gcp-text) !important;
     border: 1px solid var(--gcp-border) !important;
+    border-radius: 6px !important;
 }
 
-/* Clean Gradio Dropdown & Select styling - single border, no nested padding/border */
-.gradio-container .dropdown-container,
-.gradio-container .dropdown-container .wrap,
-.gradio-container .dropdown-container select,
-.gradio-container .dropdown-container .wrap-inner,
-.gradio-container .dropdown-container input {
+/* Single crisp border for all Dropdowns & Textboxes - theme-aware background and no inner border */
+.gradio-dropdown .wrap,
+.gradio-dropdown .wrap-inner,
+.gradio-dropdown .secondary-wrap,
+.gradio-container .dropdown-container {
     border: none !important;
     box-shadow: none !important;
-    background-color: transparent !important;
+    outline: none !important;
+    background-color: var(--gcp-card-bg) !important;
+    background: var(--gcp-card-bg) !important;
+    color: var(--gcp-text) !important;
 }
 
-.gradio-container .dropdown-container {
-    border: 1px solid var(--gcp-border) !important;
-    border-radius: 4px !important;
+.gradio-dropdown input,
+.dropdown-container input,
+[data-testid="dropdown"] input,
+.wrap input,
+.wrap-inner input {
+    border: none !important;
+    box-shadow: none !important;
+    outline: none !important;
     background-color: var(--gcp-card-bg) !important;
+    background: var(--gcp-card-bg) !important;
+    color: var(--gcp-text) !important;
 }
 
 .gradio-container .dropdown-container .options {
     background-color: var(--gcp-card-bg) !important;
     border: 1px solid var(--gcp-border) !important;
+    border-radius: 6px !important;
+    box-shadow: 0 4px 12px rgba(15, 23, 42, 0.1) !important;
     color: var(--gcp-text) !important;
 }
 
 .gradio-container .dropdown-container .item {
     color: var(--gcp-text) !important;
+    background-color: var(--gcp-card-bg) !important;
 }
 
 .gradio-container .dropdown-container .item:hover {
@@ -554,16 +591,18 @@ th, thead th, .gr-table thead th, .dataframe thead th,
     background: var(--gcp-header-bg) !important;
     white-space: nowrap !important;
     color: var(--gcp-text) !important;
-    font-weight: 500 !important;
+    font-weight: 600 !important;
     text-transform: uppercase !important;
     font-size: 11px !important;
     border-bottom: 2px solid var(--gcp-border) !important;
     padding: 12px 8px !important;
 }
 
-/* Force dark text in all header children specifically */
+/* Force header background and text in all header children specifically */
 th span, th div, .gr-table th span, .gr-table th div,
-.dataframe th span, .dataframe th div {
+.dataframe th span, .dataframe th div, thead * {
+    background-color: var(--gcp-header-bg) !important;
+    background: var(--gcp-header-bg) !important;
     color: var(--gcp-text) !important;
 }
 
@@ -577,6 +616,34 @@ input[type="checkbox"] {
     accent-color: var(--gcp-primary) !important;
     opacity: 1 !important;
     visibility: visible !important;
+}
+
+.gradio-checkbox-group label,
+.checkbox-group label,
+[data-testid="checkbox-group"] label {
+    background: var(--gcp-pill-bg) !important;
+    background-color: var(--gcp-pill-bg) !important;
+    border: 1px solid var(--gcp-border) !important;
+    border-radius: 6px !important;
+    color: var(--gcp-text) !important;
+    padding: 6px 12px !important;
+    font-weight: 500 !important;
+}
+
+.gradio-checkbox-group label span,
+.checkbox-group label span,
+[data-testid="checkbox-group"] label span {
+    color: var(--gcp-text) !important;
+    background: transparent !important;
+}
+
+.gradio-checkbox-group label.selected,
+.checkbox-group label.selected,
+[data-testid="checkbox-group"] label.selected {
+    background: var(--gcp-pill-selected-bg) !important;
+    background-color: var(--gcp-pill-selected-bg) !important;
+    border-color: var(--gcp-primary) !important;
+    color: var(--gcp-pill-selected-text) !important;
 }
 
 tr, .gr-table tr, .dataframe tr {
@@ -595,22 +662,79 @@ tr, .gr-table tr, .dataframe tr {
     color: var(--gcp-text) !important;
 }
 
+.tabs .tab-nav {
+    background: var(--gcp-tab-nav-bg) !important;
+    border-radius: 10px !important;
+    padding: 5px !important;
+    margin-bottom: 14px !important;
+    border: none !important;
+}
+
 .tabs .tabitem.selected, .tabs button.selected {
-    border-bottom: 3px solid var(--gcp-primary) !important;
-    color: var(--gcp-primary) !important;
-    background: transparent !important;
+    border-bottom: none !important;
+    color: var(--gcp-text) !important;
+    background: var(--gcp-tab-selected-bg) !important;
+    border-radius: 8px !important;
+    box-shadow: 0 2px 6px rgba(15, 23, 42, 0.1) !important;
+    font-weight: 600 !important;
 }
 
 .tabs button {
     color: var(--gcp-metric-label-color) !important;
-    border-bottom: 1px solid transparent !important;
+    border-bottom: none !important;
+    font-weight: 500 !important;
+    padding: 8px 16px !important;
+    transition: all 0.15s ease !important;
 }
 
 .gcp-card {
     background: var(--gcp-card-bg) !important;
     border: 1px solid var(--gcp-border) !important;
+    border-radius: 10px !important;
+    box-shadow: 0 2px 10px rgba(15, 23, 42, 0.05), 0 1px 3px rgba(15, 23, 42, 0.03) !important;
+    padding: 18px 22px !important;
+}
+
+.hero-banner-block,
+.gradio-html.hero-banner-block,
+.hero-banner-block .prose {
+    padding: 0 !important;
+    margin: 0 0 10px 0 !important;
+    border: none !important;
+    background: transparent !important;
     box-shadow: none !important;
-    padding: 12px 16px !important;
+    width: 100% !important;
+    max-width: 100% !important;
+}
+
+.hero-banner-block div.gcp-hero-header,
+div.gcp-hero-header {
+    width: 100% !important;
+    max-width: 100% !important;
+    box-sizing: border-box !important;
+    margin: 0 !important;
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 55%, #1d4ed8 100%) !important;
+    border: 1px solid rgba(255, 255, 255, 0.15) !important;
+    color: #ffffff !important;
+    border-radius: 10px !important;
+    box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12) !important;
+    padding: 18px 24px !important;
+}
+
+.env-settings-accordion {
+    border-left: 4px solid var(--gcp-primary) !important;
+    border-radius: 10px !important;
+    background: var(--gcp-card-bg) !important;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05) !important;
+    margin-bottom: 10px !important;
+}
+
+.doc-context-accordion {
+    border-left: 4px solid #0284c7 !important;
+    border-radius: 10px !important;
+    background: var(--gcp-card-bg) !important;
+    box-shadow: 0 2px 8px rgba(15, 23, 42, 0.05) !important;
+    margin-bottom: 12px !important;
 }
 
 .gcp-card .prose, .gcp-card .markdown {
@@ -678,6 +802,17 @@ tr, .gr-table tr, .dataframe tr {
     margin: 0 4px !important;
 }
 </style>
+<script>
+(function() {
+    try {
+        if (!localStorage.getItem('theme')) {
+            localStorage.setItem('theme', 'light');
+            document.body.classList.remove('dark');
+            document.documentElement.classList.remove('dark');
+        }
+    } catch (e) {}
+})();
+</script>
 """
 
 
@@ -702,7 +837,7 @@ def analyze_and_preview(
         fallback_status = "Enabled" if fallback_to_llm else "Disabled"
         if active_doc_paths:
             summary += (
-                f"\n\n📄 **Unstructured Context Active**: Using **{len(active_doc_paths)}** "
+                f"\n\n📄 **Document Context Active**: Using **{len(active_doc_paths)}** "
                 f"selected document(s) in `{str(context_mode).upper()}` mode "
                 f"| 🤖 **Gemini Fallback**: **{fallback_status}**"
             )
@@ -1142,14 +1277,58 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
             ).then(fn=None, js="() => window.location.href='/google_login'")
 
     with gr.Column(visible=False) as app_view:
-        with gr.Row():
-            with gr.Column(scale=8):
-                gr.Markdown("# 🛡️ Governance on Auto-pilot")
-            with gr.Column(scale=2):
-                logout_html = '<a href="/logout" style="color: #666; text-decoration: underline;">Logout</a>'
-                gr.HTML(logout_html)
+        gr.HTML(
+            """
+            <div class="gcp-hero-header" style="width: 100%;
+                        box-sizing: border-box;
+                        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 55%, #1d4ed8 100%) !important;
+                        border: 1px solid rgba(255, 255, 255, 0.15);
+                        border-radius: 10px;
+                        padding: 18px 24px;
+                        box-shadow: 0 4px 14px rgba(15, 23, 42, 0.12);
+                        display: flex;
+                        align-items: center;
+                        justify-content: space-between;">
+                <div style="display: flex; align-items: center; gap: 14px;">
+                    <div style="background: rgba(255, 255, 255, 0.12);
+                                border: 1px solid rgba(255, 255, 255, 0.2);
+                                border-radius: 10px;
+                                padding: 10px 12px;
+                                font-size: 26px;
+                                line-height: 1;">🛡️</div>
+                    <div>
+                        <div style="font-size: 22px; font-weight: 700; color: #ffffff !important; letter-spacing: -0.3px;">
+                            Governance on Auto-pilot
+                        </div>
+                        <div style="font-size: 13px; color: #cbd5e1 !important; margin-top: 2px;">
+                            Knowledge Catalog · Gemini AI · Lineage & Multi-Document RAG Engine
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <a href="/logout"
+                       style="background: rgba(255, 255, 255, 0.14);
+                              border: 1px solid rgba(255, 255, 255, 0.28);
+                              color: #ffffff !important;
+                              padding: 7px 18px;
+                              border-radius: 9999px;
+                              font-size: 13px;
+                              font-weight: 500;
+                              text-decoration: none;
+                              transition: background 0.15s ease;">
+                        Logout
+                    </a>
+                </div>
+            </div>
+            """,
+            elem_classes=["hero-banner-block"],
+        )
 
-        with gr.Accordion("Global Environment Settings", open=True):
+        with gr.Accordion(
+            "⚙️ Global Environment Settings",
+            open=True,
+            elem_classes=["env-settings-accordion"],
+        ):
             with gr.Row():
                 config_project = gr.Dropdown(
                     label="Project ID",
@@ -1193,13 +1372,13 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                 handle_refresh_lineage_cache, inputs=None, outputs=None
             )
 
-        # --- Global Unstructured Document Context (Header Level) ---
+        # --- Global Document Context (Header Level) ---
         docs_state = gr.State([])
-        header_doc_badge = gr.HTML(render_header_doc_badge([], [], "rag"))
 
         with gr.Accordion(
-            "📄 Global Unstructured Document Context (Upload & Select Docs for AI Context)",
+            "📄 Global Document Context (Upload & Select Docs for AI Context)",
             open=True,
+            elem_classes=["doc-context-accordion"],
         ):
             with gr.Row():
                 with gr.Column(scale=4):
@@ -1214,7 +1393,7 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                             ".jpg",
                             ".jpeg",
                         ],
-                        label="Upload Unstructured Documents (PDF, XLSX, MD, TXT, Images)",
+                        label="Upload Reference Documents (PDF, XLSX, MD, TXT, Images)",
                     )
                 with gr.Column(scale=6):
                     doc_checkbox_group = gr.CheckboxGroup(
@@ -1260,70 +1439,72 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                             info="Re-extract document markdown via Gemini even if cached",
                         )
 
-            doc_upload_input.upload(
-                handle_doc_uploads,
-                inputs=[
-                    doc_upload_input,
-                    docs_state,
-                    doc_checkbox_group,
-                    doc_context_mode,
-                ],
-                outputs=[
-                    docs_state,
-                    doc_checkbox_group,
-                    header_doc_badge,
-                    doc_fallback_to_llm,
-                ],
-            )
-            doc_checkbox_group.change(
-                update_doc_selection_badge,
-                inputs=[
-                    docs_state,
-                    doc_checkbox_group,
-                    doc_context_mode,
-                    doc_fallback_to_llm,
-                ],
-                outputs=[header_doc_badge, doc_fallback_to_llm],
-            )
-            doc_context_mode.change(
-                update_doc_selection_badge,
-                inputs=[
-                    docs_state,
-                    doc_checkbox_group,
-                    doc_context_mode,
-                    doc_fallback_to_llm,
-                ],
-                outputs=[header_doc_badge, doc_fallback_to_llm],
-            )
-            select_all_docs_btn.click(
-                select_all_docs,
-                inputs=[docs_state, doc_context_mode],
-                outputs=[
-                    doc_checkbox_group,
-                    header_doc_badge,
-                    doc_fallback_to_llm,
-                ],
-            )
-            deselect_all_docs_btn.click(
-                deselect_all_docs,
-                inputs=[docs_state, doc_context_mode],
-                outputs=[
-                    doc_checkbox_group,
-                    header_doc_badge,
-                    doc_fallback_to_llm,
-                ],
-            )
-            clear_docs_btn.click(
-                clear_all_docs,
-                inputs=[doc_context_mode],
-                outputs=[
-                    docs_state,
-                    doc_checkbox_group,
-                    header_doc_badge,
-                    doc_upload_input,
-                    doc_fallback_to_llm,
-                ],
-            )
+        header_doc_badge = gr.HTML(render_header_doc_badge([], [], "rag"))
+
+        doc_upload_input.upload(
+            handle_doc_uploads,
+            inputs=[
+                doc_upload_input,
+                docs_state,
+                doc_checkbox_group,
+                doc_context_mode,
+            ],
+            outputs=[
+                docs_state,
+                doc_checkbox_group,
+                header_doc_badge,
+                doc_fallback_to_llm,
+            ],
+        )
+        doc_checkbox_group.change(
+            update_doc_selection_badge,
+            inputs=[
+                docs_state,
+                doc_checkbox_group,
+                doc_context_mode,
+                doc_fallback_to_llm,
+            ],
+            outputs=[header_doc_badge, doc_fallback_to_llm],
+        )
+        doc_context_mode.change(
+            update_doc_selection_badge,
+            inputs=[
+                docs_state,
+                doc_checkbox_group,
+                doc_context_mode,
+                doc_fallback_to_llm,
+            ],
+            outputs=[header_doc_badge, doc_fallback_to_llm],
+        )
+        select_all_docs_btn.click(
+            select_all_docs,
+            inputs=[docs_state, doc_context_mode],
+            outputs=[
+                doc_checkbox_group,
+                header_doc_badge,
+                doc_fallback_to_llm,
+            ],
+        )
+        deselect_all_docs_btn.click(
+            deselect_all_docs,
+            inputs=[docs_state, doc_context_mode],
+            outputs=[
+                doc_checkbox_group,
+                header_doc_badge,
+                doc_fallback_to_llm,
+            ],
+        )
+        clear_docs_btn.click(
+            clear_all_docs,
+            inputs=[doc_context_mode],
+            outputs=[
+                docs_state,
+                doc_checkbox_group,
+                header_doc_badge,
+                doc_upload_input,
+                doc_fallback_to_llm,
+            ],
+        )
 
         with gr.Tabs():
             with gr.TabItem("Dashboard"):
