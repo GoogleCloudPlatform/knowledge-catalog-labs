@@ -5,7 +5,7 @@ fi
 source .venv/bin/activate
 
 if [ "$1" == "--install" ]; then
-  pip install ----require-hashes -r requirements.txt
+  pip install --require-hashes -r requirements.txt
 fi
 
 export PYTHONDONTWRITEBYTECODE=1
