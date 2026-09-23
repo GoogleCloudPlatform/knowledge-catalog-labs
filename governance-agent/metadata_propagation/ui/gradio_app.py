@@ -37,6 +37,8 @@ oauth_config.register(
 
 # Import Agent Components
 from metadata_propagation.agent.plugins.context import (
+    get_oauth_token,
+    is_oauth_enabled,
     set_oauth_token,
 )
 from metadata_propagation.agent.plugins.dq_plugin import DQPlugin
@@ -143,7 +145,16 @@ def render_header_doc_badge(docs_state: list, selected_labels: list, context_mod
         )
 
 
-def handle_doc_uploads(uploaded_files, current_docs_state, current_selected_labels, context_mode):
+def handle_doc_uploads(
+    uploaded_files,
+    current_docs_state,
+    current_selected_labels,
+    context_mode,
+    request: gr.Request = None,
+):
+    if uploaded_files:
+        token = get_token_from_session(request)
+        set_oauth_token(token)
     current_docs_state = list(current_docs_state or [])
     current_selected_labels = list(current_selected_labels or [])
 
@@ -290,20 +301,31 @@ def get_plugin(project_id, location):
 
 
 def get_token_from_session(request: gr.Request):
-    if os.environ.get("BYPASS_OAUTH") == "true":
+    if os.environ.get("BYPASS_OAUTH", "").lower() == "true":
         return None
     if request and hasattr(request, "session"):
         token_dict = request.session.get("google_token")
-        if isinstance(token_dict, dict):
+        if isinstance(token_dict, dict) and token_dict.get("access_token"):
             import time
 
             expires_at = token_dict.get("expires_at")
-            if expires_at and time.time() > (expires_at - 60) and not token_dict.get("refresh_token"):
-                # Remove expired token so ADC is used seamlessly
+            if (
+                expires_at
+                and time.time() > (expires_at - 60)
+                and not token_dict.get("refresh_token")
+            ):
+                # Remove expired token and deny unauthenticated access instead of falling back to ADC
                 request.session.pop("google_token", None)
-                return None
+                set_oauth_token(None)
+                raise gr.Error(
+                    "Session expired: Please sign in again with Google OAuth."
+                )
             return token_dict
-    return None
+
+    set_oauth_token(None)
+    raise gr.Error(
+        "Authentication required: Please sign in with Google OAuth to access this endpoint."
+    )
 
 
 def scan_dataset(
@@ -1177,7 +1199,9 @@ def get_dq_propagation(
     set_oauth_token(token)
     try:
         dq_plugin = DQPlugin(project_id, location)
-        engine = DQPropagationEngine(project_id, location, token=token)
+        engine = DQPropagationEngine(
+            project_id, location, token=get_oauth_token()
+        )
         target_fqn = f"bigquery:{project_id}.{dataset_id}.{table_id}"
         from google.cloud import bigquery
 
@@ -1998,13 +2022,50 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
     demo.load(check_auth_status, outputs=[login_view, app_view])
 
 if __name__ == "__main__":
+    import secrets
     from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
 
     main_app = FastAPI()
 
+    _PROTECTED_API_PREFIXES = (
+        "/api/",
+        "/gradio_api/",
+        "/call/",
+        "/run/",
+        "/queue/",
+        "/upload",
+    )
+
+    @main_app.middleware("http")
+    async def enforce_oauth_middleware(request: fastapi.Request, call_next):
+        path = request.url.path
+        if os.environ.get("BYPASS_OAUTH", "").lower() != "true" and any(
+            path.startswith(prefix) for prefix in _PROTECTED_API_PREFIXES
+        ):
+            session = request.scope.get("session") or {}
+            token_dict = (
+                session.get("google_token")
+                if isinstance(session, dict)
+                else None
+            )
+            if not isinstance(token_dict, dict) or not token_dict.get(
+                "access_token"
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": "Authentication required: valid Google OAuth session missing."
+                    },
+                )
+        return await call_next(request)
+
+    session_secret = os.environ.get(
+        "SESSION_SECRET_KEY"
+    ) or secrets.token_urlsafe(32)
     main_app.add_middleware(
         SessionMiddleware,
-        secret_key="some-secret-key-for-auth-propagation",
+        secret_key=session_secret,
         session_cookie="steward_session",
     )
 

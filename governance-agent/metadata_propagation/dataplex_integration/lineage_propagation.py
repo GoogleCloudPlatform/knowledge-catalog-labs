@@ -389,13 +389,27 @@ class LineageGraphTraverser:
         search_type: "target" for upstream, "source" for downstream.
         """
         token = self.token
+        if isinstance(token, dict):
+            token = token.get("access_token")
 
         if not token:
-            # Fallback to ADC
-            credentials, _project = google.auth.default()
-            auth_req = google.auth.transport.requests.Request()
-            credentials.refresh(auth_req)
-            token = credentials.token
+            from metadata_propagation.agent.plugins.context import (
+                get_credentials,
+                get_oauth_token,
+                is_oauth_enabled,
+            )
+
+            token = get_oauth_token()
+            if not token:
+                if is_oauth_enabled():
+                    creds = get_credentials(self.project_id)
+                    token = getattr(creds, "token", None)
+                else:
+                    # Fallback to ADC only when OAuth is not enabled
+                    credentials, _project = google.auth.default()
+                    auth_req = google.auth.transport.requests.Request()
+                    credentials.refresh(auth_req)
+                    token = credentials.token
 
         headers = {
             "Authorization": f"Bearer {token}",

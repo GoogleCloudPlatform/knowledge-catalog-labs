@@ -311,7 +311,7 @@ class DocDescriptionPlugin(BasePlugin):
 
         # Use thread-local storage for session to reuse connections
         if not hasattr(self._thread_local, "session"):
-            credentials, _project = google.auth.default()
+            credentials = get_credentials(self.project_id)
             self._thread_local.session = AuthorizedSession(credentials)
 
         authed_session = self._thread_local.session
@@ -372,14 +372,13 @@ class DocDescriptionPlugin(BasePlugin):
 
     def _verify_datastore_exists(self) -> bool:
         """Verifies that the DataStore exists by making a simple search call."""
-        import google.auth
         from google.auth.transport.requests import AuthorizedSession
 
         project_id = self.project_id
         location = "global"
         datastore_id = self.datastore_id
 
-        credentials, _project = google.auth.default()
+        credentials = get_credentials(self.project_id)
         authed_session = AuthorizedSession(credentials)
 
         if datastore_id.startswith("projects/"):

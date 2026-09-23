@@ -1,5 +1,6 @@
 import contextvars
 import logging
+import os
 import threading
 
 import google.auth
@@ -8,13 +9,33 @@ import google.oauth2.credentials
 logger = logging.getLogger(__name__)
 
 _oauth_token = contextvars.ContextVar("oauth_token", default=None)
+_oauth_token_set = contextvars.ContextVar("oauth_token_set", default=False)
 _cached_adc_creds = None
 _adc_lock = threading.Lock()
 
 
+def is_oauth_enabled() -> bool:
+    """
+    Returns True when OAuth authentication is active in the current execution context
+    and ADC fallback must be blocked.
+    OAuth is active whenever set_oauth_token() has been invoked (e.g. by Gradio UI or
+    ADK AuthPlugin) and BYPASS_OAUTH is not explicitly set to 'true'.
+    """
+    if os.environ.get("BYPASS_OAUTH", "").lower() == "true":
+        return False
+    return bool(_oauth_token_set.get())
+
+
 def set_oauth_token(token: str | dict | None):
-    """Sets the OAuth token for the current context."""
+    """Sets the OAuth token for the current context and marks OAuth enforcement active."""
     _oauth_token.set(token)
+    _oauth_token_set.set(True)
+
+
+def reset_oauth_context():
+    """Resets the OAuth context variables to their initial state."""
+    _oauth_token.set(None)
+    _oauth_token_set.set(False)
 
 
 def get_oauth_token() -> str | None:
@@ -28,32 +49,49 @@ def get_oauth_token() -> str | None:
 def get_credentials(quota_project_id: str):
     """
     Returns Google Credentials object.
-    Only uses the stored OAuth token if it contains a refresh_token along with
-    GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (required by Google Cloud clients for refresh).
-    Otherwise, seamlessly uses Application Default Credentials (ADC).
+    When OAuth is enabled (or set_oauth_token was called without BYPASS_OAUTH=true),
+    strictly requires a valid user OAuth token and NEVER falls back to Server
+    Application Default Credentials (ADC).
     """
-    import os
-
+    bypass_oauth = os.environ.get("BYPASS_OAUTH", "").lower() == "true"
     token_data = _oauth_token.get()
-    if (
-        token_data
-        and isinstance(token_data, dict)
-        and os.environ.get("BYPASS_OAUTH") != "true"
-    ):
-        access_token = token_data.get("access_token")
-        refresh_token = token_data.get("refresh_token")
-        client_id = os.environ.get("GOOGLE_CLIENT_ID")
-        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
 
-        if access_token and refresh_token and client_id and client_secret:
+    if not bypass_oauth and token_data:
+        if isinstance(token_data, dict):
+            access_token = token_data.get("access_token")
+            refresh_token = token_data.get("refresh_token")
+            client_id = os.environ.get("GOOGLE_CLIENT_ID")
+            client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+
+            if access_token:
+                if refresh_token and client_id and client_secret:
+                    return google.oauth2.credentials.Credentials(
+                        token=access_token,
+                        refresh_token=refresh_token,
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        quota_project_id=quota_project_id,
+                    )
+                return google.oauth2.credentials.Credentials(
+                    token=access_token,
+                    quota_project_id=quota_project_id,
+                )
+        elif isinstance(token_data, str) and token_data.strip():
             return google.oauth2.credentials.Credentials(
-                token=access_token,
-                refresh_token=refresh_token,
-                token_uri="https://oauth2.googleapis.com/token",
-                client_id=client_id,
-                client_secret=client_secret,
+                token=token_data.strip(),
                 quota_project_id=quota_project_id,
             )
+
+    if is_oauth_enabled():
+        logger.error(
+            "Authentication required: missing or invalid OAuth token. "
+            "Refusing to fall back to Application Default Credentials (ADC)."
+        )
+        raise PermissionError(
+            "Authentication required: missing or invalid OAuth token. "
+            "Fallback to Application Default Credentials (ADC) is disabled."
+        )
 
     global _cached_adc_creds
     if not _cached_adc_creds:
@@ -73,3 +111,4 @@ def get_credentials(quota_project_id: str):
                     _cached_adc_creds = None
 
     return _cached_adc_creds
+
