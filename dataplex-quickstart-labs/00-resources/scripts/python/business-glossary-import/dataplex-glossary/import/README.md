@@ -49,6 +49,10 @@ Share the Google Sheet with the service account (`SA_EMAIL`) as a **Viewer** so 
 
 *   **Glossary Import**: The sheet should contain the following header row:
     `id, parent, display_name, description, overview, type, contact1_email, contact1_name, contact2_email, contact2_name, label1_key, label1_value, label2_key, label2_value`
+    *   *(Optional)* To import custom Dataplex Aspects, add a second worksheet
+        (`Sheet2` by default) with the header row `id, Aspect name, Aspect value`.
+        See [Sheets file schema (Aspects)](#sheets-file-schema-aspects--second-sheet)
+        below. Spreadsheets without this second sheet import exactly as before.
 *   **EntryLinks Import**: The sheet should contain the following columns in the header row:
     *   `entry_link_type` - Type of link: `definition`, `related`, or `synonym`
     *   `source_entry` - Full entry name of the source (e.g., `projects/PROJECT/locations/LOCATION/entryGroups/ENTRY_GROUP/entries/ENTRY_ID`)
@@ -109,6 +113,129 @@ Where:
 *   `label1_value` (optional): Label1's value.
 *   `label2_key` (optional): Label2's key.
 *   `label2_value` (optional): Label2's value.
+
+### Sheets file schema (Aspects — second sheet)
+
+Custom Dataplex **Aspects** are read from a **second worksheet** (`Sheet2` by
+default) using a normalized 3-column schema. The Sheet 1 schema above is
+**unchanged**, and its header validation still requires exactly those 14 columns.
+
+`id, Aspect name, Aspect value`
+
+Where:
+
+*   `id` (required): Foreign key to the `id` column of Sheet 1. Must reference a
+    term or category that exists in Sheet 1. One id may own many aspect rows.
+*   `Aspect name` (required): The aspect field identifier, in any of:
+    *   Short — `<aspectTypeId>.<fieldName>`, e.g. `custom-gov.tier`
+    *   Qualified — `<project>.<location>.<aspectTypeId>.<fieldName>`, e.g.
+        `my-project.us-central1.custom-gov.tier`
+    *   Full resource path —
+        `projects/{project}/locations/{location}/aspectTypes/{aspectType}/{field}`
+
+    Project and location default to the **target glossary's** when omitted.
+    Dotted field names address record sub-fields (`custom-gov.owner.email`).
+*   `Aspect value` (required): The scalar or serialized value.
+
+#### Worked example
+
+Sheet 2:
+
+| id | Aspect name | Aspect value |
+|---|---|---|
+| `term-customer-id` | `custom-gov.tier` | `HIGH` |
+| `term-customer-id` | `custom-gov.is_pii` | `true` |
+| `term-customer-id` | `custom-gov.retention_days` | `365` |
+
+All rows for the same `(id, aspect type)` are aggregated into **one** aspect
+object on the entry:
+
+```json
+{"entry": {
+  "name": "projects/.../entryGroups/@dataplex/entries/.../terms/term-customer-id",
+  "entryType": "projects/dataplex-types/locations/global/entryTypes/glossary-term",
+  "aspects": {
+    "dataplex-types.global.glossary-term-aspect": {"data": {}},
+    "dataplex-types.global.overview": {"data": {"content": "..."}},
+    "dataplex-types.global.contacts": {"data": {"identities": []}},
+    "my-project.us-central1.custom-gov": {
+      "aspectType": "projects/my-project/locations/us-central1/aspectTypes/custom-gov",
+      "data": {"tier": "HIGH", "is_pii": true, "retention_days": 365}}},
+  "entrySource": {}}, "entryLink": null}
+```
+
+#### Datatypes
+
+Types follow `AspectType.MetadataTemplate` in
+`google/cloud/dataplex/v1/catalog.proto`.
+
+| Type | Accepted cell value | Parsed as |
+|---|---|---|
+| `string` | any text | `str` |
+| `enum` | any text | `str` |
+| `int` | `365`, `-42` | `int` |
+| `double` | `3.14` | `float` |
+| `bool` | `true`/`false`/`yes`/`no`/`y`/`n`/`t`/`f` (case-insensitive) | `bool` |
+| `datetime` | RFC 3339, e.g. `2024-01-15T10:30:00Z` | `str` (passed through) |
+| `array` | `["finance","core"]`, or `finance,core` | `list` |
+| `record` / `map` | `{"email":"a@b.c"}`, or dotted sub-field rows | `dict` |
+
+Notes on ambiguous cells:
+
+*   `1` and `0` are read as **integers** unless the AspectType declares the
+    field as `bool`, in which case they are read as `true`/`false`.
+*   A comma-separated list is only split into an array when the AspectType
+    declares the field as `array`; otherwise it stays a string.
+*   Dotted field names rebuild nested records:
+    `custom-gov.owner.email` → `{"owner": {"email": ...}}`.
+
+The importer calls `dataplex.projects.locations.aspectTypes.get` to read the
+AspectType and drive coercion from its `MetadataTemplate` (results are cached
+per run). If the AspectType cannot be read — permission denied or missing — a
+warning is logged and the heuristics above are used instead.
+
+#### Validation
+
+Aspect rows are validated with row-numbered messages, like the glossary sheet:
+
+*   Missing `id` or missing `Aspect name`.
+*   `id` that does not exist in Sheet 1.
+*   Malformed `Aspect name` (no field component, empty dotted segments, bad
+    resource path).
+*   Duplicate `(id, Aspect name)` pairs.
+*   System aspects (`overview`, `contacts`, `glossary-term-aspect`,
+    `glossary-category-aspect`) — these are owned by Sheet 1's `overview` and
+    `contact*` columns and are rejected if set from Sheet 2.
+
+Any aspect validation error fails the run before anything is uploaded.
+
+#### Aspect sync semantics (IMPORTANT)
+
+The metadata job is created with `"entry_sync_mode": "FULL"` and
+`"aspect_sync_mode": "INCREMENTAL"`. INCREMENTAL is the correct mode for
+adding and updating aspects: aspects present in the import file are created or
+overwritten, and aspects **not** mentioned are left untouched.
+
+> **Deleting a row from Sheet 2 does NOT remove the aspect from the entry.**
+> Under INCREMENTAL the importer has no way to express "remove this aspect".
+> To remove a custom aspect you must delete it out of band (for example with
+> `gcloud dataplex entries update --aspect-keys ...` or the Entries API).
+
+#### Backward compatibility
+
+If the second sheet is absent, empty, or header-only, the import behaves
+**exactly** as it did before — a single informational line is printed and no
+custom aspects are attached. Existing single-sheet spreadsheets continue to
+import unchanged.
+
+#### Overriding the sheet name
+
+The aspects worksheet defaults to `Sheet2`. To use a different tab, set:
+
+```bash
+export GLOSSARY_ASPECTS_SHEET_NAME="Aspects"
+```
+
 
 ---
 

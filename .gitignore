@@ -367,3 +367,13 @@ scratch/
 .rag_cache/
 
 uv.lock
+
+# Dataplex glossary tooling runtime artifacts
+# Staged import payloads and rotated logs written by the glossary/entrylinks
+# import and export scripts. The .gitkeep files are tracked deliberately.
+dataplex-quickstart-labs/**/dataplex-glossary/import/processed/*
+!dataplex-quickstart-labs/**/dataplex-glossary/import/processed/.gitkeep
+dataplex-quickstart-labs/**/dataplex-glossary/import/archive/*
+!dataplex-quickstart-labs/**/dataplex-glossary/import/archive/.gitkeep
+dataplex-quickstart-labs/**/dataplex-glossary/logs/
+.pytest_cache/

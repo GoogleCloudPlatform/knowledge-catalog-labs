@@ -1,8 +1,16 @@
 from google.auth import default
 from googleapiclient.discovery import build
+import os
 import re
+import sys
 import logging
 from typing import List, Dict, Optional
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from utils import business_glossary_utils, sheet_utils
+from utils.constants import ASPECT_SHEET_HEADERS
 
 # --- Configure logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -416,12 +424,23 @@ def _get_aspects_from_entry(entry):
     """
         Extracts simplified aspects from an entry.
         This function simplifies the aspects of an entry to include only the overview and identities.
+
+        The "overview" and "identities" keys are the long-standing contract used
+        to populate the Sheet 1 columns. The additional "custom" key carries
+        every NON-system aspect, keyed by its aspect key, for Sheet 2.
+
+        System aspects (overview, contacts, glossary-term-aspect,
+        glossary-category-aspect) are matched on their
+        '<location>.<aspect_type_id>' suffix, because export observes the
+        numeric project number ('655216118709.global.overview') while import
+        writes the friendly project id ('dataplex-types.global.overview').
+
         Args:
             entry: An Entry object.
         Returns:
-            A dictionary with simplified aspects containing "overview" and "identities".
+            A dictionary with simplified aspects containing "overview", "identities" and "custom".
     """
-    simplified_aspects = {"overview": "", "identities": []}
+    simplified_aspects = {"overview": "", "identities": [], "custom": {}}
     aspects_map = entry["aspects"]
     # append overview
     if aspects_map and aspects_map.get(OVERVIEW_ASPECT_ID):
@@ -434,23 +453,79 @@ def _get_aspects_from_entry(entry):
         contacts = aspects_map[CONTACTS_ASPECT_ID]
         if contacts.get("data") and contacts.get("data").get("identities"):
             simplified_aspects["identities"] = contacts.get("data").get("identities")
+    # append custom (non-system) aspects
+    for aspect_key, aspect in (aspects_map or {}).items():
+        if business_glossary_utils.is_system_aspect(aspect_key):
+            continue
+        aspect_data = aspect.get("data") if isinstance(aspect, dict) else None
+        if not aspect_data:
+            continue
+        simplified_aspects["custom"][aspect_key] = aspect_data
     return simplified_aspects
 
-def _write_to_sheet(sheets_service: build, spreadsheet_id: str, data: List[List[str]]) -> None:
+
+def _get_aspect_rows_for_entry(term_or_category, entry) -> List[List[str]]:
+    """Builds the Sheet 2 rows for a single term or category.
+
+    Each custom aspect's ``data`` dict is flattened into one row per field,
+    using the '<aspect_type_id>.<field_name>' short identifier. Record and map
+    sub-fields are flattened one level into dotted names ('custom-gov.owner.email');
+    anything deeper is serialized as a JSON object string.
+
+    Args:
+        term_or_category: A Term or Category resource dict.
+        entry: The Entry representing that term or category.
+
+    Returns:
+        A list of [id, Aspect name, Aspect value] rows, empty when the entry
+        carries no custom aspects.
+    """
+    resource_name = term_or_category.get("name", "")
+    match = TERM_NAME_REGEX_PATTERN.match(resource_name) or CATERGORY_NAME_REGEX_PATTERN.match(resource_name)
+    if not match:
+        logging.warning(f"Could not determine id for aspect rows from: {resource_name}")
+        return []
+    resource_id = match.groups()[-1]
+
+    simplified_aspects = _get_aspects_from_entry(entry)
+    aspect_rows = []
+
+    for aspect_key, aspect_data in simplified_aspects["custom"].items():
+        aspect_type_id = business_glossary_utils.extract_aspect_type_id(aspect_key)
+        for field_name, cell_value in business_glossary_utils.flatten_aspect_data(aspect_data):
+            aspect_rows.append([
+                resource_id,
+                business_glossary_utils.format_aspect_identifier(aspect_type_id, field_name),
+                cell_value,
+            ])
+
+    return aspect_rows
+
+
+def _write_to_sheet(
+    sheets_service: build,
+    spreadsheet_id: str,
+    data: List[List[str]],
+    sheet_name: Optional[str] = None,
+) -> None:
     """Writes data to a Google Sheet.
     
     Args:
         sheets_service: The Google Sheets API service object.
         spreadsheet_id: The ID of the spreadsheet.
         data: The data to write to the sheet.
+        sheet_name: Optional worksheet name to target. When omitted the write
+            is untargeted (range 'A1'), exactly as before, which keeps the
+            Sheet 1 write path behaviorally unchanged.
     
     Raises:
         SheetsAPIError: If there is an error during the write operation.
     """
+    target_range = f"'{sheet_name}'!A1" if sheet_name else 'A1'
     try:
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range='A1',
+            range=target_range,
             valueInputOption='USER_ENTERED',
             body={'values': data}
         ).execute()
@@ -458,6 +533,43 @@ def _write_to_sheet(sheets_service: build, spreadsheet_id: str, data: List[List[
     except Exception as e:
         logging.error(f"Error while writing to spreadsheet: {e}")
         raise SheetsAPIError(f"Error while writing to spreadsheet: {e}")
+
+
+def _write_aspects_to_sheet(
+    sheets_service: build, spreadsheet_id: str, aspect_rows: List[List[str]]
+) -> None:
+    """Writes the collected custom aspect rows to the aspects sheet (Sheet 2).
+
+    When there are no custom aspects, nothing is written and no tab is created:
+    a single informational line is logged, so glossaries without custom aspects
+    export exactly as they did before.
+
+    The write clears the target tab first, so aspect rows removed since the
+    previous export do not linger as orphans (which would later fail import
+    validation with an unknown id).
+
+    Args:
+        sheets_service: The Google Sheets API service object.
+        spreadsheet_id: The ID of the spreadsheet.
+        aspect_rows: Rows of [id, Aspect name, Aspect value], header excluded.
+
+    Raises:
+        SheetsAPIError: If there is an error during the write operation.
+    """
+    if not aspect_rows:
+        logging.info("No custom aspects found; skipping the aspects sheet.")
+        return
+
+    try:
+        target_sheet_name = sheet_utils.write_aspect_rows(
+            sheets_service, spreadsheet_id, [ASPECT_SHEET_HEADERS] + aspect_rows
+        )
+        logging.info(
+            f"Wrote {len(aspect_rows)} custom aspect row(s) to '{target_sheet_name}'."
+        )
+    except Exception as e:
+        logging.error(f"Error while writing aspects to spreadsheet: {e}")
+        raise SheetsAPIError(f"Error while writing aspects to spreadsheet: {e}")
 
 # --- Main Function ---
 def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -> None:
@@ -513,6 +625,7 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
                 continue
 
         sheet_data = [SHEET_HEADERS]
+        aspect_rows = []
         # 7. Add Categories data in the sheet
         for category in categories:
             category_entry = entry_id_to_entry_map.get(category.get("name"))
@@ -527,6 +640,7 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
                 else:
                     category_row.append("")
             sheet_data.append(category_row)
+            aspect_rows.extend(_get_aspect_rows_for_entry(category, category_entry))
 
         # 8. Add Terms data in the sheet
         for term in terms:
@@ -542,9 +656,13 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
             else:
               term_row.append("")
           sheet_data.append(term_row)
+          aspect_rows.extend(_get_aspect_rows_for_entry(term, term_entry))
         
         # 9. Write data to the sheet
         _write_to_sheet(sheets_service, spreadsheet_id, sheet_data)
+
+        # 10. Write custom aspects to the aspects sheet (no-op when there are none)
+        _write_aspects_to_sheet(sheets_service, spreadsheet_id, aspect_rows)
 
         logging.info("Process completed successfully.")
 
