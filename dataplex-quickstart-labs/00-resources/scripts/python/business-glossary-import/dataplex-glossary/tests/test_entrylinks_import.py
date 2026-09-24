@@ -541,16 +541,22 @@ class TestResolutionHelpers:
         assert link.entryReferences[1].name == 'projects/p/locations/global/entryGroups/@dataplex/entries/.../terms/t1'
 
     def test_build_entry_link_with_6_columns(self, monkeypatch):
-        """build_entry_link should handle explicit 6-column SpreadsheetRow"""
+        """build_entry_link should handle explicit 6-column SpreadsheetRow and pass target_id"""
         from utils.models import SpreadsheetRow
         mock_service = Mock()
+        captured_term_ids = []
         monkeypatch.setattr(
             entrylinks_import.api_layer, 'lookup_entry_by_fqn',
-            lambda s, fqn, p: 'projects/p/locations/us/entryGroups/@bigquery/entries/e1'
+            lambda s, fqn, p: {'name': 'projects/p/locations/us/entryGroups/@bigquery/entries/e1'}
         )
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured_term_ids.append((identifier, term_id))
+            return 'projects/p/locations/global/entryGroups/@dataplex/entries/.../terms/t1'
+
         monkeypatch.setattr(
             entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
-            lambda s, term_id, p: 'projects/p/locations/global/entryGroups/@dataplex/entries/.../terms/t1'
+            fake_lookup_term
         )
 
         row = SpreadsheetRow(
@@ -568,6 +574,41 @@ class TestResolutionHelpers:
         assert link.entryReferences[0].name == 'projects/p/locations/us/entryGroups/@bigquery/entries/e1'
         assert link.entryReferences[0].path == 'Schema.order_id'
         assert link.entryReferences[1].name == 'projects/p/locations/global/entryGroups/@dataplex/entries/.../terms/t1'
+        assert captured_term_ids == [('my_proj.global.Sales.Order ID', 'order_id_term')]
+
+    def test_build_entry_link_synonym_passes_both_source_id_and_target_id(self, monkeypatch):
+        """Synonym link with 6 columns should pass both source_id and target_id to lookup_term_by_display_identifier"""
+        from utils.models import SpreadsheetRow
+        mock_service = Mock()
+        captured = []
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured.append((identifier, term_id))
+            return (
+                f'projects/p/locations/global/entryGroups/@dataplex/entries/'
+                f'projects/p/locations/global/glossaries/g1/terms/{term_id}'
+            )
+
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
+            fake_lookup_term
+        )
+
+        row = SpreadsheetRow(
+            entry_link_type='synonym',
+            source_name='my_proj.global.Sales.Order ID',
+            source_id='order_id_v1',
+            column='',
+            target_name='my_proj.global.Sales.Order ID',
+            target_id='order_id_v2'
+        )
+
+        link = entrylinks_import.build_entry_link(row, dataplex_service=mock_service, user_project='my_proj')
+        assert link is not None
+        assert captured == [
+            ('my_proj.global.Sales.Order ID', 'order_id_v1'),
+            ('my_proj.global.Sales.Order ID', 'order_id_v2'),
+        ]
 
     def test_resolve_with_full_resource_ids(self):
         """Resolving with full term resource names in ID columns generates correct entry names"""
@@ -580,10 +621,6 @@ class TestResolutionHelpers:
         result = entrylinks_import._resolve_target_entry_name('', target_id=target_id)
         assert 'entryGroups/@dataplex/entries/' in result
         assert 'glossaries/g1/terms/t2' in result
-
-
-
-
 
 # ============================================================================
 # MAIN FLOW TESTS

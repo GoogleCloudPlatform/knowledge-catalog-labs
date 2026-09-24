@@ -19,7 +19,7 @@ SHEET_HEADERS = ENTRYLINK_SHEET_HEADERS
 
 def _build_deduplication_key(entry_link_row: list) -> tuple:
     """Build a unique key for detecting duplicate entry links.
-    
+
     Row format: [link_type, source_name, source_id, column, target_name, target_id]
     or legacy: [link_type, source, column, target]
     """
@@ -42,7 +42,7 @@ def _build_deduplication_key(entry_link_row: list) -> tuple:
         source_key = entry_link_row[1] if len(entry_link_row) > 1 else ''
         column = entry_link_row[2] if len(entry_link_row) > 2 else ''
         target_key = entry_link_row[3] if len(entry_link_row) > 3 else ''
-    
+
     if link_type in ("synonym", "related"):
         return (link_type, tuple(sorted([source_key, target_key])), column)
     return (link_type, source_key, target_key, column)
@@ -52,13 +52,13 @@ def deduplicate_entry_links(entry_links: list) -> list:
     """Remove duplicate entry links from the list."""
     processed_link_keys = set()
     unique_entry_links = []
-    
+
     for entry_link_row in entry_links:
         dedup_key = _build_deduplication_key(entry_link_row)
         if dedup_key not in processed_link_keys:
             processed_link_keys.add(dedup_key)
             unique_entry_links.append(entry_link_row)
-    
+
     return unique_entry_links
 
 
@@ -73,7 +73,7 @@ def fetch_entry_links_for_region(term_entry_name: str, region: str, billing_proj
 
 
 def _resolve_regions_for_glossary(glossary_resource_name: str, billing_project: str) -> list:
-    """Resolve which regions to query for a glossary's entry links. """
+    """Resolve which regions to query for a glossary's entry links."""
     glossary_location = business_glossary_utils.extract_location_from_name(glossary_resource_name)
     try:
         return api_layer.resolve_regions_to_query(glossary_location, billing_project)
@@ -87,7 +87,7 @@ def _fetch_links_from_regions_parallel(term_entry_name: str, regions: list, bill
     collected_links = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         region_futures = {
-            executor.submit(fetch_entry_links_for_region, term_entry_name, region, billing_project): region 
+            executor.submit(fetch_entry_links_for_region, term_entry_name, region, billing_project): region
             for region in regions
         }
         for completed_future in as_completed(region_futures):
@@ -113,10 +113,10 @@ def fetch_entry_links_for_term(
     term_entry_name = business_glossary_utils.generate_entry_name_from_term_name(
         term_name, project_number=project_number
     )
-    
+
     if not regions_to_query:
         return []
-    
+
     collected_links = _fetch_links_from_regions_parallel(term_entry_name, regions_to_query, billing_project)
     return sheet_utils.entry_links_to_rows(
         collected_links, dataplex_service=dataplex_service, user_project=billing_project
@@ -130,7 +130,7 @@ def fetch_all_entry_links(
     all_entry_links = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         term_futures = {
-            executor.submit(fetch_entry_links_for_term, term, regions_to_query, billing_project, dataplex_service): term 
+            executor.submit(fetch_entry_links_for_term, term, regions_to_query, billing_project, dataplex_service): term
             for term in glossary_terms
         }
         for completed_future in as_completed(term_futures):
@@ -185,7 +185,6 @@ def export_entry_links(glossary_resource_name: str, spreadsheet_url: str, billin
     return True
 
 
-
 def _handle_export_exception(exception: Exception) -> int:
     """Handle exceptions during export and return exit code."""
     if isinstance(exception, KeyboardInterrupt):
@@ -200,7 +199,7 @@ def _handle_export_exception(exception: Exception) -> int:
     if is_network_error(exception):
         logger.error("Network error. Check your connection and try again.")
         return 1
-    
+
     logger.error(f"Export failed: {type(exception).__name__}: {exception}")
     logger.debug("Full exception:", exc_info=True)
     return 1
@@ -219,10 +218,10 @@ def _run_export() -> int:
     logging_utils.setup_file_logging()
     parsed_args = argument_parser.get_export_entrylinks_arguments()
     _log_export_arguments(parsed_args)
-    
+
     glossary_resource_name = business_glossary_utils.extract_glossary_name(parsed_args.glossary_url)
     logger.info(f"Starting EntryLink Export for: {glossary_resource_name}")
-    
+
     export_successful = export_entry_links(glossary_resource_name, parsed_args.spreadsheet_url, parsed_args.user_project)
     logger.info("Export completed successfully" if export_successful else "No EntryLinks found to export")
     return 0

@@ -15,7 +15,7 @@ class EntryReference:
     name: str
     path: str = ""
     type: Optional[str] = None
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'EntryReference':
         """Create an EntryReference from a dictionary."""
@@ -24,7 +24,7 @@ class EntryReference:
             path=data.get('path', ''),
             type=data.get('type')
         )
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary, excluding None values."""
         result = {'name': self.name}
@@ -41,7 +41,7 @@ class EntryLink:
     name: str
     entryLinkType: str
     entryReferences: List[EntryReference] = field(default_factory=list)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'EntryLink':
         """Create EntryLink from a dictionary."""
@@ -53,7 +53,7 @@ class EntryLink:
             entryLinkType=entry_data.get('entryLinkType', ''),
             entryReferences=refs
         )
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
@@ -83,6 +83,7 @@ class SpreadsheetRow:
     column: str = ""
     target_name: str = ""
     target_id: str = ""
+    row_number: int = 0
 
     def __init__(
         self,
@@ -97,6 +98,7 @@ class SpreadsheetRow:
         source_entry: Optional[str] = None,
         target_entry: Optional[str] = None,
         source_path: Optional[str] = None,
+        row_number: int = 0,
     ):
         self.entry_link_type = entry_link_type
         # Handle source (prefer explicit source_name/source_id, fallback to source/source_entry)
@@ -106,6 +108,7 @@ class SpreadsheetRow:
         self.target_name = target_name if target_name else (target_entry or target or "")
         self.target_id = target_id
         self.column = source_path if source_path is not None else column
+        self.row_number = int(row_number) if row_number else 0
 
     @property
     def source(self) -> str:
@@ -130,7 +133,7 @@ class SpreadsheetRow:
         return self.column
 
     @classmethod
-    def from_dict(cls, data: Dict[str, str]) -> 'SpreadsheetRow':
+    def from_dict(cls, data: Dict[str, Any]) -> 'SpreadsheetRow':
         """Create a SpreadsheetRow from a dictionary supporting 6-column and legacy keys."""
         link_type = (
             data.get('entry_link_type') or data.get('Entry link type') or data.get('entryLinkType', '')
@@ -150,13 +153,17 @@ class SpreadsheetRow:
         column = (
             data.get('column') or data.get('Column') or data.get('source_path') or data.get('sourcePath', '')
         ).strip()
+        raw_row_num = data.get('row_number', 0)
+        try:
+            row_number = int(raw_row_num) if raw_row_num else 0
+        except (ValueError, TypeError):
+            row_number = 0
         return cls(
             entry_link_type=link_type,
             source_name=source_name,
             source_id=source_id,
             column=column,
             target_name=target_name,
-            target_id=target_id
+            target_id=target_id,
+            row_number=row_number,
         )
-
-

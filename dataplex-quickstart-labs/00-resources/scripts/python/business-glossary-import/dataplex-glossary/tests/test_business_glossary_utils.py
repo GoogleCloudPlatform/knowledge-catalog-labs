@@ -168,4 +168,3 @@ class TestExtractShortId:
         assert business_glossary_utils.extract_short_id("simple_id") == "simple_id"
         assert business_glossary_utils.extract_short_id("") == ""
         assert business_glossary_utils.extract_short_id(None) == ""
-

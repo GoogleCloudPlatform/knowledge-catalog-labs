@@ -121,7 +121,23 @@ LINK_TYPES = {
     DP_LINK_TYPE_RELATED: 'projects/dataplex-types/locations/global/entryLinkTypes/related'
 }
 
+# --- BigQuery Candidate Locations ---
+BIGQUERY_CANDIDATE_LOCATIONS = ["us", "us-central1", "eu", "us-east1", "us-west1", "global"]
+
 # --- Google Sheets Headers ---
 ENTRYLINK_SHEET_HEADERS = ["Entry link type", "Source Name", "Source ID", "Column", "Target Name", "Target ID"]
 LEGACY_ENTRYLINK_SHEET_HEADERS = ["entry_link_type", "source_entry", "target_entry", "source_path"]
 FOUR_COLUMN_ENTRYLINK_SHEET_HEADERS = ["Entry link type", "Source", "Column", "Target"]
+
+TYPE_HEADER_ALIASES = ["entry link type", "entry_link_type", "link_type", "type"]
+SOURCE_ID_HEADER_ALIASES = ["source id", "source_id", "sourceid", "source resource name", "source entry id"]
+SOURCE_NAME_HEADER_ALIASES = [
+    "source name", "sourcename", "source display name", "sourcedisplayname",
+    "source", "source_entry", "sourceentry",
+]
+TARGET_ID_HEADER_ALIASES = ["target id", "target_id", "targetid", "target resource name", "target entry id"]
+TARGET_NAME_HEADER_ALIASES = [
+    "target name", "targetname", "target display name", "targetdisplayname",
+    "target", "target_entry", "targetentry",
+]
+COLUMN_HEADER_ALIASES = ["column", "column name", "source_path", "sourcepath", "path"]

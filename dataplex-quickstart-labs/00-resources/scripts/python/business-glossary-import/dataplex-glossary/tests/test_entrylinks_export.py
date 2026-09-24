@@ -81,20 +81,20 @@ class TestBuildDeduplicationKey:
         """6-column row format should deduplicate symmetric links"""
         row1 = ['synonym', 'proj.loc.glossary.Term A', 'term_a', '', 'proj.loc.glossary.Term B', 'term_b']
         row2 = ['synonym', 'proj.loc.glossary.Term B', 'term_b', '', 'proj.loc.glossary.Term A', 'term_a']
-        
+
         key1 = entrylinks_export._build_deduplication_key(row1)
         key2 = entrylinks_export._build_deduplication_key(row2)
-        
+
         assert key1 == key2
 
     def test_6_column_definition_link_type_directional(self):
         """6-column row format definition links are directional"""
         row1 = ['definition', 'bigquery:p.d.t', 't', 'col1', 'proj.loc.glossary.Term A', 'term_a']
         row2 = ['definition', 'proj.loc.glossary.Term A', 'term_a', 'col1', 'bigquery:p.d.t', 't']
-        
+
         key1 = entrylinks_export._build_deduplication_key(row1)
         key2 = entrylinks_export._build_deduplication_key(row2)
-        
+
         assert key1 != key2
 
 

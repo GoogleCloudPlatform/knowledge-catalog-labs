@@ -49,11 +49,14 @@ Share the Google Sheet with the service account (`SA_EMAIL`) as a **Viewer** so 
 
 *   **Glossary Import**: The sheet should contain the following header row:
     `id, parent, display_name, description, overview, type, contact1_email, contact1_name, contact2_email, contact2_name, label1_key, label1_value, label2_key, label2_value`
-*   **EntryLinks Import**: The sheet should contain the following columns in the header row:
+*   **EntryLinks Import**: The sheet should contain the following 6 columns in the header row:
+    `Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
     *   `Entry link type` (or `entry_link_type`) - Type of link: `definition`, `related`, or `synonym`
-    *   `Source` (or `source_entry`) - For `definition` links, the data asset FQN (e.g., `bigquery:project.dataset.table`). For `synonym`/`related` links, the 4-part term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`. Full Dataplex entry resource names are also accepted for backward compatibility.
+    *   `Source Name` (or `Source`) - For `definition` links, the data asset FQN (e.g., `bigquery:project.dataset.table`). For `synonym`/`related` links, the 4-part term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`. Full Dataplex entry resource names are also accepted for backward compatibility.
+    *   `Source ID` (optional) - For `synonym`/`related` links, the unique short `term_id` of the source glossary term (used for exact term lookup when present). For `definition` links, the short ID of the source asset.
     *   `Column` (or `source_path`) - (Optional) Specific column/field name (e.g., `order_id` or `Schema.order_id`). Leave empty for table-level definitions and synonym/related links.
-    *   `Target` (or `target_entry`) - The 4-part term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`. Full Dataplex entry resource names are also accepted for backward compatibility.
+    *   `Target Name` (or `Target`) - The 4-part term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`. Full Dataplex entry resource names are also accepted for backward compatibility.
+    *   `Target ID` (optional) - The unique short `term_id` of the target glossary term (used for exact term lookup within the glossary identified by `Target Name`).
 
 ### Authentication
 
@@ -160,4 +163,3 @@ Where:
 *   `Target ID` (optional): Short ID of the target term.
 
 *(Note: 4-column sheets `[Entry link type, Source, Column, Target]` and legacy full-entry-name sheets remain fully supported for backward compatibility.)*
-

@@ -482,6 +482,66 @@ class TestLookupTermByDisplayIdentifier:
                 mock_service, 'my-proj.global.Sales.MissingTerm'
             )
 
+    def test_resolves_duplicate_display_name_using_term_id(self, monkeypatch):
+        mock_service = MagicMock()
+        monkeypatch.setattr(api_layer, 'get_project_number', lambda p, u=None: p)
+        monkeypatch.setattr(
+            api_layer, 'list_glossaries',
+            lambda s, parent: [{'name': 'projects/my-proj/locations/global/glossaries/g1', 'displayName': 'Sales'}]
+        )
+        monkeypatch.setattr(
+            api_layer, 'list_glossary_terms',
+            lambda s, g: [
+                {'name': 'projects/my-proj/locations/global/glossaries/g1/terms/status_order', 'displayName': 'Status'},
+                {'name': 'projects/my-proj/locations/global/glossaries/g1/terms/status_customer', 'displayName': 'Status'},
+            ]
+        )
+
+        entry_name = api_layer.lookup_term_by_display_identifier(
+            mock_service, 'my-proj.global.Sales.Status', term_id='status_customer'
+        )
+        assert entry_name.endswith('/glossaries/g1/terms/status_customer')
+
+    def test_raises_ambiguous_term_error_when_term_id_omitted_on_duplicate_display_names(self, monkeypatch):
+        from utils.error import AmbiguousTermError
+        mock_service = MagicMock()
+        monkeypatch.setattr(api_layer, 'get_project_number', lambda p, u=None: p)
+        monkeypatch.setattr(
+            api_layer, 'list_glossaries',
+            lambda s, parent: [{'name': 'projects/my-proj/locations/global/glossaries/g1', 'displayName': 'Sales'}]
+        )
+        monkeypatch.setattr(
+            api_layer, 'list_glossary_terms',
+            lambda s, g: [
+                {'name': 'projects/my-proj/locations/global/glossaries/g1/terms/status_order', 'displayName': 'Status'},
+                {'name': 'projects/my-proj/locations/global/glossaries/g1/terms/status_customer', 'displayName': 'Status'},
+            ]
+        )
+
+        with pytest.raises(AmbiguousTermError):
+            api_layer.lookup_term_by_display_identifier(
+                mock_service, 'my-proj.global.Sales.Status'
+            )
+
+    def test_resolves_glossary_display_name_containing_dots(self, monkeypatch):
+        mock_service = MagicMock()
+        monkeypatch.setattr(api_layer, 'get_project_number', lambda p, u=None: p)
+        monkeypatch.setattr(
+            api_layer, 'list_glossaries',
+            lambda s, parent: [{'name': 'projects/my-proj/locations/global/glossaries/g1', 'displayName': 'Finance v2.0'}]
+        )
+        monkeypatch.setattr(
+            api_layer, 'list_glossary_terms',
+            lambda s, g: [
+                {'name': 'projects/my-proj/locations/global/glossaries/g1/terms/net_rev', 'displayName': 'Net.Revenue'}
+            ]
+        )
+
+        entry_name = api_layer.lookup_term_by_display_identifier(
+            mock_service, 'my-proj.global.Finance v2.0.Net.Revenue', term_id='net_rev'
+        )
+        assert entry_name.endswith('/glossaries/g1/terms/net_rev')
+
 
 class TestLookupEntryByFQN:
     """Test lookup_entry_by_fqn."""
@@ -522,14 +582,28 @@ class TestLookupEntryByFQN:
         entry2 = api_layer.lookup_entry_by_fqn(mock_service, 'custom:my_ds.custom_01', 'user-proj')
         assert entry2['name'] == 'projects/my-proj/locations/us-central1/entryGroups/my-eg/entries/custom-01'
 
-    def test_raises_when_fqn_not_found(self, monkeypatch):
+    def test_raises_when_fqn_not_found_and_negatively_caches(self, monkeypatch):
         from utils.error import EntryFQNNotFoundError
         mock_service = MagicMock()
         monkeypatch.setattr(api_layer, 'get_project_number', lambda p, u=None: p)
+        call_count = {'search': 0}
+
+        def fake_search(*args, **kwargs):
+            call_count['search'] += 1
+            mock_req = MagicMock()
+            mock_req.execute.return_value = {'results': []}
+            return mock_req
+
         monkeypatch.setattr(api_layer, 'list_supported_locations', lambda p, s: ['us'])
         mock_service.projects().locations().entryGroups().entries().get().execute.side_effect = Exception("Not found")
-        mock_service.projects().locations().searchEntries().execute.return_value = {'results': []}
+        mock_service.projects().locations().searchEntries.side_effect = fake_search
 
         with pytest.raises(EntryFQNNotFoundError):
             api_layer.lookup_entry_by_fqn(mock_service, 'bigquery:missing.ds.tbl', 'user-proj')
+        first_search_calls = call_count['search']
+        assert first_search_calls == 1
 
+        # Second lookup should immediately raise from negative cache without re-probing
+        with pytest.raises(EntryFQNNotFoundError):
+            api_layer.lookup_entry_by_fqn(mock_service, 'bigquery:missing.ds.tbl', 'user-proj')
+        assert call_count['search'] == first_search_calls

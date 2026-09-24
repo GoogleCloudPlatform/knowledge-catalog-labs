@@ -494,15 +494,16 @@ class TestExtractColumnIndices:
         data = [
             ['Entry link type', 'Source Name', 'Source ID', 'Column', 'Target Name', 'Target ID']
         ]
-        
+
         type_idx, src_name_idx, src_id_idx, col_idx, tgt_name_idx, tgt_id_idx = sheet_utils.extract_column_indices(data)
-        
+
         assert type_idx == 0
         assert src_name_idx == 1
         assert src_id_idx == 2
         assert col_idx == 3
         assert tgt_name_idx == 4
         assert tgt_id_idx == 5
+
 
     def test_extracts_legacy_header_indices(self):
         """Extract column indices from legacy headers"""
@@ -562,8 +563,43 @@ class TestEdgeCases:
     def test_handles_empty_strings(self):
         """Handle empty strings in row"""
         row = ['', '', '', '', '', '']
-        
+
         result = sheet_utils._create_entry_link_dict(row, 0, 1, 2, 3, 4, 5)
-        
+
         assert result['entry_link_type'] == ''
         assert result['source_name'] == ''
+
+    def test_rows_with_omitted_trailing_target_id_are_not_dropped(self):
+        """Rows where Google Sheets trims an empty trailing Target ID column should not be dropped"""
+        rows = [
+            ['Entry link type', 'Source Name', 'Source ID', 'Column', 'Target Name', 'Target ID'],
+            ['definition', 'bigquery:p.d.t', 't', 'col1', 'p.global.G.Term']  # length 5 (Target ID trimmed)
+        ]
+
+        result = sheet_utils.rows_to_entry_link_dicts(rows, 0, 1, 2, 3, 4, 5)
+        assert len(result) == 1
+        assert result[0]['source_name'] == 'bigquery:p.d.t'
+        assert result[0]['target_name'] == 'p.global.G.Term'
+        assert result[0]['target_id'] == ''
+        assert result[0]['row_number'] == '2'
+
+    def test_export_falls_back_to_raw_name_when_term_resolution_raises(self, monkeypatch):
+        """_add_entry_link_to_rows should fall back to raw entry name if term resolution fails"""
+        mock_service = MagicMock()
+        monkeypatch.setattr(sheet_utils.api_layer, 'get_entry_fqn', lambda s, r, p: 'bigquery:p.d.t')
+
+        def fail_resolve(*args, **kwargs):
+            raise RuntimeError("Permission denied")
+
+        monkeypatch.setattr(sheet_utils.api_layer, 'resolve_term_entry_to_display_identifier', fail_resolve)
+
+        rows = []
+        source_ref = {'name': 'projects/p/locations/us/entryGroups/@bigquery/entries/t', 'path': 'Schema.c'}
+        target_ref = {'name': 'projects/p/locations/global/entryGroups/@dataplex/entries/projects/p/locations/global/glossaries/g/terms/term1'}
+        sheet_utils._add_entry_link_to_rows(rows, 'definition', source_ref, target_ref, dataplex_service=mock_service)
+
+        assert len(rows) == 1
+        assert rows[0][0] == 'definition'
+        assert rows[0][1] == 'bigquery:p.d.t'
+        assert rows[0][4] == target_ref['name']
+        assert rows[0][5] == 'term1'

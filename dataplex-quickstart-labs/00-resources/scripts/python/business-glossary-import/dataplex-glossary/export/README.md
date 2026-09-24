@@ -175,4 +175,3 @@ Where:
 *   `Target ID`: Short identifier of the target glossary term.
 
 *(Note: Legacy 4-column sheets `[Entry link type, Source, Column, Target]` and full Dataplex entry resource names remain supported for backward compatibility.)*
-

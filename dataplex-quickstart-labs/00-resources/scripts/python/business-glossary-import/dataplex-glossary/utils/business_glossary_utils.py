@@ -14,19 +14,20 @@ from utils.constants import (
     GLOSSARY_NAME_PATTERN,
     TERM_NAME_PATTERN,
 )
-from utils.error import InvalidTermNameError
+from utils.error import InvalidTermIdentifierError, InvalidTermNameError
+from utils.models import ParsedTermIdentifier
 
 
 def extract_glossary_name(url: str) -> str:
     """Extract the glossary resource name from a Dataplex URL or resource name.
-    
+
     Searches for 'projects/{project}/locations/{location}/glossaries/{glossary}'
     pattern anywhere in the input string.
     """
     match = GLOSSARY_NAME_PATTERN.search(url)
     if match:
         return f"projects/{match.group('project_id')}/locations/{match.group('location_id')}/glossaries/{match.group('glossary_id')}"
-    
+
     raise ValueError(
         f"Could not extract glossary resource from: {url}. "
         f"Expected format: 'projects/{{project}}/locations/{{location}}/glossaries/{{glossary}}'"
@@ -36,7 +37,7 @@ def extract_glossary_name(url: str) -> str:
 def generate_entry_name_from_term_name(term_name: str, project_number: str = "") -> str:
     """
     Generates a Dataplex entry ID from a glossary term name.
-    
+
     Args:
         term_name: The full term name in format:
                    projects/{project}/locations/{location}/glossaries/{glossary}/terms/{term}
@@ -48,15 +49,15 @@ def generate_entry_name_from_term_name(term_name: str, project_number: str = "")
     match = TERM_NAME_PATTERN.match(term_name)
     if not match:
         raise InvalidTermNameError(f"Invalid term name format: {term_name}")
-    
+
     project_id = match.group('project_id')
     location_id = match.group('location_id')
     glossary_id = match.group('glossary_id')
     term_id = match.group('term_id')
-    
+
     inner_project = project_number if project_number else project_id
     outer_project = project_number if project_number else project_id
-    
+
     return (
         f"projects/{outer_project}/locations/{location_id}/entryGroups/{DATAPLEX_SYSTEM_ENTRY_GROUP}/entries/"
         f"projects/{inner_project}/locations/{location_id}/glossaries/{glossary_id}/terms/{term_id}"
@@ -83,11 +84,11 @@ def extract_location_from_name(resource_name: str) -> str:
     """
     # Generic pattern to extract location from any resource name
     location_pattern = re.compile(r"projects/[^/]+/locations/(?P<location_id>[^/]+)")
-    
+
     match = location_pattern.search(resource_name)
     if match:
         return match.group('location_id')
-    
+
     raise ValueError(
         f"Could not extract location from resource name: {resource_name}. "
         f"Expected format containing 'projects/{{project}}/locations/{{location}}'"
@@ -97,13 +98,13 @@ def extract_location_from_name(resource_name: str) -> str:
 def normalize_id(name: str) -> str:
     """
     Converts a string to a valid Dataplex ID (lowercase, numbers, hyphens), starting with a letter.
-    
+
     Args:
         name: The string to normalize
-        
+
     Returns:
         A normalized ID suitable for Dataplex (lowercase, numbers, hyphens, starts with letter)
-        
+
     Example:
         >>> normalize_id("My Special ID!")
         'my-special-id'
@@ -121,7 +122,7 @@ def normalize_id(name: str) -> str:
 
 def generate_entry_link_id() -> str:
     """
-    Generate a unique entry link ID that starts with a lowercase letter 
+    Generate a unique entry link ID that starts with a lowercase letter
     and contains only lowercase letters and numbers.
     """
     entrylink_id = 'g' + uuid.uuid4().hex
@@ -140,31 +141,32 @@ def format_term_display_identifier(
     return f"{project_id.strip()}{delimiter}{location.strip()}{delimiter}{glossary_display_name.strip()}{delimiter}{term_display_name.strip()}"
 
 
-def parse_term_display_identifier(identifier: str, delimiter: str = ".") -> 'ParsedTermIdentifier':
+def parse_term_display_identifier(
+    identifier: str, delimiter: str = ".", allow_three_part: bool = False
+) -> ParsedTermIdentifier:
     """Parse a human-readable term identifier string into a ParsedTermIdentifier.
 
     Expected format: '<project>.<location>.<glossaryDisplayName>.<termDisplayName>'
-    (or slash-delimited if delimiter='/').
+    (or 3-part '<project>.<location>.<glossaryDisplayName>' when allow_three_part=True).
 
     Args:
         identifier: The term display identifier string.
         delimiter: Delimiter character (default '.').
+        allow_three_part: If True, allows 3-part identifier without termDisplayName.
 
     Returns:
         ParsedTermIdentifier containing project_id, location, glossary_display_name, and term_display_name.
 
     Raises:
-        InvalidTermIdentifierError: If the identifier has fewer than 4 segments or empty components.
+        InvalidTermIdentifierError: If the identifier has fewer than required segments or empty components.
     """
-    from utils.error import InvalidTermIdentifierError
-    from utils.models import ParsedTermIdentifier
-
     if not identifier or not isinstance(identifier, str):
         raise InvalidTermIdentifierError(f"Invalid term identifier: '{identifier}'. Identifier must be a non-empty string.")
 
     cleaned = identifier.strip()
     parts = cleaned.split(delimiter)
-    if len(parts) < 4:
+    min_parts = 3 if allow_three_part else 4
+    if len(parts) < min_parts:
         raise InvalidTermIdentifierError(
             f"Invalid term identifier '{cleaned}'. Expected format: "
             f"'<project>{delimiter}<location>{delimiter}<glossaryDisplayName>{delimiter}<termDisplayName>'"
@@ -173,9 +175,9 @@ def parse_term_display_identifier(identifier: str, delimiter: str = ".") -> 'Par
     project_id = parts[0].strip()
     location_id = parts[1].strip()
     glossary_display_name = parts[2].strip()
-    term_display_name = delimiter.join(parts[3:]).strip()
+    term_display_name = delimiter.join(parts[3:]).strip() if len(parts) >= 4 else ""
 
-    if not project_id or not location_id or not glossary_display_name or not term_display_name:
+    if not project_id or not location_id or not glossary_display_name or (not allow_three_part and not term_display_name):
         raise InvalidTermIdentifierError(
             f"Invalid term identifier '{cleaned}'. All components (project, location, glossary, term) must be non-empty."
         )
@@ -292,5 +294,3 @@ def extract_short_id(resource_or_entry_name: str) -> str:
         return last_part
 
     return name
-
-

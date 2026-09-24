@@ -13,20 +13,21 @@ from googleapiclient.errors import HttpError
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from . import api_call_utils, logging_utils
+from . import api_call_utils, business_glossary_utils, logging_utils
 from .api_call_utils import fetch_api_response
 from .constants import (
+    API_CALL_DELAY_SECONDS,
+    BIGQUERY_CANDIDATE_LOCATIONS,
     CLOUD_RESOURCE_MANAGER_BASE_URL,
     DATAPLEX_BASE_URL,
     ENTRY_NAME_PATTERN,
     EXCLUDED_LOCATIONS,
     PAGE_SIZE,
     PROJECT_PATTERN,
-    API_CALL_DELAY_SECONDS,
     TERM_NAME_PATTERN,
 )
-
 from .error import (
+    AmbiguousTermError,
     DataplexAPIError,
     EntryFQNNotFoundError,
     GlossaryNotFoundError,
@@ -34,24 +35,24 @@ from .error import (
     InvalidEntryIdFormatError,
     InvalidGlossaryNameError,
     InvalidSpreadsheetURLError,
-    InvalidTermIdentifierError,
     InvalidTermNameError,
-    NetworkError,
     NoCategoriesFoundError,
     NoTermsFoundError,
     SheetsAPIError,
     TermNotFoundError,
 )
-from .retry_utils import execute_with_retry, is_retryable_google_api_error
+from .retry_utils import execute_with_retry
 
 logger = logging_utils.get_logger()
 
+# Module-level caches shared across worker threads (dict get/set is GIL-atomic in CPython).
 _locations_cache: Dict[str, List[str]] = {}
 _glossary_cache: Dict[str, Dict] = {}
 _term_cache: Dict[str, Dict] = {}
 _project_glossaries_cache: Dict[str, List[Dict]] = {}
-_glossary_terms_map_cache: Dict[str, Dict[str, str]] = {}
+_glossary_terms_map_cache: Dict[str, Dict] = {}
 _fqn_to_entry_cache: Dict[str, Dict] = {}
+_failed_fqn_cache: set = set()
 _entry_to_fqn_cache: Dict[str, str] = {}
 _project_id_to_number_cache: Dict[str, str] = {}
 _project_number_to_id_cache: Dict[str, str] = {}
@@ -60,7 +61,7 @@ _project_number_to_id_cache: Dict[str, str] = {}
 def clear_caches():
     """Clear all in-memory caches (useful between batch runs and in unit tests)."""
     global _locations_cache, _glossary_cache, _term_cache, _project_glossaries_cache
-    global _glossary_terms_map_cache, _fqn_to_entry_cache, _entry_to_fqn_cache
+    global _glossary_terms_map_cache, _fqn_to_entry_cache, _failed_fqn_cache, _entry_to_fqn_cache
     global _project_id_to_number_cache, _project_number_to_id_cache
     _locations_cache.clear()
     _glossary_cache.clear()
@@ -68,6 +69,7 @@ def clear_caches():
     _project_glossaries_cache.clear()
     _glossary_terms_map_cache.clear()
     _fqn_to_entry_cache.clear()
+    _failed_fqn_cache.clear()
     _entry_to_fqn_cache.clear()
     _project_id_to_number_cache.clear()
     _project_number_to_id_cache.clear()
@@ -326,7 +328,7 @@ def get_project_id_from_number(project_identifier: str, user_project: str = "") 
             _project_id_to_number_cache[proj_id] = project_identifier
             return proj_id
     except Exception as e:
-        logger.debug(f"Could not resolve project ID for number '{project_identifier}': {e}")
+        logger.warning(f"Could not resolve project ID for number '{project_identifier}': {e}")
 
     return project_identifier
 
@@ -334,25 +336,25 @@ def get_project_id_from_number(project_identifier: str, user_project: str = "") 
 def list_supported_locations(billing_project: str, dataplex_service=None, force_refresh: bool = False) -> List[str]:
     """Lists all supported Dataplex locations for a project with caching."""
     global _locations_cache
-    
+
     if not force_refresh and billing_project in _locations_cache:
         return _locations_cache[billing_project]
-    
+
     if dataplex_service is None:
         dataplex_service = authenticate_dataplex()
-    
+
     try:
         parent_resource = f"projects/{billing_project}"
         logger.debug(f"Request: locations.list(name={parent_resource})")
-        
+
         locations_request = dataplex_service.projects().locations().list(name=parent_resource)
         response = execute_with_retry(locations_request.execute, f"List locations for {billing_project}")
         locations = [loc.get('locationId') for loc in response.get('locations', []) if loc.get('locationId')]
-        
+
         _locations_cache[billing_project] = locations
         logger.debug(f"Response: {len(locations)} locations for {billing_project}")
         return locations
-        
+
     except Exception as locations_error:
         logger.error(f"Error while listing supported locations: {locations_error}")
         raise DataplexAPIError(f"Error while listing supported locations: {locations_error}")
@@ -360,7 +362,7 @@ def list_supported_locations(billing_project: str, dataplex_service=None, force_
 
 def resolve_regions_to_query(location: str, user_project: str) -> List[str]:
     """Resolve location to regions for entry link queries.
-    
+
     For 'global' location, returns all supported locations for fanout.
     For specific locations, returns just that location.
     """
@@ -429,7 +431,6 @@ def resolve_term_entry_to_display_identifier(
     dataplex_service: build, term_entry_name: str, user_project: str = ""
 ) -> str:
     """Resolves a Dataplex term entry resource name into '<project>.<location>.<glossaryDisplayName>.<termDisplayName>'."""
-    from utils import business_glossary_utils
     term_resource_name = business_glossary_utils.extract_term_resource_from_entry_name(term_entry_name)
 
     match = TERM_NAME_PATTERN.match(term_resource_name)
@@ -466,7 +467,7 @@ def get_entry_fqn(dataplex_service: build, entry_resource_name: str, user_projec
     if entry_resource_name in _entry_to_fqn_cache:
         return _entry_to_fqn_cache[entry_resource_name]
 
-    project_id, location_id, entry_group, entry_id = parse_entry_name(entry_resource_name)
+    project_id, location_id, _, _ = parse_entry_name(entry_resource_name)
     parent = f"projects/{user_project}/locations/{location_id}"
     entry_dict = lookup_entry(dataplex_service, entry_resource_name, parent)
     if not entry_dict:
@@ -476,29 +477,93 @@ def get_entry_fqn(dataplex_service: build, entry_resource_name: str, user_projec
     fqn = entry_dict.get("fullyQualifiedName") if entry_dict else None
     if not fqn:
         logger.warning(f"Could not retrieve fullyQualifiedName for entry {entry_resource_name}, falling back to entry name.")
-        fqn = entry_resource_name
+        return entry_resource_name
 
     _entry_to_fqn_cache[entry_resource_name] = fqn
     return fqn
 
 
-def lookup_term_by_display_identifier(dataplex_service: build, identifier: str, user_project: str = "") -> str:
-    """Resolves a human-readable term identifier to a Dataplex term entry resource name."""
-    from utils import business_glossary_utils
-    parsed = business_glossary_utils.parse_term_display_identifier(identifier)
+def _match_glossary_for_identifier(
+    glossaries: List[Dict], parsed_glossary_name: str, parsed_term_name: str
+) -> tuple[Optional[Dict], str]:
+    """Match a glossary by display name or ID, supporting glossary display names that contain dots."""
+    # 1. Exact display name match
+    for g in glossaries:
+        if (g.get('displayName') or '').strip() == parsed_glossary_name:
+            return g, parsed_term_name
+
+    # 2. Case-insensitive display name or glossary ID match
+    for g in glossaries:
+        if (g.get('displayName') or '').strip().lower() == parsed_glossary_name.lower():
+            return g, parsed_term_name
+        glossary_id = g.get('name', '').split('/')[-1]
+        if glossary_id.lower() == parsed_glossary_name.lower():
+            return g, parsed_term_name
+
+    # 3. Handle glossary display names containing '.' (e.g. 'Finance v1.2.Revenue')
+    if parsed_term_name:
+        combined = f"{parsed_glossary_name}.{parsed_term_name}"
+        for g in glossaries:
+            g_display = (g.get('displayName') or '').strip()
+            if g_display and combined.lower().startswith(g_display.lower() + "."):
+                remainder = combined[len(g_display) + 1:].strip()
+                if remainder:
+                    return g, remainder
+
+    return None, parsed_term_name
+
+
+def _get_or_build_glossary_terms_index(dataplex_service: build, glossary_name: str) -> Dict:
+    """Build and cache separate ID and display-name indexes for a glossary's terms."""
+    if glossary_name not in _glossary_terms_map_cache:
+        terms = list_glossary_terms(dataplex_service, glossary_name)
+        by_id: Dict[str, str] = {}
+        by_id_lower: Dict[str, str] = {}
+        by_display_exact: Dict[str, List[str]] = {}
+        by_display_lower: Dict[str, List[str]] = {}
+
+        for t in terms:
+            t_name = t.get('name', '')
+            if not t_name:
+                continue
+            t_id = t_name.split('/')[-1]
+            t_display = (t.get('displayName') or '').strip()
+
+            if t_id:
+                by_id[t_id] = t_name
+                by_id_lower[t_id.lower()] = t_name
+            if t_display:
+                by_display_exact.setdefault(t_display, []).append(t_name)
+                by_display_lower.setdefault(t_display.lower(), []).append(t_name)
+
+        _glossary_terms_map_cache[glossary_name] = {
+            "by_id": by_id,
+            "by_id_lower": by_id_lower,
+            "by_display_exact": by_display_exact,
+            "by_display_lower": by_display_lower,
+        }
+    return _glossary_terms_map_cache[glossary_name]
+
+
+def lookup_term_by_display_identifier(
+    dataplex_service: build, identifier: str, user_project: str = "", term_id: str = ""
+) -> str:
+    """Resolves a human-readable term identifier (and optional term_id) to a Dataplex term entry resource name.
+
+    When `term_id` (from Source ID / Target ID) is provided, resolves the glossary from `identifier`
+    and looks up the term directly by its unique `term_id`. When `term_id` is omitted (e.g. 4-column sheets),
+    looks up the term by display name and raises `AmbiguousTermError` if multiple terms share that display name.
+    """
+    cleaned_term_id = term_id.strip() if term_id else ""
+    parsed = business_glossary_utils.parse_term_display_identifier(
+        identifier, allow_three_part=bool(cleaned_term_id)
+    )
     parent_loc = f"projects/{parsed.project_id}/locations/{parsed.location}"
 
     glossaries = list_glossaries(dataplex_service, parent_loc)
-    matched_glossary = None
-    for g in glossaries:
-        if (g.get('displayName') or '').strip().lower() == parsed.glossary_display_name.lower():
-            matched_glossary = g
-            break
-        # Also check if user passed glossary ID
-        glossary_id = g.get('name', '').split('/')[-1]
-        if glossary_id.lower() == parsed.glossary_display_name.lower():
-            matched_glossary = g
-            break
+    matched_glossary, effective_term_display = _match_glossary_for_identifier(
+        glossaries, parsed.glossary_display_name, parsed.term_display_name
+    )
 
     if not matched_glossary:
         raise GlossaryNotFoundError(
@@ -506,34 +571,50 @@ def lookup_term_by_display_identifier(dataplex_service: build, identifier: str, 
         )
 
     glossary_name = matched_glossary['name']
+    terms_index = _get_or_build_glossary_terms_index(dataplex_service, glossary_name)
+    by_id = terms_index["by_id"]
+    by_id_lower = terms_index["by_id_lower"]
+    by_display_exact = terms_index["by_display_exact"]
+    by_display_lower = terms_index["by_display_lower"]
 
-    # Load terms for glossary (cached)
-    if glossary_name not in _glossary_terms_map_cache:
-        terms = list_glossary_terms(dataplex_service, glossary_name)
-        terms_map = {}
-        for t in terms:
-            t_name = t.get('name', '')
-            t_display = (t.get('displayName') or '').strip().lower()
-            t_id = t_name.split('/')[-1].lower()
-            if t_display:
-                terms_map[t_display] = t_name
-            if t_id:
-                terms_map[t_id] = t_name
-        _glossary_terms_map_cache[glossary_name] = terms_map
+    term_resource_name = None
 
-    terms_map = _glossary_terms_map_cache[glossary_name]
-    target_term_key = parsed.term_display_name.strip().lower()
-    if target_term_key not in terms_map:
-        raise TermNotFoundError(
-            f"Term '{parsed.term_display_name}' not found in glossary '{parsed.glossary_display_name}' ({glossary_name})"
-        )
+    # 1. If explicit term_id (Source ID / Target ID) is provided, use it as the authoritative unique term key
+    if cleaned_term_id:
+        term_resource_name = by_id.get(cleaned_term_id) or by_id_lower.get(cleaned_term_id.lower())
+        if not term_resource_name:
+            raise TermNotFoundError(
+                f"Term with ID '{cleaned_term_id}' not found in glossary '{parsed.glossary_display_name}' ({glossary_name})"
+            )
+    else:
+        # 2. Fall back to display name lookup (4-column format or blank ID cell)
+        target_display = effective_term_display.strip()
+        matches = by_display_exact.get(target_display) or by_display_lower.get(target_display.lower(), [])
+        if len(matches) == 1:
+            term_resource_name = matches[0]
+        elif len(matches) > 1:
+            colliding_ids = [business_glossary_utils.extract_short_id(m) for m in matches]
+            raise AmbiguousTermError(
+                f"Term display name '{target_display}' is ambiguous in glossary '{parsed.glossary_display_name}' "
+                f"({glossary_name}): matches term IDs {colliding_ids}. "
+                f"Please specify the unique term ID in the 'Source ID' / 'Target ID' column."
+            )
+        else:
+            # Allow 4-column sheets where the 4th segment is already the term ID
+            term_resource_name = by_id.get(target_display) or by_id_lower.get(target_display.lower())
+            if not term_resource_name:
+                raise TermNotFoundError(
+                    f"Term '{target_display}' not found in glossary '{parsed.glossary_display_name}' ({glossary_name})"
+                )
 
-    term_resource_name = terms_map[target_term_key]
     try:
         project_number = get_project_number(parsed.project_id, user_project or parsed.project_id)
-    except Exception:
-        project_number = parsed.project_id
-    return business_glossary_utils.generate_entry_name_from_term_name(term_resource_name, project_number=project_number)
+    except Exception as e:
+        logger.warning(f"Could not resolve numeric project number for '{parsed.project_id}', using project ID: {e}")
+        project_number = ""
+    return business_glossary_utils.generate_entry_name_from_term_name(
+        term_resource_name, project_number=project_number
+    )
 
 
 def normalize_entry_name_project_number(entry_name: str, user_project: str = "") -> str:
@@ -548,17 +629,76 @@ def normalize_entry_name_project_number(entry_name: str, user_project: str = "")
                 proj_num = get_project_number(proj, user_project or proj)
                 parts[1] = str(proj_num)
                 return "/".join(parts)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Could not normalize project number for '{proj}': {e}")
     return entry_name
+
+
+def _search_entry_by_fqn(
+    dataplex_service: build, fqn: str, user_project: str, location: str = "global"
+) -> Optional[Dict]:
+    """Search Dataplex Catalog by fully_qualified_name."""
+    parent = f"projects/{user_project}/locations/{location}"
+    sanitized_fqn = fqn.replace('"', '\\"')
+    try:
+        request = dataplex_service.projects().locations().searchEntries(
+            name=parent,
+            query=f'fully_qualified_name="{sanitized_fqn}"'
+        )
+        search_res = execute_with_retry(request.execute, f"Search entry by FQN {fqn}")
+        if search_res and search_res.get('results'):
+            entry_dict = None
+            for result in search_res['results']:
+                dp_entry = result.get('dataplexEntry')
+                if dp_entry:
+                    if dp_entry.get('fullyQualifiedName') == fqn or not entry_dict:
+                        entry_dict = dp_entry
+                        if dp_entry.get('fullyQualifiedName') == fqn:
+                            break
+            return entry_dict
+    except Exception as e:
+        logger.debug(f"searchEntries failed for FQN '{fqn}': {e}")
+    return None
+
+
+def _probe_bigquery_entry_locations(
+    dataplex_service: build, proj: str, ds: str, tbl: str, locations: List[str]
+) -> tuple[Optional[Dict], Optional[Exception]]:
+    """Probe candidate locations for a BigQuery entry, aborting early on 401/403 permission errors."""
+    for loc in locations:
+        candidate_name = (
+            f"projects/{proj}/locations/{loc}/entryGroups/@bigquery/entries/"
+            f"bigquery.googleapis.com/projects/{proj}/datasets/{ds}/tables/{tbl}"
+        )
+        try:
+            request = dataplex_service.projects().locations().entryGroups().entries().get(
+                name=candidate_name
+            )
+            entry_dict = execute_with_retry(request.execute, f"Get BigQuery entry {candidate_name}")
+            if entry_dict:
+                return entry_dict, None
+        except HttpError as http_err:
+            status = getattr(http_err.resp, 'status', None) if hasattr(http_err, 'resp') else None
+            if status in (401, 403):
+                logger.warning(f"Permission denied (HTTP {status}) accessing BigQuery entry '{candidate_name}': {http_err}")
+                return None, http_err
+            continue
+        except Exception:
+            continue
+    return None, None
 
 
 def lookup_entry_by_fqn(
     dataplex_service: build, fqn: str, user_project: str, location: str = "global"
 ) -> Dict:
-    """Looks up a Dataplex entry by its Fully Qualified Name (FQN) or entry path with caching."""
+    """Looks up a Dataplex entry by its Fully Qualified Name (FQN) or entry path with positive and negative caching."""
     if fqn in _fqn_to_entry_cache:
         return _fqn_to_entry_cache[fqn]
+    if fqn in _failed_fqn_cache:
+        raise EntryFQNNotFoundError(f"Entry with FQN '{fqn}' not found in Dataplex under project '{user_project}'")
+
+    entry_dict = None
+    permission_error = None
 
     # Handle BigQuery FQN (e.g. bigquery:project.dataset.table)
     if fqn.startswith("bigquery:"):
@@ -569,75 +709,57 @@ def lookup_entry_by_fqn(
             ds = parts[1]
             tbl = ".".join(parts[2:])
 
-            try:
-                proj_num = get_project_number(proj, user_project or proj)
-            except Exception:
-                proj_num = proj
+            # 1. Probe primary common locations first (fast path)
+            primary_locations = list(BIGQUERY_CANDIDATE_LOCATIONS)
+            entry_dict, permission_error = _probe_bigquery_entry_locations(
+                dataplex_service, proj, ds, tbl, primary_locations
+            )
 
-            candidate_locations = ["us", "us-central1", "eu", "us-east1", "us-west1", "global"]
-            try:
-                all_locs = list_supported_locations(user_project or proj, dataplex_service)
-                for loc in all_locs:
-                    if loc not in candidate_locations:
-                        candidate_locations.append(loc)
-            except Exception:
-                pass
+            # 2. Try single-call searchEntries before probing all remaining regional endpoints
+            if not entry_dict and not permission_error:
+                entry_dict = _search_entry_by_fqn(dataplex_service, fqn, user_project, location)
 
-            for loc in candidate_locations:
-                candidate_name = (
-                    f"projects/{proj}/locations/{loc}/entryGroups/@bigquery/entries/"
-                    f"bigquery.googleapis.com/projects/{proj}/datasets/{ds}/tables/{tbl}"
-                )
+            # 3. Fall back to remaining supported locations if searchEntries did not return a match
+            if not entry_dict and not permission_error:
                 try:
-                    request = dataplex_service.projects().locations().entryGroups().entries().get(
-                        name=candidate_name
-                    )
-                    entry_dict = execute_with_retry(request.execute, f"Get BigQuery entry {candidate_name}")
-                    if entry_dict:
-                        if entry_dict.get('name'):
-                            entry_dict['name'] = normalize_entry_name_project_number(entry_dict['name'], user_project or proj)
-                            _entry_to_fqn_cache[entry_dict['name']] = fqn
-                        _fqn_to_entry_cache[fqn] = entry_dict
-                        return entry_dict
+                    all_locs = list_supported_locations(user_project or proj, dataplex_service)
+                    remaining_locs = [loc for loc in all_locs if loc not in primary_locations]
+                    if remaining_locs:
+                        entry_dict, permission_error = _probe_bigquery_entry_locations(
+                            dataplex_service, proj, ds, tbl, remaining_locs
+                        )
                 except Exception:
-                    continue
+                    pass
 
-    entry_dict = None
-
-    # 1. Full resource path (projects/...)
-    if fqn.startswith("projects/"):
+    # Full resource path (projects/...)
+    elif fqn.startswith("projects/"):
         try:
             request = dataplex_service.projects().locations().entryGroups().entries().get(name=fqn)
             entry_dict = execute_with_retry(request.execute, f"Get entry {fqn}")
         except Exception:
             entry_dict = None
     else:
-        # 2. Search Dataplex Catalog by fully_qualified_name for custom / external FQNs
-        parent = f"projects/{user_project}/locations/{location}"
-        sanitized_fqn = fqn.replace('"', '\\"')
-        try:
-            request = dataplex_service.projects().locations().searchEntries(
-                name=parent,
-                query=f'fully_qualified_name="{sanitized_fqn}"'
-            )
-            search_res = execute_with_retry(request.execute, f"Search entry by FQN {fqn}")
-            if search_res and search_res.get('results'):
-                for result in search_res['results']:
-                    dp_entry = result.get('dataplexEntry')
-                    if dp_entry:
-                        if dp_entry.get('fullyQualifiedName') == fqn or not entry_dict:
-                            entry_dict = dp_entry
-                            if dp_entry.get('fullyQualifiedName') == fqn:
-                                break
-        except Exception as e:
-            logger.debug(f"searchEntries failed for FQN '{fqn}': {e}")
-            entry_dict = None
+        # Custom / external FQNs via searchEntries
+        entry_dict = _search_entry_by_fqn(dataplex_service, fqn, user_project, location)
 
     if not entry_dict:
+        _failed_fqn_cache.add(fqn)
+        if permission_error:
+            raise EntryFQNNotFoundError(
+                f"Permission denied while looking up entry with FQN '{fqn}' under project '{user_project}': {permission_error}"
+            )
         raise EntryFQNNotFoundError(f"Entry with FQN '{fqn}' not found in Dataplex under project '{user_project}'")
 
     if entry_dict.get('name'):
-        entry_dict['name'] = normalize_entry_name_project_number(entry_dict['name'], user_project)
+        entry_dict['name'] = normalize_entry_name_project_number(entry_dict['name'], user_project or extract_project_or_default(entry_dict['name'], user_project))
         _entry_to_fqn_cache[entry_dict['name']] = fqn
     _fqn_to_entry_cache[fqn] = entry_dict
     return entry_dict
+
+
+def extract_project_or_default(entry_name: str, default_project: str) -> str:
+    """Extract project ID from an entry name if present, else return default_project."""
+    try:
+        return business_glossary_utils.extract_project_id_from_name(entry_name)
+    except Exception:
+        return default_project

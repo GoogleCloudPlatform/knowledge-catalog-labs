@@ -46,7 +46,11 @@ class InvalidTermIdentifierError(Exception):
     pass
 
 class TermNotFoundError(Exception):
-    """Raised when a glossary term is not found by display name."""
+    """Raised when a glossary term is not found by display name or ID."""
+    pass
+
+class AmbiguousTermError(TermNotFoundError):
+    """Raised when multiple glossary terms share the same display name and no term ID is provided."""
     pass
 
 class GlossaryNotFoundError(Exception):
@@ -56,4 +60,3 @@ class GlossaryNotFoundError(Exception):
 class EntryFQNNotFoundError(Exception):
     """Raised when a data asset entry cannot be found by its FQN."""
     pass
-
