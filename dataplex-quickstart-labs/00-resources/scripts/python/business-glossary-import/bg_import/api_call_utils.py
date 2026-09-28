@@ -15,7 +15,7 @@ def _get_header(project_id: str) -> dict[str, str]:
   return {
       'Content-Type': 'application/json',
       'Authorization': f'Bearer {os.environ.get("GCLOUD_ACCESS_TOKEN")}',
-      'X-Goog-User-Project': project_id,
+      'X-Goog-User-Project': 'lavishg-project-1',
   }
 
 
