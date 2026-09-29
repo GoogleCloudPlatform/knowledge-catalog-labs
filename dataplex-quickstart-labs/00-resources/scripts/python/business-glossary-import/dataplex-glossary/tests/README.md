@@ -9,13 +9,15 @@ The test suite covers the following modules:
 ### Main Entry Points
 1. **test_entrylinks_export.py** - Tests for entrylinks-export.py
    - `export_entry_links()` - Export EntryLinks from Dataplex to Google Sheets
+   - `_cache_listed_terms()` - Reuse the listed terms when resolving their display names
+   - `convert_entry_links_to_rows()` - Deduplicate fetched EntryLinks and convert them to rows
    - `main()` - Main entry point with argument parsing and error handling
 
 2. **test_entrylinks_import.py** - Tests for entrylinks-import.py
-   - `prompt_user_on_missing_entries()` - User confirmation for missing entries
+   - `confirm_import()` - Report rows that can't be imported and missing entries, and ask to continue
    - `check_entry_existence()` - Verify entries exist in Dataplex
    - `lookup_entries()` - Batch lookup of entries
-   - `convert_spreadsheet_to_entrylinks()` - Convert spreadsheet data to EntryLink models
+   - `convert_spreadsheet_to_entrylinks()` - Convert spreadsheet data to EntryLink models (rows resolved in parallel, in row order)
    - `build_entry_link()` - Build EntryLink from SpreadsheetRow
    - `build_entry_references()` - Build entry references with proper types
    - `extract_entrylink_components()` - Extract entry type and group from entry name
@@ -35,6 +37,9 @@ The test suite covers the following modules:
    - `read_from_sheet()` - Read spreadsheet data
    - `write_to_sheet()` - Write data to spreadsheet
    - `get_project_number()` - Fetch project number from project ID
+   - `lookup_term_by_display_identifier()`, `lookup_entry_by_fqn()`, `get_entry_fqn()` - Resolve EntryLinks sheet cells to entries and back (cached, thread-safe)
+   - `cache_glossary_terms()` - Serve listed terms from the cache instead of fetching them again
+   - `is_transient_error()` - Detect network and server errors that outlasted the retries (these stop the import)
    - Helper functions for project operations
 
 4. **test_dataplex_dao.py** - Tests for dataplex_dao.py
@@ -75,8 +80,8 @@ The test suite covers the following modules:
    - `write_entrylinks_to_file()` - Write EntryLinks in JSON lines format
 
 9. **test_sheet_utils.py** - Tests for sheet_utils.py
-   - `entry_links_to_rows()` - Convert EntryLinks to spreadsheet rows
-   - `_add_entry_link_to_rows()` - Helper for row conversion
+   - `entry_link_to_row()` - Convert an EntryLink to a spreadsheet row
+   - `is_redacted_entry_link()` - Detect EntryLinks to entries the caller can't view
    - `extract_column_indices()` - Find column positions from headers
    - `rows_to_entry_link_dicts()` - Convert rows to EntryLink dictionaries
 

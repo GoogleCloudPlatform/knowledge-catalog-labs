@@ -13,6 +13,10 @@ class DataplexAPIError(Exception):
     """Raised when there is an error interacting with the Dataplex API."""
     pass
 
+class TransientAPIError(DataplexAPIError):
+    """Raised when an API call kept failing with a network, 429 or 5xx error after all retries."""
+    pass
+
 class SheetsAPIError(Exception):
     """Raised when there is an error interacting with the Google Sheets API."""
     pass
@@ -42,21 +46,21 @@ class InvalidEntryIdFormatError(Exception):
     pass
 
 class InvalidTermIdentifierError(Exception):
-    """Raised when a human-readable term identifier format is invalid."""
+    """Raised when a term reference is malformed or incomplete (e.g. the term ID is missing)."""
     pass
 
 class TermNotFoundError(Exception):
-    """Raised when a glossary term is not found by display name or ID."""
+    """Raised when no glossary term matches a term reference."""
     pass
 
 class AmbiguousTermError(TermNotFoundError):
-    """Raised when multiple glossary terms share the same display name and no term ID is provided."""
+    """Raised when a term reference matches more than one glossary term."""
     pass
 
 class GlossaryNotFoundError(Exception):
-    """Raised when a glossary is not found by display name."""
+    """Raised when a glossary is not found by display name or ID."""
     pass
 
 class EntryFQNNotFoundError(Exception):
-    """Raised when a data asset entry cannot be found by its FQN."""
+    """Raised when a data asset entry cannot be found (or read) by its FQN."""
     pass

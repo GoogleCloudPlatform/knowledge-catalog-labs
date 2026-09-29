@@ -85,85 +85,22 @@ class SpreadsheetRow:
     target_id: str = ""
     row_number: int = 0
 
-    def __init__(
-        self,
-        entry_link_type: str = "",
-        source_name: str = "",
-        source_id: str = "",
-        column: str = "",
-        target_name: str = "",
-        target_id: str = "",
-        source: Optional[str] = None,
-        target: Optional[str] = None,
-        source_entry: Optional[str] = None,
-        target_entry: Optional[str] = None,
-        source_path: Optional[str] = None,
-        row_number: int = 0,
-    ):
-        self.entry_link_type = entry_link_type
-        # Handle source (prefer explicit source_name/source_id, fallback to source/source_entry)
-        self.source_name = source_name if source_name else (source_entry or source or "")
-        self.source_id = source_id
-        # Handle target (prefer explicit target_name/target_id, fallback to target/target_entry)
-        self.target_name = target_name if target_name else (target_entry or target or "")
-        self.target_id = target_id
-        self.column = source_path if source_path is not None else column
-        self.row_number = int(row_number) if row_number else 0
-
-    @property
-    def source(self) -> str:
-        """Effective source identifier (prefers source_id, falls back to source_name)."""
-        return self.source_id if self.source_id else self.source_name
-
-    @property
-    def target(self) -> str:
-        """Effective target identifier (prefers target_id, falls back to target_name)."""
-        return self.target_id if self.target_id else self.target_name
-
-    @property
-    def source_entry(self) -> str:
-        return self.source
-
-    @property
-    def target_entry(self) -> str:
-        return self.target
-
-    @property
-    def source_path(self) -> str:
-        return self.column
-
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'SpreadsheetRow':
-        """Create a SpreadsheetRow from a dictionary supporting 6-column and legacy keys."""
-        link_type = (
-            data.get('entry_link_type') or data.get('Entry link type') or data.get('entryLinkType', '')
-        ).strip()
-        source_name = (
-            data.get('source_name') or data.get('Source Name') or data.get('source') or data.get('Source') or data.get('source_entry') or data.get('sourceEntry', '')
-        ).strip()
-        source_id = (
-            data.get('source_id') or data.get('Source ID') or data.get('sourceId', '')
-        ).strip()
-        target_name = (
-            data.get('target_name') or data.get('Target Name') or data.get('target') or data.get('Target') or data.get('target_entry') or data.get('targetEntry', '')
-        ).strip()
-        target_id = (
-            data.get('target_id') or data.get('Target ID') or data.get('targetId', '')
-        ).strip()
-        column = (
-            data.get('column') or data.get('Column') or data.get('source_path') or data.get('sourcePath', '')
-        ).strip()
-        raw_row_num = data.get('row_number', 0)
+        """Create a SpreadsheetRow from a dictionary produced by sheet_utils."""
+        def _value(key: str) -> str:
+            return str(data.get(key) or '').strip()
+
         try:
-            row_number = int(raw_row_num) if raw_row_num else 0
+            row_number = int(data.get('row_number') or 0)
         except (ValueError, TypeError):
             row_number = 0
         return cls(
-            entry_link_type=link_type,
-            source_name=source_name,
-            source_id=source_id,
-            column=column,
-            target_name=target_name,
-            target_id=target_id,
+            entry_link_type=_value('entry_link_type'),
+            source_name=_value('source_name'),
+            source_id=_value('source_id'),
+            column=_value('column'),
+            target_name=_value('target_name'),
+            target_id=_value('target_id'),
             row_number=row_number,
         )

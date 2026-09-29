@@ -10,6 +10,7 @@ import uuid
 
 # Local imports
 from utils.constants import (
+    BIGQUERY_ENTRY_ID_PATTERN,
     DATAPLEX_SYSTEM_ENTRY_GROUP,
     GLOSSARY_NAME_PATTERN,
     TERM_NAME_PATTERN,
@@ -130,20 +131,18 @@ def generate_entry_link_id() -> str:
 
 
 def format_term_display_identifier(
-    project_id: str, location: str, glossary_display_name: str, term_display_name: str, delimiter: str = "."
+    project_id: str, location: str, glossary_display_name: str, term_display_name: str
 ) -> str:
-    """Format a human-readable term identifier string.
+    """Format a human-readable term identifier string ('.'-separated).
 
     Example:
         >>> format_term_display_identifier("my-proj", "global", "Sales Glossary", "Revenue")
         'my-proj.global.Sales Glossary.Revenue'
     """
-    return f"{project_id.strip()}{delimiter}{location.strip()}{delimiter}{glossary_display_name.strip()}{delimiter}{term_display_name.strip()}"
+    return f"{project_id.strip()}.{location.strip()}.{glossary_display_name.strip()}.{term_display_name.strip()}"
 
 
-def parse_term_display_identifier(
-    identifier: str, delimiter: str = ".", allow_three_part: bool = False
-) -> ParsedTermIdentifier:
+def parse_term_display_identifier(identifier: str, allow_three_part: bool = False) -> ParsedTermIdentifier:
     """Parse a human-readable term identifier string into a ParsedTermIdentifier.
 
     Expected format: '<project>.<location>.<glossaryDisplayName>.<termDisplayName>'
@@ -151,7 +150,6 @@ def parse_term_display_identifier(
 
     Args:
         identifier: The term display identifier string.
-        delimiter: Delimiter character (default '.').
         allow_three_part: If True, allows 3-part identifier without termDisplayName.
 
     Returns:
@@ -164,18 +162,18 @@ def parse_term_display_identifier(
         raise InvalidTermIdentifierError(f"Invalid term identifier: '{identifier}'. Identifier must be a non-empty string.")
 
     cleaned = identifier.strip()
-    parts = cleaned.split(delimiter)
+    parts = cleaned.split(".")
     min_parts = 3 if allow_three_part else 4
     if len(parts) < min_parts:
         raise InvalidTermIdentifierError(
             f"Invalid term identifier '{cleaned}'. Expected format: "
-            f"'<project>{delimiter}<location>{delimiter}<glossaryDisplayName>{delimiter}<termDisplayName>'"
+            f"'<project>.<location>.<glossaryDisplayName>.<termDisplayName>'"
         )
 
     project_id = parts[0].strip()
     location_id = parts[1].strip()
     glossary_display_name = parts[2].strip()
-    term_display_name = delimiter.join(parts[3:]).strip() if len(parts) >= 4 else ""
+    term_display_name = ".".join(parts[3:]).strip() if len(parts) >= 4 else ""
 
     if not project_id or not location_id or not glossary_display_name or (not allow_three_part and not term_display_name):
         raise InvalidTermIdentifierError(
@@ -229,7 +227,7 @@ def extract_column_from_source_path(source_path: str) -> str:
     return cleaned
 
 
-def format_source_path_from_column(column: str, entry_group: str = "") -> str:
+def format_source_path_from_column(column: str) -> str:
     """Format a column name into a Dataplex source path (prepending 'Schema.').
 
     Example:
@@ -258,10 +256,12 @@ def extract_short_id(resource_or_entry_name: str) -> str:
         'my-term'
         >>> extract_short_id("projects/p/locations/l/entryGroups/@dataplex/entries/projects/p/locations/l/glossaries/g/terms/my-term")
         'my-term'
-        >>> extract_short_id("projects/p/locations/l/entryGroups/@dataplex/entries/glossary:g.term:my-term")
-        'my-term'
-        >>> extract_short_id("projects/p/locations/l/entryGroups/@bigquery/entries/bigquery:p.d.my_table")
-        'my_table'
+        >>> extract_short_id("projects/p/locations/us/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/p/datasets/d/tables/orders")
+        'p.d.orders'
+        >>> extract_short_id("projects/p/locations/us/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/p/datasets/d")
+        'p.d'
+        >>> extract_short_id("projects/p/locations/l/entryGroups/my-group/entries/my-entry")
+        'my-entry'
         >>> extract_short_id("my-term")
         'my-term'
     """
@@ -269,28 +269,18 @@ def extract_short_id(resource_or_entry_name: str) -> str:
         return ""
     name = resource_or_entry_name.strip()
 
-    # 1. Match glossary term resource pattern: .../terms/<term_id>
+    # 1. BigQuery dataset/table entry: .../bigquery.googleapis.com/projects/<p>/datasets/<d>[/tables/<t>]
+    bq_match = BIGQUERY_ENTRY_ID_PATTERN.search(name)
+    if bq_match:
+        parts = [bq_match.group("project_id"), bq_match.group("dataset_id")]
+        if bq_match.group("table_id"):
+            parts.append(bq_match.group("table_id"))
+        return ".".join(parts)
+
+    # 2. Glossary term resource or term entry: .../terms/<term_id>
     term_match = re.search(r"/terms/(?P<term_id>[^/]+)$", name)
     if term_match:
         return term_match.group("term_id")
 
-    # 2. Match glossary term entry pattern: ...term:<term_id>
-    colon_term_match = re.search(r"term:(?P<term_id>[^/]+)$", name)
-    if colon_term_match:
-        return colon_term_match.group("term_id")
-
-    # 3. Match BigQuery FQN or entry: bigquery:project.dataset.table
-    if "bigquery:" in name:
-        bq_part = name.split("bigquery:")[-1]
-        if "." in bq_part:
-            return bq_part.split(".")[-1]
-        return bq_part
-
-    # 4. Fall back to last component after slash or colon
-    if "/" in name:
-        last_part = name.split("/")[-1]
-        if ":" in last_part:
-            return last_part.split(":")[-1]
-        return last_part
-
-    return name
+    # 3. Any other entry or resource name: its last path segment
+    return name.rsplit("/", 1)[-1]

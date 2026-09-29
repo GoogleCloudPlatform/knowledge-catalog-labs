@@ -5,10 +5,9 @@ Test coverage:
 - Sheet name helpers (_get_first_sheet_name, _get_first_sheet_info, _build_sheet_range)
 - Link type extraction (_extract_link_type)
 - Reference finding (_find_source_and_target_refs)
-- Row validation (_is_row_valid)
 - Entry link creation (_create_entry_link_dict)
 - Spreadsheet operations (get_spreadsheet_id, authenticate_sheets, read_from_sheet, write_to_sheet)
-- Data conversion (entry_links_to_rows, rows_to_entry_link_dicts)
+- Data conversion (entry_link_to_row, is_redacted_entry_link, rows_to_entry_link_dicts)
 """
 
 import sys
@@ -167,32 +166,6 @@ class TestFindSourceAndTargetRefs:
 
 
 # ============================================================================
-# ROW VALIDATION TESTS
-# ============================================================================
-
-class TestIsRowValid:
-    """Test _is_row_valid function"""
-    
-    def test_valid_row_passes(self):
-        """Valid row should return True"""
-        row = ['definition', 'source', 'target', '/path']
-        required_max_idx = 2  # need at least 3 columns
-        
-        result = sheet_utils._is_row_valid(row, 1, required_max_idx)
-        
-        assert result is True
-    
-    def test_insufficient_columns_fails(self):
-        """Row with insufficient columns should return False"""
-        row = ['definition', 'source']  # Only 2 columns
-        required_max_idx = 2  # need at least 3 columns
-        
-        result = sheet_utils._is_row_valid(row, 1, required_max_idx)
-        
-        assert result is False
-
-
-# ============================================================================
 # ENTRY LINK DICT CREATION TESTS
 # ============================================================================
 
@@ -201,18 +174,19 @@ class TestCreateEntryLinkDict:
     
     def test_creates_dict_from_row(self):
         """Create entry link dict from row"""
-        row = ['definition', 'source_name', 'src_id', '/path', 'target_name', 'tgt_id']
-        
-        result = sheet_utils._create_entry_link_dict(row, 0, 1, 2, 3, 4, 5)
-        
-        assert result['entry_link_type'] == 'definition'
-        assert result['source_name'] == 'source_name'
-        assert result['source_id'] == 'src_id'
-        assert result['target_name'] == 'target_name'
-        assert result['target_id'] == 'tgt_id'
-        assert result['source_entry'] == 'src_id'
-        assert result['target_entry'] == 'tgt_id'
-        assert result['source_path'] == '/path'
+        row = ['definition', 'source_name', 'src_id', 'order_id', 'target_name', 'tgt_id']
+
+        result = sheet_utils._create_entry_link_dict(row, 0, 1, 2, 3, 4, 5, row_number=7)
+
+        assert result == {
+            'entry_link_type': 'definition',
+            'source_name': 'source_name',
+            'source_id': 'src_id',
+            'column': 'order_id',
+            'target_name': 'target_name',
+            'target_id': 'tgt_id',
+            'row_number': '7',
+        }
     
     def test_handles_missing_path(self):
         """Handle row without path column"""
@@ -220,7 +194,7 @@ class TestCreateEntryLinkDict:
         
         result = sheet_utils._create_entry_link_dict(row, 0, 1, -1, -1, 4, -1)
         
-        assert result['source_path'] == ''
+        assert result['column'] == ''
         assert result['source_name'] == 'source_name'
         assert result['target_name'] == 'target_name'
     
@@ -354,88 +328,150 @@ class TestWriteToSheet:
 # DATA CONVERSION TESTS
 # ============================================================================
 
-class TestEntryLinksToRows:
-    """Test entry_links_to_rows function"""
-    
-    def test_converts_links_to_rows(self):
-        """Convert entry links to row format [type, source_name, source_id, column, target_name, target_id]"""
-        entry_links = [
-            {
-                'entryLinkType': 'projects/dataplex-types/locations/global/entryLinkTypes/definition',
-                'entryReferences': [
-                    {'type': 'SOURCE', 'name': 'source_entry', 'path': 'Schema.order_id'},
-                    {'type': 'TARGET', 'name': 'target_entry'}
-                ]
-            }
-        ]
-        
-        result = sheet_utils.entry_links_to_rows(entry_links)
-        
-        assert len(result) == 1
-        assert result[0] == ['definition', 'source_entry', 'source_entry', 'order_id', 'target_entry', 'target_entry']
+DEFINITION_TYPE = 'projects/dataplex-types/locations/global/entryLinkTypes/definition'
+SYNONYM_TYPE = 'projects/dataplex-types/locations/global/entryLinkTypes/synonym'
+BQ_TABLE_ENTRY = (
+    'projects/123/locations/us/entryGroups/@bigquery/entries/'
+    'bigquery.googleapis.com/projects/proj/datasets/ds/tables/tbl'
+)
+TERM1_ENTRY = 'projects/123/locations/global/entryGroups/@dataplex/entries/projects/123/locations/global/glossaries/g/terms/t1'
+TERM2_ENTRY = 'projects/123/locations/global/entryGroups/@dataplex/entries/projects/123/locations/global/glossaries/g/terms/t2'
 
-    def test_converts_links_with_dataplex_service(self, monkeypatch):
-        """Convert entry links with FQN and display name resolution"""
-        from utils import api_layer
-        mock_service = Mock()
-        monkeypatch.setattr(api_layer, 'get_entry_fqn', lambda s, entry, p: 'bigquery:proj.ds.tbl')
+
+class TestEntryLinkToRow:
+    """Test entry_link_to_row function"""
+
+    def test_converts_link_to_row_without_service(self):
+        """Without a Dataplex service, Name cells hold the raw entry names"""
+        entry_link = {
+            'entryLinkType': DEFINITION_TYPE,
+            'entryReferences': [
+                {'type': 'SOURCE', 'name': BQ_TABLE_ENTRY, 'path': 'Schema.order_id'},
+                {'type': 'TARGET', 'name': TERM1_ENTRY}
+            ]
+        }
+        
+        result = sheet_utils.entry_link_to_row(entry_link)
+        
+        assert result == ['definition', BQ_TABLE_ENTRY, 'proj.ds.tbl', 'order_id', TERM1_ENTRY, 't1']
+
+    def test_definition_link_resolves_source_fqn_and_target_display_name(self, monkeypatch):
+        """Definition links: FQN for the source, display identifier for the target term"""
+        calls = []
+
+        def fake_fqn(service, entry, user_project):
+            calls.append(('fqn', entry, user_project))
+            return 'bigquery:proj.ds.tbl'
+
+        def fake_display(service, entry, user_project):
+            calls.append(('display', entry, user_project))
+            return 'proj.global.Sales.Order ID'
+
+        monkeypatch.setattr(sheet_utils.api_layer, 'get_entry_fqn', fake_fqn)
+        monkeypatch.setattr(sheet_utils.api_layer, 'resolve_term_entry_to_display_identifier', fake_display)
+        entry_link = {
+            'entryLinkType': DEFINITION_TYPE,
+            'entryReferences': [
+                {'type': 'SOURCE', 'name': BQ_TABLE_ENTRY, 'path': 'Schema.user_id'},
+                {'type': 'TARGET', 'name': TERM1_ENTRY}
+            ]
+        }
+
+        result = sheet_utils.entry_link_to_row(entry_link, dataplex_service=Mock(), user_project='user-proj')
+
+        assert result == ['definition', 'bigquery:proj.ds.tbl', 'proj.ds.tbl', 'user_id', 'proj.global.Sales.Order ID', 't1']
+        assert calls == [('fqn', BQ_TABLE_ENTRY, 'user-proj'), ('display', TERM1_ENTRY, 'user-proj')]
+
+    def test_synonym_link_resolves_both_terms_and_has_no_column(self, monkeypatch):
+        """Synonym/related links: both sides are terms and the Column cell stays empty"""
+        def fail_fqn(*args):
+            raise AssertionError("get_entry_fqn must not be called for term references")
+
+        monkeypatch.setattr(sheet_utils.api_layer, 'get_entry_fqn', fail_fqn)
         monkeypatch.setattr(
-            api_layer, 'resolve_term_entry_to_display_identifier',
-            lambda s, entry, **kwargs: 'proj.global.Sales.Order ID'
+            sheet_utils.api_layer, 'resolve_term_entry_to_display_identifier',
+            lambda service, entry, user_project: f"proj.global.G.{entry.split('/')[-1].upper()}"
         )
+        entry_link = {
+            'entryLinkType': SYNONYM_TYPE,
+            'entryReferences': [
+                {'name': TERM1_ENTRY, 'path': 'Schema.ignored'},
+                {'name': TERM2_ENTRY}
+            ]
+        }
 
-        entry_links = [
-            {
-                'entryLinkType': 'projects/dataplex-types/locations/global/entryLinkTypes/definition',
-                'entryReferences': [
-                    {'type': 'SOURCE', 'name': 'projects/p/locations/us/entryGroups/@bigquery/entries/e1', 'path': 'Schema.user_id'},
-                    {'type': 'TARGET', 'name': 'projects/p/locations/global/entryGroups/@dataplex/entries/.../terms/t1'}
-                ]
-            }
-        ]
+        result = sheet_utils.entry_link_to_row(entry_link, dataplex_service=Mock(), user_project='user-proj')
 
-        result = sheet_utils.entry_links_to_rows(entry_links, dataplex_service=mock_service, user_project='user-proj')
+        assert result == ['synonym', 'proj.global.G.T1', 't1', '', 'proj.global.G.T2', 't2']
 
-        assert len(result) == 1
-        assert result[0] == ['definition', 'bigquery:proj.ds.tbl', 'e1', 'user_id', 'proj.global.Sales.Order ID', 't1']
+    def test_falls_back_to_raw_name_when_resolution_fails(self, monkeypatch):
+        """A name that can't be resolved is written as the raw entry name, with a warning"""
+        warnings = []
+        monkeypatch.setattr(sheet_utils.logger, 'warning', warnings.append)
+        monkeypatch.setattr(sheet_utils.api_layer, 'get_entry_fqn', lambda s, r, p: 'bigquery:proj.ds.tbl')
+
+        def fail_resolve(*args):
+            raise RuntimeError("Permission denied")
+
+        monkeypatch.setattr(sheet_utils.api_layer, 'resolve_term_entry_to_display_identifier', fail_resolve)
+        entry_link = {
+            'entryLinkType': DEFINITION_TYPE,
+            'entryReferences': [
+                {'type': 'SOURCE', 'name': BQ_TABLE_ENTRY, 'path': 'Schema.c'},
+                {'type': 'TARGET', 'name': TERM1_ENTRY}
+            ]
+        }
+
+        result = sheet_utils.entry_link_to_row(entry_link, dataplex_service=MagicMock())
+
+        assert result == ['definition', 'bigquery:proj.ds.tbl', 'proj.ds.tbl', 'c', TERM1_ENTRY, 't1']
+        assert len(warnings) == 1
+        assert TERM1_ENTRY in warnings[0] and 'Permission denied' in warnings[0]
     
-    def test_skips_invalid_link_type(self):
-        """Skip entry links with invalid link type"""
-        entry_links = [
-            {
-                'entryLinkType': 'invalid',
-                'entryReferences': [
-                    {'type': 'SOURCE', 'name': 'source'},
-                    {'type': 'TARGET', 'name': 'target'}
-                ]
-            }
-        ]
+    def test_returns_none_for_invalid_link_type(self):
+        """Links with an unknown link type can't be written as a row"""
+        entry_link = {
+            'entryLinkType': 'invalid',
+            'entryReferences': [
+                {'type': 'SOURCE', 'name': 'source'},
+                {'type': 'TARGET', 'name': 'target'}
+            ]
+        }
         
-        result = sheet_utils.entry_links_to_rows(entry_links)
-        
-        assert len(result) == 0
-    
-    def test_skips_redacted_entries(self):
-        """Skip entry links with redacted entries"""
-        entry_links = [
-            {
-                'entryLinkType': 'projects/dataplex-types/locations/global/entryLinkTypes/definition',
-                'entryReferences': [
-                    {'type': 'SOURCE', 'name': '***redacted***'},
-                    {'type': 'TARGET', 'name': 'target_entry'}
-                ]
-            }
-        ]
-        
-        result = sheet_utils.entry_links_to_rows(entry_links)
-        
-        assert len(result) == 0
-    
-    def test_handles_empty_input(self):
-        """Empty input should return empty list"""
-        result = sheet_utils.entry_links_to_rows([])
-        
-        assert result == []
+        assert sheet_utils.entry_link_to_row(entry_link) is None
+
+    @pytest.mark.parametrize('references', [[], [{'name': TERM1_ENTRY}]])
+    def test_returns_none_without_source_and_target(self, references):
+        """Links without both a source and a target can't be written as a row"""
+        entry_link = {'entryLinkType': SYNONYM_TYPE, 'entryReferences': references}
+
+        assert sheet_utils.entry_link_to_row(entry_link) is None
+
+
+class TestIsRedactedEntryLink:
+    """Test is_redacted_entry_link function"""
+
+    def test_detects_redacted_reference(self):
+        """A reference the caller can't view has a redacted ('*') name"""
+        entry_link = {
+            'entryLinkType': DEFINITION_TYPE,
+            'entryReferences': [
+                {'type': 'SOURCE', 'name': '***redacted***'},
+                {'type': 'TARGET', 'name': TERM1_ENTRY}
+            ]
+        }
+
+        assert sheet_utils.is_redacted_entry_link(entry_link) is True
+
+    def test_visible_link_is_not_redacted(self):
+        """Links whose references all have real names are not redacted"""
+        entry_link = {
+            'entryLinkType': SYNONYM_TYPE,
+            'entryReferences': [{'name': TERM1_ENTRY}, {'name': TERM2_ENTRY}]
+        }
+
+        assert sheet_utils.is_redacted_entry_link(entry_link) is False
+        assert sheet_utils.is_redacted_entry_link({}) is False
 
 
 class TestRowsToEntryLinkDicts:
@@ -450,28 +486,32 @@ class TestRowsToEntryLinkDicts:
         
         result = sheet_utils.rows_to_entry_link_dicts(rows, 0, 1, 2, 3, 4, 5)
         
-        assert len(result) == 1
-        assert result[0]['entry_link_type'] == 'definition'
-        assert result[0]['source_name'] == 'bigquery:proj.ds.tbl'
-        assert result[0]['source_id'] == 'src1'
-        assert result[0]['source'] == 'src1'
-        assert result[0]['target_name'] == 'proj.global.Sales.Order ID'
-        assert result[0]['target_id'] == 'tgt1'
-        assert result[0]['target'] == 'tgt1'
-        assert result[0]['column'] == 'order_id'
+        assert result == [{
+            'entry_link_type': 'definition',
+            'source_name': 'bigquery:proj.ds.tbl',
+            'source_id': 'src1',
+            'column': 'order_id',
+            'target_name': 'proj.global.Sales.Order ID',
+            'target_id': 'tgt1',
+            'row_number': '2',
+        }]
     
-    def test_skips_rows_missing_source_or_target(self):
-        """Should skip rows missing source or target"""
+    def test_keeps_incomplete_rows_and_skips_blank_rows(self):
+        """Incomplete rows are kept (the import reports them); blank rows are skipped"""
         rows = [
             ['Entry link type', 'Source Name', 'Source ID', 'Column', 'Target Name', 'Target ID'],
             ['definition', 'src1', '', 'order_id', 'tgt1', ''],
-            ['definition', '', '', 'order_id', 'tgt2', ''],  # Missing source
-            ['definition', 'src3', '', 'order_id', '', '']   # Missing target
+            ['', '', '', '', '', ''],                         # Blank row
+            ['definition', '', '', 'order_id', 'tgt2', ''],   # Missing source
+            [],                                               # Blank row (trimmed by Sheets)
+            ['definition', 'src3', '', 'order_id', '', ''],   # Missing target
         ]
         
         result = sheet_utils.rows_to_entry_link_dicts(rows, 0, 1, 2, 3, 4, 5)
         
-        assert len(result) == 1
+        assert [row['row_number'] for row in result] == ['2', '4', '6']
+        assert result[1]['source_name'] == ''
+        assert result[2]['target_name'] == ''
     
     def test_handles_empty_input(self):
         """Empty input should return empty list"""
@@ -542,6 +582,27 @@ class TestExtractColumnIndices:
         with pytest.raises(ValueError):
             sheet_utils.extract_column_indices(data)
 
+    def test_header_matching_ignores_case_and_whitespace(self):
+        """Headers are matched case-insensitively, ignoring surrounding whitespace"""
+        data = [
+            ['ENTRY LINK TYPE', ' source name ', 'Source Id', 'COLUMN', 'target NAME', 'Target Id ']
+        ]
+
+        assert sheet_utils.extract_column_indices(data) == (0, 1, 2, 3, 4, 5)
+
+    def test_rejects_four_column_source_target_headers(self):
+        """A sheet with 'Source'/'Target' headers is rejected with the expected headers in the message"""
+        data = [
+            ['Entry link type', 'Source', 'Column', 'Target']
+        ]
+
+        with pytest.raises(ValueError) as error:
+            sheet_utils.extract_column_indices(data)
+
+        message = str(error.value)
+        assert "'Source Name' or 'Source ID'" in message
+        assert "'Target Name' or 'Target ID'" in message
+        assert 'Expected headers' in message
 
 
 # ============================================================================
@@ -582,24 +643,3 @@ class TestEdgeCases:
         assert result[0]['target_name'] == 'p.global.G.Term'
         assert result[0]['target_id'] == ''
         assert result[0]['row_number'] == '2'
-
-    def test_export_falls_back_to_raw_name_when_term_resolution_raises(self, monkeypatch):
-        """_add_entry_link_to_rows should fall back to raw entry name if term resolution fails"""
-        mock_service = MagicMock()
-        monkeypatch.setattr(sheet_utils.api_layer, 'get_entry_fqn', lambda s, r, p: 'bigquery:p.d.t')
-
-        def fail_resolve(*args, **kwargs):
-            raise RuntimeError("Permission denied")
-
-        monkeypatch.setattr(sheet_utils.api_layer, 'resolve_term_entry_to_display_identifier', fail_resolve)
-
-        rows = []
-        source_ref = {'name': 'projects/p/locations/us/entryGroups/@bigquery/entries/t', 'path': 'Schema.c'}
-        target_ref = {'name': 'projects/p/locations/global/entryGroups/@dataplex/entries/projects/p/locations/global/glossaries/g/terms/term1'}
-        sheet_utils._add_entry_link_to_rows(rows, 'definition', source_ref, target_ref, dataplex_service=mock_service)
-
-        assert len(rows) == 1
-        assert rows[0][0] == 'definition'
-        assert rows[0][1] == 'bigquery:p.d.t'
-        assert rows[0][4] == target_ref['name']
-        assert rows[0][5] == 'term1'

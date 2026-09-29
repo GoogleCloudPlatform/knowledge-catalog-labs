@@ -23,12 +23,6 @@ class TestFormatTermDisplayIdentifier:
         )
         assert result == "my-project.global.Sales Glossary.Order ID"
 
-    def test_custom_delimiter(self):
-        result = business_glossary_utils.format_term_display_identifier(
-            "my-project", "global", "Sales Glossary", "Order ID", delimiter="/"
-        )
-        assert result == "my-project/global/Sales Glossary/Order ID"
-
 
 class TestParseTermDisplayIdentifier:
     """Tests for parse_term_display_identifier."""
@@ -51,15 +45,6 @@ class TestParseTermDisplayIdentifier:
         assert result.location == "global"
         assert result.glossary_display_name == "Sales Glossary"
         assert result.term_display_name == "Order.ID.v2"
-
-    def test_custom_delimiter_slash(self):
-        result = business_glossary_utils.parse_term_display_identifier(
-            "my-project/us-central1/Finance/Net Revenue", delimiter="/"
-        )
-        assert result.project_id == "my-project"
-        assert result.location == "us-central1"
-        assert result.glossary_display_name == "Finance"
-        assert result.term_display_name == "Net Revenue"
 
     def test_invalid_too_few_parts_raises_error(self):
         with pytest.raises(InvalidTermIdentifierError) as exc_info:
@@ -113,16 +98,17 @@ class TestColumnExtractionAndFormatting:
         assert business_glossary_utils.extract_column_from_source_path("") == ""
         assert business_glossary_utils.extract_column_from_source_path(None) == ""
 
-    def test_format_column_prepends_schema_for_bigquery(self):
-        assert business_glossary_utils.format_source_path_from_column("order_id", "@bigquery") == "Schema.order_id"
-        assert business_glossary_utils.format_source_path_from_column("Schema.order_id", "@bigquery") == "Schema.order_id"
+    def test_format_column_prepends_schema(self):
+        assert business_glossary_utils.format_source_path_from_column("order_id") == "Schema.order_id"
+        assert business_glossary_utils.format_source_path_from_column(" user.address.zip ") == "Schema.user.address.zip"
 
-    def test_format_column_prepends_schema_for_custom_group(self):
-        assert business_glossary_utils.format_source_path_from_column("custom_field", "custom_group") == "Schema.custom_field"
+    def test_format_column_keeps_existing_schema_prefix(self):
+        assert business_glossary_utils.format_source_path_from_column("Schema.order_id") == "Schema.order_id"
 
     def test_format_column_empty_returns_empty(self):
-        assert business_glossary_utils.format_source_path_from_column("", "@bigquery") == ""
-        assert business_glossary_utils.format_source_path_from_column(None, "@bigquery") == ""
+        assert business_glossary_utils.format_source_path_from_column("") == ""
+        assert business_glossary_utils.format_source_path_from_column("   ") == ""
+        assert business_glossary_utils.format_source_path_from_column(None) == ""
 
 
 class TestExtractShortId:
@@ -145,23 +131,36 @@ class TestExtractShortId:
             == "my_term"
         )
 
-    def test_extracts_from_colon_entry_identifier(self):
+    def test_extracts_project_dataset_table_from_bigquery_table_entry(self):
         assert (
             business_glossary_utils.extract_short_id(
-                "projects/p/locations/l/entryGroups/@dataplex/entries/glossary:g.term:customer_id"
+                "projects/123/locations/us/entryGroups/@bigquery/entries/"
+                "bigquery.googleapis.com/projects/p/datasets/d/tables/orders"
             )
-            == "customer_id"
+            == "p.d.orders"
         )
 
-    def test_extracts_from_bigquery_fqn(self):
-        assert business_glossary_utils.extract_short_id("bigquery:my_proj.dataset.table_name") == "table_name"
-
-    def test_extracts_from_bigquery_entry(self):
+    def test_extracts_project_dataset_from_bigquery_dataset_entry(self):
         assert (
             business_glossary_utils.extract_short_id(
-                "projects/p/locations/us/entryGroups/@bigquery/entries/bigquery:p.d.orders"
+                "projects/123/locations/us/entryGroups/@bigquery/entries/"
+                "bigquery.googleapis.com/projects/p/datasets/d"
             )
-            == "orders"
+            == "p.d"
+        )
+
+    def test_extracts_entry_id_from_custom_entry(self):
+        assert (
+            business_glossary_utils.extract_short_id(
+                "projects/p/locations/us-central1/entryGroups/my-group/entries/my-entry"
+            )
+            == "my-entry"
+        )
+        assert (
+            business_glossary_utils.extract_short_id(
+                "projects/p/locations/us-central1/entryGroups/my-group/entries/orders:v1"
+            )
+            == "orders:v1"
         )
 
     def test_passes_through_plain_id(self):

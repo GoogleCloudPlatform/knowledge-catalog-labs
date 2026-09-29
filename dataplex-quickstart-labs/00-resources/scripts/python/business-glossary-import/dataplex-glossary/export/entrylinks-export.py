@@ -9,7 +9,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from utils import api_layer, argument_parser, business_glossary_utils, logging_utils, sheet_utils, error
-from utils.constants import MAX_WORKERS, ENTRYLINK_SHEET_HEADERS
+from utils.constants import ENTRYLINK_SHEET_HEADERS, MAX_WORKERS, SYMMETRIC_LINK_TYPES
 from utils.retry_utils import is_network_error
 
 logger = logging_utils.get_logger()
@@ -18,32 +18,15 @@ SHEET_HEADERS = ENTRYLINK_SHEET_HEADERS
 
 
 def _build_deduplication_key(entry_link_row: list) -> tuple:
-    """Build a unique key for detecting duplicate entry links.
+    """Build a unique key for detecting duplicate rows.
 
-    Row format: [link_type, source_name, source_id, column, target_name, target_id]
-    or legacy: [link_type, source, column, target]
+    Row format: [link_type, source_name, source_id, column, target_name, target_id].
+    Synonym and related links have no direction, so their source and target are compared unordered.
     """
-    if not entry_link_row:
-        return ()
-    link_type = entry_link_row[0]
-    if len(entry_link_row) >= 6:
-        source_name = entry_link_row[1]
-        source_id = entry_link_row[2]
-        column = entry_link_row[3]
-        target_name = entry_link_row[4]
-        target_id = entry_link_row[5]
-        source_key = f"{source_name}:{source_id}" if (source_name and source_id) else (source_id or source_name)
-        target_key = f"{target_name}:{target_id}" if (target_name and target_id) else (target_id or target_name)
-    elif len(entry_link_row) == 4:
-        source_key = entry_link_row[1]
-        column = entry_link_row[2]
-        target_key = entry_link_row[3]
-    else:
-        source_key = entry_link_row[1] if len(entry_link_row) > 1 else ''
-        column = entry_link_row[2] if len(entry_link_row) > 2 else ''
-        target_key = entry_link_row[3] if len(entry_link_row) > 3 else ''
-
-    if link_type in ("synonym", "related"):
+    link_type, source_name, source_id, column, target_name, target_id = entry_link_row
+    source_key = (source_name, source_id)
+    target_key = (target_name, target_id)
+    if link_type in SYMMETRIC_LINK_TYPES:
         return (link_type, tuple(sorted([source_key, target_key])), column)
     return (link_type, source_key, target_key, column)
 
@@ -95,12 +78,10 @@ def _fetch_links_from_regions_parallel(term_entry_name: str, regions: list, bill
     return collected_links
 
 
-def fetch_entry_links_for_term(
-    glossary_term: dict, regions_to_query: list, billing_project: str, dataplex_service=None
-) -> list:
-    """Fetch all entry links for a term across relevant regions and convert to rows."""
-    if dataplex_service is None:
-        dataplex_service = api_layer.get_dataplex_service()
+def fetch_entry_links_for_term(glossary_term: dict, regions_to_query: list, billing_project: str) -> list:
+    """Fetch all entry links for a term across relevant regions."""
+    if not regions_to_query:
+        return []
 
     term_name = glossary_term["name"]
     try:
@@ -113,29 +94,69 @@ def fetch_entry_links_for_term(
     term_entry_name = business_glossary_utils.generate_entry_name_from_term_name(
         term_name, project_number=project_number
     )
-
-    if not regions_to_query:
-        return []
-
-    collected_links = _fetch_links_from_regions_parallel(term_entry_name, regions_to_query, billing_project)
-    return sheet_utils.entry_links_to_rows(
-        collected_links, dataplex_service=dataplex_service, user_project=billing_project
-    ) if collected_links else []
+    return _fetch_links_from_regions_parallel(term_entry_name, regions_to_query, billing_project)
 
 
-def fetch_all_entry_links(
-    glossary_terms: list, regions_to_query: list, billing_project: str, dataplex_service=None
-) -> list:
-    """Fetch entry links for all terms in parallel using thread-local service clients."""
+def fetch_all_entry_links(glossary_terms: list, regions_to_query: list, billing_project: str) -> list:
+    """Fetch entry links for all terms in parallel."""
     all_entry_links = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         term_futures = {
-            executor.submit(fetch_entry_links_for_term, term, regions_to_query, billing_project, dataplex_service): term
+            executor.submit(fetch_entry_links_for_term, term, regions_to_query, billing_project): term
             for term in glossary_terms
         }
         for completed_future in as_completed(term_futures):
             all_entry_links.extend(completed_future.result())
     return all_entry_links
+
+
+def deduplicate_raw_entry_links(entry_links: list) -> list:
+    """Remove duplicate entry links (a link is returned once for every term it references)."""
+    processed_link_keys = set()
+    unique_entry_links = []
+
+    for entry_link in entry_links:
+        # Each reference carries its type, so sorting only makes the order of synonym and
+        # related references irrelevant; the direction of definition links is kept.
+        dedup_key = (
+            entry_link.get('entryLinkType', '').rsplit('/', 1)[-1],
+            tuple(sorted(
+                (ref.get('name', ''), ref.get('path', ''), ref.get('type', ''))
+                for ref in entry_link.get('entryReferences', [])
+            )),
+        )
+        if dedup_key not in processed_link_keys:
+            processed_link_keys.add(dedup_key)
+            unique_entry_links.append(entry_link)
+
+    return unique_entry_links
+
+
+def convert_entry_links_to_rows(entry_links: list, billing_project: str) -> list:
+    """Convert entry links to sheet rows, skipping duplicate and redacted links.
+
+    Resolving display names and FQNs takes API calls, so links are converted in parallel,
+    each worker thread using its own Dataplex client.
+    """
+    unique_entry_links = deduplicate_raw_entry_links(entry_links)
+    logger.debug(f"Deduplicated {len(entry_links)} -> {len(unique_entry_links)} fetched entry links")
+
+    visible_entry_links = []
+    for entry_link in unique_entry_links:
+        if sheet_utils.is_redacted_entry_link(entry_link):
+            logger.debug(f"Skipping redacted entrylink: {entry_link.get('name', 'unknown')}")
+        else:
+            visible_entry_links.append(entry_link)
+    redacted_link_count = len(unique_entry_links) - len(visible_entry_links)
+    if redacted_link_count > 0:
+        logger.info(f"Skipped {redacted_link_count} redacted entrylink(s) during export")
+
+    def to_row(entry_link: dict):
+        return sheet_utils.entry_link_to_row(entry_link, api_layer.get_dataplex_service(), billing_project)
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        rows = list(executor.map(to_row, visible_entry_links))
+    return [row for row in rows if row is not None]
 
 
 def _write_entry_links_to_sheet(entry_links: list, spreadsheet_url: str, sheets_service) -> str:
@@ -153,6 +174,21 @@ def _clear_sheet_with_headers(spreadsheet_url: str, sheets_service) -> str:
     return sheet_utils.write_to_sheet(sheets_service, spreadsheet_id, [SHEET_HEADERS], sheet_name=target_sheet_name)
 
 
+def _cache_listed_terms(glossary_resource_name: str, glossary_terms: list, billing_project: str) -> None:
+    """Cache the listed terms, so resolving their display names for the rows needs no API calls."""
+    try:
+        project_id = business_glossary_utils.extract_project_id_from_name(glossary_resource_name)
+    except ValueError as e:
+        logger.debug(f"Not caching the terms of '{glossary_resource_name}': {e}")
+        return
+    try:
+        project_number = api_layer.get_project_number(project_id, billing_project)
+    except Exception as e:
+        logger.debug(f"Could not resolve project number for '{glossary_resource_name}': {e}")
+        project_number = ""
+    api_layer.cache_glossary_terms(glossary_terms, project_id, project_number)
+
+
 def export_entry_links(glossary_resource_name: str, spreadsheet_url: str, billing_project: str) -> bool:
     """Export all EntryLinks from a glossary to Google Sheets."""
     dataplex_service = api_layer.authenticate_dataplex()
@@ -164,6 +200,7 @@ def export_entry_links(glossary_resource_name: str, spreadsheet_url: str, billin
         logger.warning("No terms found in the glossary")
         _clear_sheet_with_headers(spreadsheet_url, sheets_service)
         return False
+    _cache_listed_terms(glossary_resource_name, glossary_terms, billing_project)
 
     regions_to_query = _resolve_regions_for_glossary(glossary_resource_name, billing_project)
     if not regions_to_query:
@@ -172,13 +209,14 @@ def export_entry_links(glossary_resource_name: str, spreadsheet_url: str, billin
         return False
 
     all_entry_links = fetch_all_entry_links(glossary_terms, regions_to_query, billing_project)
-    if not all_entry_links:
+    entry_link_rows = convert_entry_links_to_rows(all_entry_links, billing_project)
+    if not entry_link_rows:
         logger.info("No entry links found")
         _clear_sheet_with_headers(spreadsheet_url, sheets_service)
         return False
 
-    unique_entry_links = deduplicate_entry_links(all_entry_links)
-    logger.debug(f"Deduplicated {len(all_entry_links)} -> {len(unique_entry_links)} links")
+    unique_entry_links = deduplicate_entry_links(entry_link_rows)
+    logger.debug(f"Deduplicated {len(entry_link_rows)} -> {len(unique_entry_links)} rows")
 
     sheet_name = _write_entry_links_to_sheet(unique_entry_links, spreadsheet_url, sheets_service)
     logger.info(f"Data exported to sheet: '{sheet_name}' ({len(unique_entry_links)} entry links)")

@@ -163,15 +163,15 @@ The first row of the sheet contains the following 6 column headers:
 
 Where:
 
-*   `Entry link type` (required): Type of EntryLink. Valid values: `definition`, `synonym`, `related`.
-*   `Source Name` (required):
-    *   For `definition` links: Fully Qualified Name (FQN) of the data asset entry (e.g., `bigquery:project_id.dataset_id.table_name` or `custom:dataset_id.entry_name`).
-    *   For `synonym` and `related` links: The 4-part term display identifier in format `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`.
-*   `Source ID`: Short identifier of the source asset or term (e.g., `table_name` or term ID).
-*   `Column` (optional):
-    *   For `definition` links: Specific column/field name within the data asset (e.g., `order_id` or `user.address.zip`). Leave empty for whole-table/entry definitions.
-    *   For `synonym` and `related` links: Always left empty.
-*   `Target Name` (required): The 4-part term display identifier in format `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`.
-*   `Target ID`: Short identifier of the target glossary term.
+*   `Entry link type`: Type of EntryLink: `definition`, `synonym` or `related`.
+*   `Source Name`:
+    *   For `definition` links: Fully Qualified Name (FQN) of the data asset (e.g. `bigquery:my-project.sales.orders`).
+    *   For `synonym` and `related` links: The term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`.
+*   `Source ID`:
+    *   For `definition` links: Short ID of the data asset, for information only (e.g. `my-project.sales.orders` for a BigQuery table).
+    *   For `synonym` and `related` links: The term ID of the source term (the `id` column of the glossary export).
+*   `Column`: For `definition` links to a column, the column name (e.g. `order_id`). Empty for links to a whole data asset and for `synonym` and `related` links.
+*   `Target Name`: The term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>` of the target term.
+*   `Target ID`: The term ID of the target term.
 
-*(Note: Legacy 4-column sheets `[Entry link type, Source, Column, Target]` and full Dataplex entry resource names remain supported for backward compatibility.)*
+If a name can't be resolved (for example, a data asset without an FQN), the export logs a warning and writes the full Dataplex entry name instead. The EntryLinks import reads this format, so an exported sheet can be imported as is.

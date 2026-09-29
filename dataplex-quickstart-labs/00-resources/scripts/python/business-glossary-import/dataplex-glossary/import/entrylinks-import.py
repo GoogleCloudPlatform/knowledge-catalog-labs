@@ -3,13 +3,14 @@
 import os
 import select
 import sys
-from typing import Dict, List
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 curr_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(curr_dir))
 sys.path.append(os.path.dirname(os.path.dirname(curr_dir)))
 
-from utils import api_layer, argument_parser, business_glossary_utils, constants, file_utils, gcs_dao, import_utils, logging_utils, retry_utils, sheet_utils
+from utils import api_layer, argument_parser, business_glossary_utils, constants, file_utils, gcs_dao, import_utils, logging_utils, sheet_utils
 from utils.constants import (
     ARCHIVE_DIRECTORY,
     DP_LINK_TYPE_DEFINITION,
@@ -17,6 +18,7 @@ from utils.constants import (
     DP_LINK_TYPE_SYNONYM,
     ENTRY_REFERENCE_TYPE_SOURCE,
     ENTRY_REFERENCE_TYPE_TARGET,
+    MAX_WORKERS,
     PROCESSED_DIRECTORY,
     SOURCE_ENTRY_PATTERN,
 )
@@ -25,6 +27,7 @@ from utils.models import EntryLink, EntryReference, SpreadsheetRow
 logger = logging_utils.get_logger()
 
 USER_INPUT_TIMEOUT = 60  # seconds
+MAX_LISTED_ITEMS = 20  # longer lists are written in full to the log file only
 
 
 def _read_user_input_with_select(timeout: int) -> str:
@@ -42,18 +45,44 @@ def get_user_input_with_timeout(prompt: str, timeout: int = USER_INPUT_TIMEOUT) 
     return _read_user_input_with_select(timeout)
 
 
-def prompt_user_on_missing_entries(missing_entry_names: List[str]):
-    """Prompt user to continue if entries are missing."""
-    if not missing_entry_names:
-        return
+def _log_items(items: List[str], log: Callable[[str], None]) -> None:
+    """Log a list of items, showing at most MAX_LISTED_ITEMS on the console (all of them go to the log file)."""
+    for item in items[:MAX_LISTED_ITEMS]:
+        log(f"  - {item}")
+    for item in items[MAX_LISTED_ITEMS:]:
+        logger.debug(f"  - {item}")
+    if len(items) > MAX_LISTED_ITEMS:
+        log(f"  ... and {len(items) - MAX_LISTED_ITEMS} more (see the log file)")
 
-    missing_count = len(missing_entry_names)
-    logger.warning(f"Found {missing_count} entries not found in Dataplex. "
-                  f"EntryLinks associated with these entries will be skipped.")
+
+def _format_failed_rows(failed_rows: List[Tuple[int, str]]) -> List[str]:
+    """Format (row number, reason) pairs, ordered by row number."""
+    return [f"Row {row_number}: {reason}" for row_number, reason in sorted(failed_rows)]
+
+
+def confirm_import(failed_rows: List[Tuple[int, str]], missing_entries: Iterable[str]) -> bool:
+    """Report rows that can't be imported and referenced entries that don't exist, then ask to continue.
+
+    Returns:
+        True if there is nothing to report or the user chooses to continue, False otherwise.
+    """
+    missing_entries = sorted(missing_entries)
+    if not failed_rows and not missing_entries:
+        return True
+
+    if failed_rows:
+        logger.warning(f"{len(failed_rows)} row(s) can't be imported and will be skipped:")
+        _log_items(_format_failed_rows(failed_rows), logger.warning)
+    if missing_entries:
+        logger.warning(f"{len(missing_entries)} referenced entry(ies) were not found in Dataplex; "
+                       f"entry links that use them may fail during import:")
+        _log_items(missing_entries, logger.warning)
+
     user_response = get_user_input_with_timeout("Continue with import? [y/N]: ")
     if not user_response.lower().startswith('y'):
         logger.info("Import aborted.")
-        sys.exit(1)
+        return False
+    return True
 
 
 def _get_existing_archive_files(archive_dir: str) -> List[str]:
@@ -146,6 +175,8 @@ def _lookup_and_check_entry(entry_ref, missing_entries: set, failed_entries: set
 def check_entry_existence(entrylinks: List[EntryLink]) -> tuple:
     """Check if entries exist using parallel lookups.
 
+    Entries already confirmed to exist while resolving the sheet rows are not looked up again.
+
     Returns:
         tuple: (missing_entry_names, failed_entry_names)
             - missing_entry_names: Entries that returned 404 (don't exist)
@@ -153,12 +184,16 @@ def check_entry_existence(entrylinks: List[EntryLink]) -> tuple:
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    unique_entry_refs = _collect_unique_entry_references(entrylinks)
-    logger.info(f"Validating {len(unique_entry_refs)} unique entries...")
-
+    unique_entry_refs = [
+        ref for ref in _collect_unique_entry_references(entrylinks)
+        if not api_layer.is_known_entry(ref.name)
+    ]
     missing_entry_names = set()
     failed_entry_names = set()
+    if not unique_entry_refs:
+        return missing_entry_names, failed_entry_names
 
+    logger.info(f"Validating {len(unique_entry_refs)} unique entries...")
     with ThreadPoolExecutor(max_workers=10) as executor:
         lookup_futures = [
             executor.submit(_lookup_and_check_entry, ref, missing_entry_names, failed_entry_names)
@@ -177,9 +212,20 @@ def convert_spreadsheet_to_entrylinks(
     spreadsheet_url: str,
     sheet_name: str = None,
     dataplex_service=None,
-    user_project: str = ""
+    user_project: str = "",
+    failed_rows: Optional[List[Tuple[int, str]]] = None
 ) -> List[EntryLink]:
-    """Convert spreadsheet rows to EntryLink entries."""
+    """Convert spreadsheet rows to EntryLink entries, in the order of the rows.
+
+    Resolving the rows takes API calls, so rows are resolved in parallel, each worker thread
+    using its own Dataplex client unless `dataplex_service` is given. Rows that can't be
+    converted are left out; their (row number, reason) is appended to `failed_rows` when
+    given (see build_entry_link).
+
+    Raises:
+        Exception: If resolving a row kept failing with network or server errors (see
+            build_entry_link); rows whose resolution hasn't started yet are then skipped.
+    """
     spreadsheet_data = sheet_utils.read_from_spreadsheet_url(spreadsheet_url, sheet_name=sheet_name)
 
     if not spreadsheet_data or len(spreadsheet_data) < 2:
@@ -190,21 +236,25 @@ def convert_spreadsheet_to_entrylinks(
         spreadsheet_data, type_idx, source_name_idx, source_id_idx, column_idx, target_name_idx, target_id_idx
     )
 
-    entrylinks = [
-        build_entry_link(
+    def to_entrylink(row_dict: Dict) -> Optional[EntryLink]:
+        return build_entry_link(
             SpreadsheetRow.from_dict(row_dict),
-            dataplex_service=dataplex_service,
-            user_project=user_project
+            dataplex_service=dataplex_service or api_layer.get_dataplex_service(),
+            user_project=user_project,
+            failed_rows=failed_rows
         )
-        for row_dict in row_dicts
-    ]
-    valid_entrylinks = [entrylink for entrylink in entrylinks if entrylink is not None]
-    skipped_count = len(row_dicts) - len(valid_entrylinks)
-    if skipped_count > 0:
-        logger.warning(f"Skipped {skipped_count} of {len(row_dicts)} row(s) due to invalid type or unresolved references.")
-        if dataplex_service is not None and valid_entrylinks:
-            prompt_user_on_missing_entries([f"unresolved_row_{i}" for i in range(skipped_count)])
-    return valid_entrylinks
+
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
+        futures = [executor.submit(to_entrylink, row_dict) for row_dict in row_dicts]
+        wait(futures, return_when=FIRST_EXCEPTION)
+    except KeyboardInterrupt:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    # After an error, rows whose resolution hasn't started yet are cancelled.
+    executor.shutdown(cancel_futures=True)
+    entrylinks = [future.result() for future in futures if not future.cancelled()]
+    return [entrylink for entrylink in entrylinks if entrylink is not None]
 
 
 def _parse_source_entry_components(source_entry: str) -> tuple:
@@ -237,149 +287,138 @@ def _resolve_explicit_resource_name(resource_name: str, user_project: str = "") 
     return api_layer.normalize_entry_name_project_number(resource_name, user_project)
 
 
+def _full_resource_name(name: str, resource_id: str) -> str:
+    """Return the full 'projects/...' resource name given in the ID or Name cell, if any."""
+    for value in (resource_id, name):
+        if value.startswith('projects/'):
+            return value
+    return ""
+
+
 def _resolve_source_entry_name(
-    source_str: str,
+    source_name: str,
     link_type: str,
     source_id: str = "",
     dataplex_service=None,
     user_project: str = ""
 ) -> str:
-    """Resolve source identifier (name and/or ID) to Dataplex entry name."""
-    source_str = source_str.strip() if source_str else ""
-    source_id = source_id.strip() if source_id else ""
+    """Resolve the Source Name / Source ID cells to a Dataplex entry name.
 
-    if source_id.startswith('projects/'):
-        return _resolve_explicit_resource_name(source_id, user_project)
-    if source_str.startswith('projects/'):
-        return _resolve_explicit_resource_name(source_str, user_project)
+    For definition links the source is a data asset, found by the FQN in Source Name
+    (Source ID is informational). Otherwise it is a glossary term (see _resolve_term_entry_name).
+    A full 'projects/...' resource name in either cell is used as is.
+    """
+    if link_type != DP_LINK_TYPE_DEFINITION:
+        return _resolve_term_entry_name("Source", source_name, source_id, dataplex_service, user_project)
 
-    source_val = source_str or source_id
-    if not source_val:
-        raise ValueError("Source name or ID must be provided")
-
-    if link_type == DP_LINK_TYPE_DEFINITION:
-        if dataplex_service:
-            entry_res = api_layer.lookup_entry_by_fqn(dataplex_service, source_val, user_project)
-            entry_name = entry_res.get('name', '') if isinstance(entry_res, dict) else str(entry_res)
-            return api_layer.normalize_entry_name_project_number(entry_name, user_project)
-        raise ValueError(f"Cannot resolve FQN '{source_val}' without Dataplex service")
-
-    if dataplex_service:
-        if source_id:
-            return api_layer.lookup_term_by_display_identifier(
-                dataplex_service, source_str, user_project, term_id=source_id
-            )
-        return api_layer.lookup_term_by_display_identifier(dataplex_service, source_str, user_project)
-    raise ValueError(f"Cannot resolve term identifier '{source_val}' without Dataplex service")
+    full_name = _full_resource_name(source_name, source_id)
+    if full_name:
+        return _resolve_explicit_resource_name(full_name, user_project)
+    if not source_name:
+        raise ValueError("Source Name is required: the data asset's fully qualified name, e.g. 'bigquery:project.dataset.table'")
+    if not dataplex_service:
+        raise ValueError(f"Cannot resolve FQN '{source_name}' without Dataplex service")
+    return api_layer.lookup_entry_by_fqn(dataplex_service, source_name, user_project)['name']
 
 
 def _resolve_target_entry_name(
-    target_str: str,
+    target_name: str,
     target_id: str = "",
     dataplex_service=None,
     user_project: str = ""
 ) -> str:
-    """Resolve target identifier (name and/or ID) to Dataplex entry name."""
-    target_str = target_str.strip() if target_str else ""
-    target_id = target_id.strip() if target_id else ""
+    """Resolve the Target Name / Target ID cells (always a glossary term) to a Dataplex entry name."""
+    return _resolve_term_entry_name("Target", target_name, target_id, dataplex_service, user_project)
 
-    if target_id.startswith('projects/'):
-        return _resolve_explicit_resource_name(target_id, user_project)
-    if target_str.startswith('projects/'):
-        return _resolve_explicit_resource_name(target_str, user_project)
 
-    target_val = target_str or target_id
-    if not target_val:
-        raise ValueError("Target name or ID must be provided")
+def _resolve_term_entry_name(
+    label: str,
+    name: str,
+    term_id: str,
+    dataplex_service=None,
+    user_project: str = ""
+) -> str:
+    """Resolve the Name / ID cells of a glossary term to the term's Dataplex entry name.
 
-    if dataplex_service:
-        if target_id:
-            return api_layer.lookup_term_by_display_identifier(
-                dataplex_service, target_str, user_project, term_id=target_id
-            )
-        return api_layer.lookup_term_by_display_identifier(dataplex_service, target_str, user_project)
-    raise ValueError(f"Cannot resolve term identifier '{target_val}' without Dataplex service")
+    Name ('<project>.<location>.<glossary>.<term>') identifies the glossary and ID identifies the
+    term in it; both are required. A full 'projects/...' resource name in either cell is used as is.
+    """
+    full_name = _full_resource_name(name, term_id)
+    if full_name:
+        return _resolve_explicit_resource_name(full_name, user_project)
+    if not name:
+        raise ValueError(f"{label} Name is required: '<project>.<location>.<glossary>.<term>'")
+    if not term_id:
+        raise ValueError(
+            f"{label} ID is required for glossary terms (the export fills it in); "
+            f"or put the full 'projects/...' resource name in {label} ID"
+        )
+    if not dataplex_service:
+        raise ValueError(f"Cannot resolve term '{name}' without Dataplex service")
+    return api_layer.lookup_term_by_display_identifier(dataplex_service, name, user_project, term_id=term_id)
+
+
+def _record_failed_row(row_number: int, reason: str, failed_rows: Optional[List[Tuple[int, str]]]) -> None:
+    """Record why a row can't be imported: in failed_rows if given, otherwise as a warning."""
+    if failed_rows is None:
+        logger.warning(f"Row {row_number} skipped: {reason}")
+        return
+    failed_rows.append((row_number, reason))
+    logger.debug(f"Row {row_number} skipped: {reason}")
 
 
 def build_entry_link(
     spreadsheet_row: SpreadsheetRow,
     dataplex_service=None,
-    user_project: str = ""
-) -> EntryLink | None:
-    """Build EntryLink model from spreadsheet row data. Returns None if link type is invalid or resolution fails."""
-    link_type = spreadsheet_row.entry_link_type.lower()
-    row_label = f"row {spreadsheet_row.row_number}" if spreadsheet_row.row_number > 0 else "row"
+    user_project: str = "",
+    failed_rows: Optional[List[Tuple[int, str]]] = None
+) -> Optional[EntryLink]:
+    """Build EntryLink model from spreadsheet row data.
 
-    if link_type not in constants.LINK_TYPES:
-        logger.warning(f"Invalid entry_link_type '{spreadsheet_row.entry_link_type}' on {row_label}. "
-                      f"Expected one of: {list(constants.LINK_TYPES.keys())}. Row skipped.")
-        return None
+    Returns None if the row can't be imported (invalid type, missing cells or unresolved
+    references). The reason is appended to `failed_rows` as (row number, reason) when
+    given, and logged as a warning otherwise.
 
-    source_name = spreadsheet_row.source_name
-    source_id = spreadsheet_row.source_id
-    target_name = spreadsheet_row.target_name
-    target_id = spreadsheet_row.target_id
-    column_val = spreadsheet_row.column or spreadsheet_row.source_path
-
+    Raises:
+        Exception: If resolving the row kept failing with network or server errors
+            (see api_layer.is_transient_error); the other rows would fail the same way.
+    """
     try:
+        link_type = spreadsheet_row.entry_link_type.lower()
+        if link_type not in constants.LINK_TYPES:
+            raise ValueError(f"Invalid entry link type '{spreadsheet_row.entry_link_type}'. "
+                             f"Expected one of: {list(constants.LINK_TYPES.keys())}")
         source_entry = _resolve_source_entry_name(
-            source_name, link_type, source_id=source_id, dataplex_service=dataplex_service, user_project=user_project
+            spreadsheet_row.source_name, link_type, source_id=spreadsheet_row.source_id,
+            dataplex_service=dataplex_service, user_project=user_project
         )
         target_entry = _resolve_target_entry_name(
-            target_name, target_id=target_id, dataplex_service=dataplex_service, user_project=user_project
+            spreadsheet_row.target_name, target_id=spreadsheet_row.target_id,
+            dataplex_service=dataplex_service, user_project=user_project
         )
-    except Exception as resolve_error:
-        logger.error(f"Resolution failed for {row_label}: {resolve_error}")
-        return None
-
-    try:
         project_id, location, entry_group = _parse_source_entry_components(source_entry)
-    except Exception as parse_error:
-        logger.error(f"Failed to parse source entry components from '{source_entry}' on {row_label}: {parse_error}")
+    except Exception as row_error:
+        if api_layer.is_transient_error(row_error):
+            raise
+        _record_failed_row(spreadsheet_row.row_number, str(row_error) or type(row_error).__name__, failed_rows)
         return None
-
-    entry_refs = build_entry_references(source_entry, target_entry, column_val, entry_group, link_type)
-    entrylink_name = _generate_entrylink_name(project_id, location, entry_group)
 
     entrylink = EntryLink(
-        name=entrylink_name,
+        name=_generate_entrylink_name(project_id, location, entry_group),
         entryLinkType=constants.LINK_TYPES[link_type],
-        entryReferences=entry_refs
+        entryReferences=build_entry_references(source_entry, target_entry, spreadsheet_row.column, link_type)
     )
 
     logger.debug(f"input row: {spreadsheet_row}, output entrylink: {entrylink}")
     return entrylink
 
 
-def _format_source_path_for_bigquery(source_path: str, entry_group: str) -> str:
-    """Format source path for BigQuery entries."""
-    column_clean = business_glossary_utils.extract_column_from_source_path(source_path) if source_path else ""
-    return business_glossary_utils.format_source_path_from_column(column_clean, entry_group)
-
-
-def _build_definition_references(
-    source_entry_or_row,
-    target_entry_or_entry_group: str = "",
-    column_name: str = "",
-    entry_group: str = ""
-) -> List[EntryReference]:
+def _build_definition_references(source_entry: str, target_entry: str, column: str = "") -> List[EntryReference]:
     """Build entry references for definition link type."""
-    if isinstance(source_entry_or_row, SpreadsheetRow):
-        row = source_entry_or_row
-        entry_group = target_entry_or_entry_group
-        source_entry = row.source or row.source_entry
-        target_entry = row.target or row.target_entry
-        column_name = row.column or row.source_path
-    else:
-        source_entry = source_entry_or_row
-        target_entry = target_entry_or_entry_group
-
-    formatted_path = _format_source_path_for_bigquery(column_name, entry_group)
-
     return [
         EntryReference(
             name=source_entry,
-            path=formatted_path,
+            path=business_glossary_utils.format_source_path_from_column(column),
             type=ENTRY_REFERENCE_TYPE_SOURCE
         ),
         EntryReference(
@@ -391,27 +430,14 @@ def _build_definition_references(
 
 
 def build_entry_references(
-    source_entry_or_row,
-    target_entry_or_entry_group: str = "",
-    column_name_or_link_type: str = "",
-    entry_group: str = "",
+    source_entry: str,
+    target_entry: str,
+    column: str = "",
     link_type: str = ""
 ) -> List[EntryReference]:
-    """Build list of EntryReference models from row data or entry names."""
-    if isinstance(source_entry_or_row, SpreadsheetRow):
-        row = source_entry_or_row
-        entry_group = target_entry_or_entry_group
-        link_type = column_name_or_link_type
-        source_entry = row.source or row.source_entry
-        target_entry = row.target or row.target_entry
-        column_name = row.column or row.source_path
-    else:
-        source_entry = source_entry_or_row
-        target_entry = target_entry_or_entry_group
-        column_name = column_name_or_link_type
-
+    """Build list of EntryReference models. The column is only used by definition links."""
     if link_type == DP_LINK_TYPE_DEFINITION:
-        return _build_definition_references(source_entry, target_entry, column_name, entry_group)
+        return _build_definition_references(source_entry, target_entry, column)
 
     return [
         EntryReference(name=source_entry),
@@ -557,8 +583,9 @@ def _handle_import_exception(exception: Exception) -> int:
         logger.info("Import cancelled by user")
         return 130
 
-    if retry_utils.is_network_error(exception):
-        logger.error("Network connectivity issue. Please check your internet connection and try again.")
+    if api_layer.is_transient_error(exception):
+        logger.error(f"Import stopped: API calls kept failing with network or server errors after retrying: {exception}")
+        logger.error("Please check your internet connection and try again.")
     else:
         logger.error(f"Unexpected error during import: {exception}")
 
@@ -580,21 +607,26 @@ def _run_import_workflow(parsed_args) -> int:
     sheet_name = sheet_utils.get_sheet_name_for_url(parsed_args.spreadsheet_url)
     logger.info(f"Starting EntryLink import from sheet: '{sheet_name}'")
 
-    dataplex_service = api_layer.authenticate_dataplex()
+    api_layer.authenticate_dataplex()  # Fail early without Dataplex credentials.
     user_project = parsed_args.user_project
     logger.debug(f"Using user project for API quota: {user_project}")
 
     if not check_and_clean_archive_folder(_get_archive_directory()):
         return 1
 
+    failed_rows: List[Tuple[int, str]] = []
     entrylinks = convert_spreadsheet_to_entrylinks(
         parsed_args.spreadsheet_url,
         sheet_name=sheet_name,
-        dataplex_service=dataplex_service,
-        user_project=user_project
+        user_project=user_project,
+        failed_rows=failed_rows
     )
     if not entrylinks:
-        logger.warning("Spreadsheet is empty or has no valid entries")
+        if failed_rows:
+            logger.error(f"None of the {len(failed_rows)} row(s) can be imported:")
+            _log_items(_format_failed_rows(failed_rows), logger.error)
+        else:
+            logger.warning("Spreadsheet is empty or has no valid entries")
         return 1
 
     unique_projects = _extract_unique_entry_projects(entrylinks)
@@ -605,7 +637,8 @@ def _run_import_workflow(parsed_args) -> int:
     if _handle_entry_validation_failures(failed_entries):
         return 1
 
-    prompt_user_on_missing_entries(missing_entries)
+    if not confirm_import(failed_rows, missing_entries):
+        return 1
 
     return _execute_import(entrylinks, parsed_args.buckets)
 
@@ -654,4 +687,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

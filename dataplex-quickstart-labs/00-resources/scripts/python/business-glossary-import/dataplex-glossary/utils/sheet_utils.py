@@ -1,12 +1,14 @@
 """Sheet Utility Functions - Google Sheets API operations and data transformations."""
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from google.auth import default
 from googleapiclient.discovery import build
 
 from utils import api_layer, business_glossary_utils, logging_utils
 from utils.constants import (
     COLUMN_HEADER_ALIASES,
+    DP_LINK_TYPE_DEFINITION,
+    ENTRYLINK_SHEET_HEADERS,
     ENTRYLINK_TYPE_PATTERN,
     ENTRY_REFERENCE_TYPE_SOURCE,
     ENTRY_REFERENCE_TYPE_TARGET,
@@ -262,109 +264,84 @@ def _find_source_and_target_refs(entry_references: List[Dict]) -> tuple:
     return first_ref, second_ref
 
 
-def entry_links_to_rows(
-    entry_links: List[Dict[str, Any]],
+def is_redacted_entry_link(entry_link: Dict[str, Any]) -> bool:
+    """Whether any reference of the entry link is redacted (the caller can't view that entry)."""
+    return any(_is_redacted_entry(ref) for ref in entry_link.get('entryReferences', []))
+
+
+def entry_link_to_row(
+    entry_link: Dict[str, Any],
     dataplex_service=None,
     user_project: str = ""
-) -> List[List[str]]:
-    """Convert EntryLinks to spreadsheet row format [Entry link type, Source Name, Source ID, Column, Target Name, Target ID]."""
-    spreadsheet_rows = []
-    redacted_link_count = 0
+) -> Optional[List[str]]:
+    """Convert an EntryLink to a row [Entry link type, Source Name, Source ID, Column, Target Name, Target ID].
 
-    for entry_link in entry_links:
-        full_link_type = entry_link.get('entryLinkType', '')
-        link_type_name = _extract_link_type(full_link_type)
-        if not link_type_name:
-            logger.warning(f"Invalid entryLinkType format: {full_link_type}")
-            continue
+    With a Dataplex service, Name cells hold the data asset FQN and the
+    '<project>.<location>.<glossary>.<term>' display identifier of glossary terms;
+    without one, they hold the raw entry names. Returns None for links that can't be
+    represented as a row (unknown link type, or missing source or target).
+    """
+    full_link_type = entry_link.get('entryLinkType', '')
+    link_type = _extract_link_type(full_link_type)
+    if not link_type:
+        logger.warning(f"Invalid entryLinkType format: {full_link_type}")
+        return None
 
-        entry_references = entry_link.get('entryReferences', [])
-        if not entry_references:
-            continue
-
-        if any(_is_redacted_entry(ref) for ref in entry_references):
-            redacted_link_count += 1
-            logger.debug(f"Skipping redacted entrylink: {entry_link.get('name', 'unknown')}")
-            continue
-
-        source_ref, target_ref = _find_source_and_target_refs(entry_references)
-
-        if source_ref and target_ref:
-            _add_entry_link_to_rows(
-                spreadsheet_rows, link_type_name, source_ref, target_ref,
-                dataplex_service=dataplex_service, user_project=user_project
-            )
-
-    if redacted_link_count > 0:
-        logger.info(f"Skipped {redacted_link_count} redacted entrylink(s) during export")
-
-    return spreadsheet_rows
+    entry_references = entry_link.get('entryReferences', [])
+    if not entry_references:
+        return None
+    source_ref, target_ref = _find_source_and_target_refs(entry_references)
+    if not source_ref or not target_ref:
+        return None
+    return _build_entry_link_row(link_type, source_ref, target_ref, dataplex_service, user_project)
 
 
-def _add_entry_link_to_rows(
-    rows: List[List[str]],
+def _build_entry_link_row(
     link_type: str,
     source_ref: Dict[str, Any],
     target_ref: Dict[str, Any],
     dataplex_service=None,
     user_project: str = ""
-) -> None:
-    """Add a single entry link as a row [type, source_name, source_id, column, target_name, target_id]."""
+) -> List[str]:
+    """Build the row [type, source_name, source_id, column, target_name, target_id] for one entry link."""
     source_raw = source_ref.get('name', '')
     target_raw = target_ref.get('name', '')
-    path_raw = source_ref.get('path', '')
+    is_definition = link_type == DP_LINK_TYPE_DEFINITION
 
+    source_name, target_name = source_raw, target_raw
     if dataplex_service:
-        if link_type == "definition":
-            try:
-                source_name = api_layer.get_entry_fqn(dataplex_service, source_raw, user_project)
-            except Exception as err:
-                logger.warning(f"Failed to resolve FQN for '{source_raw}', falling back to raw entry name: {err}")
-                source_name = source_raw
-            source_id = business_glossary_utils.extract_short_id(source_raw)
-            column_val = business_glossary_utils.extract_column_from_source_path(path_raw)
-            try:
-                target_name = api_layer.resolve_term_entry_to_display_identifier(
-                    dataplex_service, target_raw, user_project=user_project
-                )
-            except Exception as err:
-                logger.warning(f"Failed to resolve display identifier for '{target_raw}', falling back to raw entry name: {err}")
-                target_name = target_raw
-            target_id = business_glossary_utils.extract_short_id(target_raw)
+        if is_definition:
+            source_name = _resolve_or_raw(api_layer.get_entry_fqn, "FQN", dataplex_service, source_raw, user_project)
         else:
-            try:
-                source_name = api_layer.resolve_term_entry_to_display_identifier(
-                    dataplex_service, source_raw, user_project=user_project
-                )
-            except Exception as err:
-                logger.warning(f"Failed to resolve display identifier for '{source_raw}', falling back to raw entry name: {err}")
-                source_name = source_raw
-            source_id = business_glossary_utils.extract_short_id(source_raw)
-            column_val = ""
-            try:
-                target_name = api_layer.resolve_term_entry_to_display_identifier(
-                    dataplex_service, target_raw, user_project=user_project
-                )
-            except Exception as err:
-                logger.warning(f"Failed to resolve display identifier for '{target_raw}', falling back to raw entry name: {err}")
-                target_name = target_raw
-            target_id = business_glossary_utils.extract_short_id(target_raw)
-    else:
-        source_name = source_raw
-        source_id = business_glossary_utils.extract_short_id(source_raw)
-        column_val = business_glossary_utils.extract_column_from_source_path(path_raw)
-        target_name = target_raw
-        target_id = business_glossary_utils.extract_short_id(target_raw)
+            source_name = _resolve_or_raw(
+                api_layer.resolve_term_entry_to_display_identifier, "display identifier",
+                dataplex_service, source_raw, user_project
+            )
+        target_name = _resolve_or_raw(
+            api_layer.resolve_term_entry_to_display_identifier, "display identifier",
+            dataplex_service, target_raw, user_project
+        )
 
-    entry_link_row = [
+    column = business_glossary_utils.extract_column_from_source_path(source_ref.get('path', '')) if is_definition else ""
+    return [
         link_type,
         source_name,
-        source_id,
-        column_val,
+        business_glossary_utils.extract_short_id(source_raw),
+        column,
         target_name,
-        target_id
+        business_glossary_utils.extract_short_id(target_raw),
     ]
-    rows.append(entry_link_row)
+
+
+def _resolve_or_raw(
+    resolve: Callable[..., str], description: str, dataplex_service, entry_name: str, user_project: str
+) -> str:
+    """Resolve an entry name for display, falling back to the raw entry name (with a warning) on failure."""
+    try:
+        return resolve(dataplex_service, entry_name, user_project)
+    except Exception as err:
+        logger.warning(f"Failed to resolve {description} for '{entry_name}', falling back to raw entry name: {err}")
+        return entry_name
 
 
 def _find_header_index(headers: List[str], candidates: List[str]) -> int:
@@ -376,44 +353,46 @@ def _find_header_index(headers: List[str], candidates: List[str]) -> int:
 
 
 def extract_column_indices(spreadsheet_data: List[List[str]]) -> Tuple[int, int, int, int, int, int]:
-    """Extract column indices from spreadsheet headers (supporting 6-column and legacy 4-column headers).
+    """Extract column indices from the header row.
+
+    Accepts the 6-column headers written by the export, and the headers of sheets
+    exported by earlier versions (entry_link_type, source_entry, target_entry, source_path).
 
     Returns:
-        (type_col, source_name_col, source_id_col, column_col, target_name_col, target_id_col)
+        (type_col, source_name_col, source_id_col, column_col, target_name_col, target_id_col),
+        with -1 for columns that are not present.
+
+    Raises:
+        ValueError: If the header row is empty or required columns are missing.
     """
     if not spreadsheet_data or not spreadsheet_data[0]:
         raise ValueError("Spreadsheet header row is empty.")
 
-    normalized_headers = [header.lower().strip() for header in spreadsheet_data[0]]
-
+    headers = spreadsheet_data[0]
+    normalized_headers = [str(header).lower().strip() for header in headers]
     type_col = _find_header_index(normalized_headers, TYPE_HEADER_ALIASES)
-    if type_col < 0:
-        logger.error(f"Required column 'Entry link type' not found in headers: {spreadsheet_data[0]}")
-        raise ValueError("Required column 'Entry link type' (or 'entry_link_type') not found in spreadsheet.")
-
-    source_id_col = _find_header_index(normalized_headers, SOURCE_ID_HEADER_ALIASES)
     source_name_col = _find_header_index(normalized_headers, SOURCE_NAME_HEADER_ALIASES)
-    if source_name_col < 0 and source_id_col < 0:
-        logger.error(f"Required column 'Source Name' or 'Source ID' not found in headers: {spreadsheet_data[0]}")
-        raise ValueError("Required column 'Source Name' (or 'Source ID') not found in spreadsheet.")
-
-    target_id_col = _find_header_index(normalized_headers, TARGET_ID_HEADER_ALIASES)
-    target_name_col = _find_header_index(normalized_headers, TARGET_NAME_HEADER_ALIASES)
-    if target_name_col < 0 and target_id_col < 0:
-        logger.error(f"Required column 'Target Name' or 'Target ID' not found in headers: {spreadsheet_data[0]}")
-        raise ValueError("Required column 'Target Name' (or 'Target ID') not found in spreadsheet.")
-
+    source_id_col = _find_header_index(normalized_headers, SOURCE_ID_HEADER_ALIASES)
     column_col = _find_header_index(normalized_headers, COLUMN_HEADER_ALIASES)
+    target_name_col = _find_header_index(normalized_headers, TARGET_NAME_HEADER_ALIASES)
+    target_id_col = _find_header_index(normalized_headers, TARGET_ID_HEADER_ALIASES)
+
+    missing = []
+    if type_col < 0:
+        missing.append("'Entry link type'")
+    if source_name_col < 0 and source_id_col < 0:
+        missing.append("'Source Name' or 'Source ID'")
+    if target_name_col < 0 and target_id_col < 0:
+        missing.append("'Target Name' or 'Target ID'")
+    if missing:
+        message = (
+            f"Spreadsheet is missing required column(s) {', '.join(missing)}. Found headers: {headers}. "
+            f"Expected headers: {ENTRYLINK_SHEET_HEADERS} (re-run the entry links export to get a sheet in this format)."
+        )
+        logger.error(message)
+        raise ValueError(message)
 
     return type_col, source_name_col, source_id_col, column_col, target_name_col, target_id_col
-
-
-def _is_row_valid(data_row: List[str], row_number: int, required_max_idx: int) -> bool:
-    """Check if a data row has sufficient columns."""
-    if len(data_row) <= required_max_idx:
-        logger.warning(f"Row {row_number} has insufficient columns, skipping")
-        return False
-    return True
 
 
 def _create_entry_link_dict(
@@ -426,28 +405,17 @@ def _create_entry_link_dict(
     target_id_idx: int,
     row_number: int = 0,
 ) -> Dict[str, str]:
-    """Create an entry link dictionary from a data row."""
-    source_name = data_row[source_name_idx].strip() if source_name_idx >= 0 and len(data_row) > source_name_idx else ''
-    source_id = data_row[source_id_idx].strip() if source_id_idx >= 0 and len(data_row) > source_id_idx else ''
-    target_name = data_row[target_name_idx].strip() if target_name_idx >= 0 and len(data_row) > target_name_idx else ''
-    target_id = data_row[target_id_idx].strip() if target_id_idx >= 0 and len(data_row) > target_id_idx else ''
-    column_val = data_row[column_idx].strip() if column_idx >= 0 and len(data_row) > column_idx else ''
-
-    effective_source = source_id if source_id else source_name
-    effective_target = target_id if target_id else target_name
+    """Create an entry link dictionary from a data row (absent or missing cells become empty strings)."""
+    def cell(idx: int) -> str:
+        return str(data_row[idx]).strip() if 0 <= idx < len(data_row) else ''
 
     result = {
-        'entry_link_type': data_row[type_idx].strip() if len(data_row) > type_idx else '',
-        'source_name': source_name,
-        'source_id': source_id,
-        'target_name': target_name,
-        'target_id': target_id,
-        'column': column_val,
-        'source': effective_source,
-        'target': effective_target,
-        'source_entry': effective_source,
-        'target_entry': effective_target,
-        'source_path': column_val,
+        'entry_link_type': cell(type_idx),
+        'source_name': cell(source_name_idx),
+        'source_id': cell(source_id_idx),
+        'column': cell(column_idx),
+        'target_name': cell(target_name_idx),
+        'target_id': cell(target_id_idx),
     }
     if row_number > 0:
         result['row_number'] = str(row_number)
@@ -463,30 +431,19 @@ def rows_to_entry_link_dicts(
     target_name_idx: int,
     target_id_idx: int
 ) -> List[Dict[str, str]]:
-    """Convert spreadsheet rows to entry link dictionaries."""
+    """Convert spreadsheet rows to entry link dictionaries.
+
+    Rows whose entry link cells are all empty are skipped. Incomplete rows are kept
+    (with their row number) so that the import can report why they can't be imported.
+    """
     entry_link_dicts = []
-    required_indices = [type_idx]
-    source_candidates = [idx for idx in (source_name_idx, source_id_idx) if idx >= 0]
-    if source_candidates:
-        required_indices.append(min(source_candidates))
-    target_candidates = [idx for idx in (target_name_idx, target_id_idx) if idx >= 0]
-    if target_candidates:
-        required_indices.append(min(target_candidates))
-    required_max_idx = max(required_indices) if required_indices else 0
-
     for row_number, data_row in enumerate(spreadsheet_data[1:], start=2):
-        if not _is_row_valid(data_row, row_number, required_max_idx):
-            continue
-
         entry_link_dict = _create_entry_link_dict(
             data_row, type_idx, source_name_idx, source_id_idx, column_idx,
             target_name_idx, target_id_idx, row_number=row_number
         )
-
-        if not (entry_link_dict['source_name'] or entry_link_dict['source_id']) or not (entry_link_dict['target_name'] or entry_link_dict['target_id']):
-            logger.warning(f"Row {row_number} missing source or target entry, skipping")
+        if not any(value for key, value in entry_link_dict.items() if key != 'row_number'):
             continue
-
         entry_link_dicts.append(entry_link_dict)
 
     return entry_link_dicts
