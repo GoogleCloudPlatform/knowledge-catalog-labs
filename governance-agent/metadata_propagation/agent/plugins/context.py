@@ -13,17 +13,33 @@ _oauth_token_set = contextvars.ContextVar("oauth_token_set", default=False)
 _cached_adc_creds = None
 _adc_lock = threading.Lock()
 
+# Process-wide enforcement flag. Set by the web server at startup so that
+# every code path in the process (including worker threads that do not
+# inherit contextvars) refuses to fall back to Application Default Credentials.
+_oauth_required_globally = False
+
+
+def is_oauth_bypassed() -> bool:
+    """True only when ADC mode is explicitly requested via BYPASS_OAUTH=true."""
+    return os.environ.get("BYPASS_OAUTH", "").strip().lower() == "true"
+
+
+def require_oauth_globally(required: bool = True):
+    """Enables (or disables) process-wide OAuth enforcement."""
+    global _oauth_required_globally
+    _oauth_required_globally = required
+
 
 def is_oauth_enabled() -> bool:
     """
-    Returns True when OAuth authentication is active in the current execution context
-    and ADC fallback must be blocked.
-    OAuth is active whenever set_oauth_token() has been invoked (e.g. by Gradio UI or
-    ADK AuthPlugin) and BYPASS_OAUTH is not explicitly set to 'true'.
+    Returns True when OAuth authentication is active and ADC fallback must be blocked.
+    OAuth is active (unless BYPASS_OAUTH=true) when either:
+    - the process has enabled enforcement via require_oauth_globally() (web server), or
+    - set_oauth_token() has been invoked in the current execution context.
     """
-    if os.environ.get("BYPASS_OAUTH", "").lower() == "true":
+    if is_oauth_bypassed():
         return False
-    return bool(_oauth_token_set.get())
+    return _oauth_required_globally or bool(_oauth_token_set.get())
 
 
 def set_oauth_token(token: str | dict | None):
@@ -53,7 +69,7 @@ def get_credentials(quota_project_id: str):
     strictly requires a valid user OAuth token and NEVER falls back to Server
     Application Default Credentials (ADC).
     """
-    bypass_oauth = os.environ.get("BYPASS_OAUTH", "").lower() == "true"
+    bypass_oauth = is_oauth_bypassed()
     token_data = _oauth_token.get()
 
     if not bypass_oauth and token_data:

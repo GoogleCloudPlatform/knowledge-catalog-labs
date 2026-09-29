@@ -163,8 +163,14 @@ gcloud run deploy governance-agent \
 
 After deployment, copy your Cloud Run Service URL (`https://<service-name>-<hash>.<region>.run.app`) and configure authentication:
 
+> [!IMPORTANT]
+> The app **refuses to start** unless one mode is configured: either `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` (OAuth), or an explicit `BYPASS_OAUTH=true` (ADC). Missing OAuth settings no longer fall back silently to the Service Account. Put one of them in `.env` before running `deploy.sh`, or pass it via `--set-env-vars` on the first `gcloud run deploy`.
+
 ### Option A: Service Account ADC Mode (`BYPASS_OAUTH=true`) — Recommended for Internal/Enterprise
 If your service runs inside a corporate perimeter (e.g., protected by Google Cloud Identity-Aware Proxy (IAP) or internal VPC ingress), you do not need individual users to log in through Google OAuth. All BigQuery and Dataplex operations will execute using the Cloud Run Service Account:
+
+> [!CAUTION]
+> In this mode the app performs **no user authentication**. Anyone who can reach the URL acts as the Service Account. Never combine `BYPASS_OAUTH=true` with a publicly reachable `--allow-unauthenticated` service. Put it behind IAP or internal ingress.
 
 ```bash
 gcloud run services update governance-agent \
@@ -187,15 +193,18 @@ If you want each user to sign in with their own Google Identity:
    > [!IMPORTANT]
    > The redirect URI must end with `/google_callback`.
 
-3. **Update Cloud Run Environment Variables**:
+3. **Update Cloud Run Environment Variables** (`SESSION_SECRET_KEY` signs the session cookie; use a long random value so sessions work across instances and restarts):
    ```bash
    gcloud run services update governance-agent \
      --region europe-west1 \
      --update-env-vars \
 GOOGLE_CLIENT_ID="<YOUR_CLIENT_ID>",\
 GOOGLE_CLIENT_SECRET="<YOUR_CLIENT_SECRET>",\
-GOOGLE_REDIRECT_URI="https://<YOUR-CLOUD-RUN-URL>/google_callback"
+GOOGLE_REDIRECT_URI="https://<YOUR-CLOUD-RUN-URL>/google_callback",\
+SESSION_SECRET_KEY="<LONG_RANDOM_SECRET>"
    ```
+
+   In this mode every action runs with the signed-in user's own OAuth token. Requests without a valid session are rejected, and the server never falls back to its Service Account.
 
 ---
 

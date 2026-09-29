@@ -7,7 +7,7 @@ from typing import Any
 import google.auth
 import google.auth.transport.requests
 import requests
-from google.cloud import bigquery, datacatalog_lineage_v1
+from google.cloud import bigquery
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -331,7 +331,8 @@ class LineageGraphTraverser:
         self.project_id = project_id
         self.location = location
         self.token = token
-        self.client = datacatalog_lineage_v1.LineageClient()
+        # Note: lineage lookups use the REST API in _search_links with the
+        # caller's OAuth token. No ADC-backed client is created here.
         self.knowledge_insights = []
 
     def load_knowledge_insights(self, json_path):

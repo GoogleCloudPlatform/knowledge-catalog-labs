@@ -38,7 +38,8 @@ oauth_config.register(
 # Import Agent Components
 from metadata_propagation.agent.plugins.context import (
     get_oauth_token,
-    is_oauth_enabled,
+    is_oauth_bypassed,
+    require_oauth_globally,
     set_oauth_token,
 )
 from metadata_propagation.agent.plugins.dq_plugin import DQPlugin
@@ -286,8 +287,13 @@ def get_active_doc_paths(docs_state: list | None, selected_labels: list | None) 
     return active_paths if active_paths else None
 
 
-def handle_refresh_lineage_cache():
-    from lineage_propagation import LineageGraphTraverser
+def handle_refresh_lineage_cache(request: gr.Request = None):
+    # Clearing the process-wide cache is a side effect shared by all users,
+    # so it must not be reachable by unauthenticated callers.
+    set_oauth_token(get_token_from_session(request))
+    from metadata_propagation.dataplex_integration.lineage_propagation import (
+        LineageGraphTraverser,
+    )
 
     LineageGraphTraverser.clear_global_cache()
     gr.Info("Unified Lineage Cache cleared successfully!")
@@ -300,27 +306,66 @@ def get_plugin(project_id, location):
     )
 
 
-def get_token_from_session(request: gr.Request):
-    if os.environ.get("BYPASS_OAUTH", "").lower() == "true":
-        return None
-    if request and hasattr(request, "session"):
-        token_dict = request.session.get("google_token")
-        if isinstance(token_dict, dict) and token_dict.get("access_token"):
-            import time
+def _as_dict(value):
+    if isinstance(value, dict):
+        return value
+    if value is not None and hasattr(value, "keys"):
+        # gr.Request converts dicts into gradio.route_utils.Obj
+        return {k: _as_dict(value[k]) for k in value.keys()}
+    return value
 
-            expires_at = token_dict.get("expires_at")
-            if (
-                expires_at
-                and time.time() > (expires_at - 60)
-                and not token_dict.get("refresh_token")
-            ):
-                # Remove expired token and deny unauthenticated access instead of falling back to ADC
+
+def _session_token(request) -> dict | None:
+    """
+    Returns the signed-session OAuth token for this request, or None.
+
+    gr.Request exposes the token in different shapes depending on the path:
+    - live queued/direct events: request.state.google_token (set by the
+      middleware in create_app) and request.session, where gr.Request converts
+      dicts into gradio.route_utils.Obj (not dict), hence _as_dict();
+    - pickled requests: the Starlette request is dropped and the state is kept
+      under request.request_state; request.session is unavailable.
+    """
+    if request is None:
+        return None
+    lookups = (
+        lambda: getattr(request.state, "google_token", None),
+        lambda: request.request_state.get("google_token"),
+        lambda: request.session.get("google_token"),
+    )
+    for lookup in lookups:
+        try:
+            token = _as_dict(lookup())
+        except (AttributeError, AssertionError, KeyError, TypeError):
+            continue
+        if isinstance(token, dict) and token.get("access_token"):
+            return token
+    return None
+
+
+def get_token_from_session(request: gr.Request):
+    if is_oauth_bypassed():
+        return None
+    token_dict = _session_token(request)
+    if token_dict:
+        import time
+
+        expires_at = token_dict.get("expires_at")
+        if (
+            expires_at
+            and time.time() > (expires_at - 60)
+            and not token_dict.get("refresh_token")
+        ):
+            # Deny expired tokens instead of falling back to ADC
+            try:
                 request.session.pop("google_token", None)
-                set_oauth_token(None)
-                raise gr.Error(
-                    "Session expired: Please sign in again with Google OAuth."
-                )
-            return token_dict
+            except (AttributeError, AssertionError, KeyError):
+                pass  # session is read-only for queued events
+            set_oauth_token(None)
+            raise gr.Error(
+                "Session expired: Please sign in again with Google OAuth."
+            )
+        return token_dict
 
     set_oauth_token(None)
     raise gr.Error(
@@ -1998,71 +2043,109 @@ with gr.Blocks(title="Governance on Auto-pilot") as demo:
                     outputs=dq_results_view,
                 )
 
-    # Helper to check auth status
+    # Helper to check auth status (UI visibility only; authorization is
+    # enforced server-side in every handler via get_token_from_session).
     def check_auth_status(request: gr.Request):
-        client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
-        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
-
-        # Bypass OAuth if client ID or secret are missing, placeholders, or if requested via env var
-        if (
-            not client_id
-            or not client_secret
-            or "YOUR_CLIENT_ID" in client_id
-            or os.environ.get("BYPASS_OAUTH") == "true"
-        ):
+        # ADC mode must be requested explicitly. Missing OAuth client settings
+        # are a misconfiguration, not an implicit opt-in to server credentials.
+        if is_oauth_bypassed():
             logger.info(
-                "Bypassing Google OAuth login screen (running in local ADC mode)."
+                "BYPASS_OAUTH=true: skipping Google OAuth login screen (ADC mode)."
             )
             return gr.update(visible=False), gr.update(visible=True)
 
-        if request and "google_token" in request.session:
+        if _session_token(request):
             return gr.update(visible=False), gr.update(visible=True)
         return gr.update(visible=True), gr.update(visible=False)
 
     demo.load(check_auth_status, outputs=[login_view, app_view])
 
-if __name__ == "__main__":
+def _oauth_client_configured() -> bool:
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "").strip()
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "").strip()
+    return bool(client_id and client_secret and "YOUR_CLIENT_ID" not in client_id)
+
+
+# Endpoints that are only used by programmatic API clients or for file
+# uploads, never by the login page. Unauthenticated requests to these are
+# rejected up front. The browser UI (including the login page) talks to the
+# backend through /gradio_api/queue/*, which must stay reachable so the
+# "Login with Google" button and demo.load() work; those events are
+# authorized inside each handler via get_token_from_session().
+_SESSION_REQUIRED_PREFIXES = (
+    "/gradio_api/upload",
+    "/gradio_api/call/",
+    "/gradio_api/run/",
+    "/gradio_api/api/",
+    "/upload",
+    "/call/",
+    "/run/",
+    "/api/",
+)
+
+
+def create_app():
+    """Builds the FastAPI app hosting the Gradio UI with OAuth enforcement."""
     import secrets
+
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
-    main_app = FastAPI()
+    if is_oauth_bypassed():
+        logger.warning(
+            "BYPASS_OAUTH=true: OAuth is disabled and ALL visitors will act with "
+            "the server's Application Default Credentials. Only use this for "
+            "local development or behind an authenticating proxy (e.g. IAP)."
+        )
+        require_oauth_globally(False)
+    else:
+        if not _oauth_client_configured():
+            raise RuntimeError(
+                "Google OAuth is not configured. Set GOOGLE_CLIENT_ID and "
+                "GOOGLE_CLIENT_SECRET, or explicitly set BYPASS_OAUTH=true to "
+                "run in Application Default Credentials (ADC) mode."
+            )
+        # Fail closed everywhere in this process: no code path may fall back
+        # to the server's ADC when a user token is missing.
+        require_oauth_globally(True)
 
-    _PROTECTED_API_PREFIXES = (
-        "/api/",
-        "/gradio_api/",
-        "/call/",
-        "/run/",
-        "/queue/",
-        "/upload",
-    )
+    main_app = FastAPI()
 
     @main_app.middleware("http")
     async def enforce_oauth_middleware(request: fastapi.Request, call_next):
-        path = request.url.path
-        if os.environ.get("BYPASS_OAUTH", "").lower() != "true" and any(
-            path.startswith(prefix) for prefix in _PROTECTED_API_PREFIXES
+        session = request.scope.get("session") or {}
+        token_dict = (
+            session.get("google_token") if isinstance(session, dict) else None
+        )
+        if not (isinstance(token_dict, dict) and token_dict.get("access_token")):
+            token_dict = None
+        # Expose the signed-session token to Gradio handlers. Queued events
+        # lose request.session but keep request.state (see _session_token).
+        # Always assigned, so it can only ever come from the signed cookie.
+        request.state.google_token = token_dict
+
+        if (
+            not is_oauth_bypassed()
+            and request.url.path.startswith(_SESSION_REQUIRED_PREFIXES)
+            and token_dict is None
         ):
-            session = request.scope.get("session") or {}
-            token_dict = (
-                session.get("google_token")
-                if isinstance(session, dict)
-                else None
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "Authentication required: valid Google OAuth session missing."
+                },
             )
-            if not isinstance(token_dict, dict) or not token_dict.get(
-                "access_token"
-            ):
-                return JSONResponse(
-                    status_code=401,
-                    content={
-                        "detail": "Authentication required: valid Google OAuth session missing."
-                    },
-                )
         return await call_next(request)
 
-    session_secret = os.environ.get(
-        "SESSION_SECRET_KEY"
-    ) or secrets.token_urlsafe(32)
+    session_secret = os.environ.get("SESSION_SECRET_KEY")
+    if not session_secret:
+        logger.warning(
+            "SESSION_SECRET_KEY is not set; generating an ephemeral key. Sessions "
+            "will not survive restarts or be shared across instances."
+        )
+        session_secret = secrets.token_urlsafe(32)
+    # Added after the auth middleware so it wraps it (outermost) and the
+    # session is populated before enforce_oauth_middleware runs.
     main_app.add_middleware(
         SessionMiddleware,
         secret_key=session_secret,
@@ -2098,10 +2181,13 @@ if __name__ == "__main__":
         request.session.pop("google_token", None)
         return RedirectResponse(url="/")
 
-    app = gr.mount_gradio_app(main_app, demo, path="/")
+    return gr.mount_gradio_app(main_app, demo, path="/")
 
+
+if __name__ == "__main__":
     import uvicorn
 
+    app = create_app()
     host = os.environ.get("HOST", "0.0.0.0")
     port = int(os.environ.get("PORT", 7860))
     uvicorn.run(app, host=host, port=port)
