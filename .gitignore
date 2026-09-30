@@ -355,6 +355,12 @@ MigrationBackup/
 # ADK
 session.db
 .venv/
+.pytest_cache/
+
+# Dataplex migration runtime files
+dataplex-quickstart-labs/**/processed/*.json
+dataplex-quickstart-labs/**/archive/*.json
+dataplex-quickstart-labs/**/logs/*.txt
 
 #governance-agent
 __pycache__/

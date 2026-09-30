@@ -2,10 +2,10 @@
 Unit tests for entrylinks-export.py
 
 Test coverage:
-- Deduplication logic (_build_deduplication_key, deduplicate_entry_links)
+- Deduplication logic (_build_deduplication_key, deduplicate_entry_links, deduplicate_raw_entry_links)
 - Region resolution and fetching (_resolve_regions_for_term, _fetch_links_from_regions_parallel)
 - Entry link fetching (fetch_entry_links_for_region, fetch_entry_links_for_term, fetch_all_entry_links)
-- Export workflow (export_entry_links, _write_entry_links_to_sheet)
+- Export workflow (export_entry_links, convert_entry_links_to_rows, _write_entry_links_to_sheet)
 - Error handling (network error detection via retry_utils, _handle_export_exception)
 - Main flow (_run_export, main)
 """
@@ -30,52 +30,56 @@ spec.loader.exec_module(entrylinks_export)
 # DEDUPLICATION TESTS
 # ============================================================================
 
+TERM_A = ['proj.global.Sales.Term A', 'term-a']
+TERM_B = ['proj.global.Sales.Term B', 'term-b']
+TABLE = ['bigquery:proj.ds.tbl', 'proj.ds.tbl']
+
+
+def _row(link_type, source, target, column=''):
+    """Build a row [type, source_name, source_id, column, target_name, target_id]."""
+    return [link_type, source[0], source[1], column, target[0], target[1]]
+
+
 class TestBuildDeduplicationKey:
     """Test _build_deduplication_key helper function"""
     
-    def test_symmetric_link_type_sorts_entries(self):
-        """All link types should create sorted key to detect A-B == B-A"""
-        row = ['related', 'entryB', 'entryA', '']
-        key = entrylinks_export._build_deduplication_key(row)
-        
-        # Should be sorted: ('related', ('entryA', 'entryB'), '')
-        assert key[0] == 'related'
-        assert key[1] == tuple(sorted(['entryA', 'entryB']))
-    
-    def test_synonym_link_type_is_symmetric(self):
-        """Synonym links should also be deduplicated symmetrically"""
-        row1 = ['synonym', 'termA', 'termB', '']
-        row2 = ['synonym', 'termB', 'termA', '']
-        
-        key1 = entrylinks_export._build_deduplication_key(row1)
-        key2 = entrylinks_export._build_deduplication_key(row2)
+    @pytest.mark.parametrize('link_type', ['synonym', 'related'])
+    def test_symmetric_link_types_ignore_direction(self, link_type):
+        """Synonym and related links have no direction: A-B == B-A"""
+        key1 = entrylinks_export._build_deduplication_key(_row(link_type, TERM_A, TERM_B))
+        key2 = entrylinks_export._build_deduplication_key(_row(link_type, TERM_B, TERM_A))
         
         assert key1 == key2
     
-    def test_definition_link_type_also_sorts(self):
-        """Definition links also sort source/target for deduplication"""
-        row1 = ['definition', 'source', 'target', '/path']
-        row2 = ['definition', 'target', 'source', '/path']
+    def test_definition_link_type_is_directional(self):
+        """Definition links are directional (source asset -> target term)"""
+        key1 = entrylinks_export._build_deduplication_key(_row('definition', TABLE, TERM_A, 'col1'))
+        key2 = entrylinks_export._build_deduplication_key(_row('definition', TERM_A, TABLE, 'col1'))
         
-        key1 = entrylinks_export._build_deduplication_key(row1)
-        key2 = entrylinks_export._build_deduplication_key(row2)
-        
-        assert key1 == key2
+        assert key1 != key2
     
-    def test_includes_source_path(self):
-        """Keys should include source_path"""
-        row = ['definition', 'source', 'target', '/schema/table']
-        key = entrylinks_export._build_deduplication_key(row)
+    def test_includes_column(self):
+        """Links to different columns are different"""
+        key1 = entrylinks_export._build_deduplication_key(_row('definition', TABLE, TERM_A, 'col1'))
+        key2 = entrylinks_export._build_deduplication_key(_row('definition', TABLE, TERM_A, 'col2'))
         
-        assert '/schema/table' in key
-    
-    def test_missing_source_path_uses_empty_string(self):
-        """Rows with only 3 elements should use empty string for path"""
-        row = ['related', 'entryA', 'entryB']  # No path element
-        key = entrylinks_export._build_deduplication_key(row)
-        
-        # Should not raise an error
-        assert key is not None
+        assert key1 != key2
+
+    def test_terms_with_same_display_name_are_distinct(self):
+        """Rows that differ only by term ID (same display name) are different links"""
+        same_name_other_term = [TERM_A[0], 'term-a-2']
+        key1 = entrylinks_export._build_deduplication_key(_row('definition', TABLE, TERM_A))
+        key2 = entrylinks_export._build_deduplication_key(_row('definition', TABLE, same_name_other_term))
+
+        assert key1 != key2
+
+    def test_terms_with_same_id_in_other_glossaries_are_distinct(self):
+        """Rows that differ only by name (same term ID in another glossary) are different links"""
+        same_id_other_glossary = ['proj.global.Finance.Term A', TERM_A[1]]
+        key1 = entrylinks_export._build_deduplication_key(_row('synonym', TERM_A, TERM_B))
+        key2 = entrylinks_export._build_deduplication_key(_row('synonym', same_id_other_glossary, TERM_B))
+
+        assert key1 != key2
 
 
 class TestDeduplicateEntryLinks:
@@ -84,8 +88,8 @@ class TestDeduplicateEntryLinks:
     def test_removes_duplicate_symmetric_links(self):
         """Should remove A-B if B-A already exists for symmetric types"""
         links = [
-            ['related', 'term1', 'term2', ''],
-            ['related', 'term2', 'term1', ''],  # Duplicate
+            _row('related', TERM_A, TERM_B),
+            _row('related', TERM_B, TERM_A),  # Duplicate
         ]
         
         result = entrylinks_export.deduplicate_entry_links(links)
@@ -95,19 +99,19 @@ class TestDeduplicateEntryLinks:
     def test_keeps_different_link_types(self):
         """Different link types between same entries should be kept"""
         links = [
-            ['related', 'term1', 'term2', ''],
-            ['synonym', 'term1', 'term2', ''],
+            _row('related', TERM_A, TERM_B),
+            _row('synonym', TERM_A, TERM_B),
         ]
         
         result = entrylinks_export.deduplicate_entry_links(links)
         
         assert len(result) == 2
     
-    def test_keeps_directional_links_both_directions(self):
-        """Definition links in both directions should be kept"""
+    def test_keeps_definition_links_from_different_sources(self):
+        """Definition links from different data assets to the same term should be kept"""
         links = [
-            ['definition', 'term1', 'table1', '/path1'],
-            ['definition', 'table1', 'term1', '/path2'],
+            _row('definition', TABLE, TERM_A, 'col1'),
+            _row('definition', ['bigquery:proj.ds.other', 'proj.ds.other'], TERM_A, 'col1'),
         ]
         
         result = entrylinks_export.deduplicate_entry_links(links)
@@ -122,13 +126,79 @@ class TestDeduplicateEntryLinks:
     def test_preserves_order_of_first_occurrence(self):
         """First occurrence of link should be kept"""
         links = [
-            ['related', 'A', 'B', ''],
-            ['related', 'B', 'A', ''],  # Duplicate - should be removed
+            _row('related', TERM_A, TERM_B),
+            _row('related', TERM_B, TERM_A),  # Duplicate - should be removed
         ]
         
         result = entrylinks_export.deduplicate_entry_links(links)
         
-        assert result[0] == ['related', 'A', 'B', '']
+        assert result == [_row('related', TERM_A, TERM_B)]
+
+
+DEFINITION_TYPE = 'projects/dataplex-types/locations/global/entryLinkTypes/definition'
+SYNONYM_TYPE = 'projects/dataplex-types/locations/global/entryLinkTypes/synonym'
+TERM_A_ENTRY = 'projects/123/locations/global/entryGroups/@dataplex/entries/projects/123/locations/global/glossaries/g/terms/term-a'
+TERM_B_ENTRY = 'projects/123/locations/global/entryGroups/@dataplex/entries/projects/123/locations/global/glossaries/g/terms/term-b'
+TABLE_ENTRY = 'projects/123/locations/us/entryGroups/@bigquery/entries/bigquery.googleapis.com/projects/proj/datasets/ds/tables/tbl'
+
+
+def _synonym_link(name, first, second, link_type=SYNONYM_TYPE):
+    return {'name': name, 'entryLinkType': link_type, 'entryReferences': [{'name': first}, {'name': second}]}
+
+
+def _definition_link(name, source, target, path=''):
+    return {
+        'name': name,
+        'entryLinkType': DEFINITION_TYPE,
+        'entryReferences': [
+            {'name': source, 'path': path, 'type': 'SOURCE'},
+            {'name': target, 'type': 'TARGET'},
+        ],
+    }
+
+
+class TestDeduplicateRawEntryLinks:
+    """Test deduplicate_raw_entry_links function"""
+
+    def test_link_returned_for_each_term_is_kept_once(self):
+        """lookupEntryLinks returns a synonym link for both of its terms"""
+        link = _synonym_link('links/1', TERM_A_ENTRY, TERM_B_ENTRY)
+
+        assert entrylinks_export.deduplicate_raw_entry_links([link, dict(link)]) == [link]
+
+    def test_symmetric_references_in_either_order_are_duplicates(self):
+        """Two synonym links between the same terms are the same link"""
+        links = [
+            _synonym_link('links/1', TERM_A_ENTRY, TERM_B_ENTRY),
+            _synonym_link('links/2', TERM_B_ENTRY, TERM_A_ENTRY),
+        ]
+
+        assert entrylinks_export.deduplicate_raw_entry_links(links) == links[:1]
+
+    def test_link_type_project_format_is_ignored(self):
+        """The link type may be named with the project number or the project ID"""
+        links = [
+            _synonym_link('links/1', TERM_A_ENTRY, TERM_B_ENTRY),
+            _synonym_link(
+                'links/1', TERM_A_ENTRY, TERM_B_ENTRY,
+                link_type='projects/655216118709/locations/global/entryLinkTypes/synonym'
+            ),
+        ]
+
+        assert len(entrylinks_export.deduplicate_raw_entry_links(links)) == 1
+
+    def test_distinct_links_are_kept(self):
+        """Links to different columns, of different types or in the other direction are kept"""
+        links = [
+            _definition_link('links/1', TABLE_ENTRY, TERM_A_ENTRY, 'Schema.col1'),
+            _definition_link('links/2', TABLE_ENTRY, TERM_A_ENTRY, 'Schema.col2'),
+            _definition_link('links/3', TABLE_ENTRY, TERM_A_ENTRY),
+            _definition_link('links/4', TERM_A_ENTRY, TABLE_ENTRY),
+            _synonym_link('links/5', TABLE_ENTRY, TERM_A_ENTRY),
+        ]
+
+        assert entrylinks_export.deduplicate_raw_entry_links(links) == links
+
 
 
 # ============================================================================
@@ -236,38 +306,59 @@ class TestFetchEntryLinksForRegion:
         assert result == []
 
 
+TERM_NAME = 'projects/my-proj/locations/us/glossaries/g/terms/t1'
+
+
 class TestFetchEntryLinksForTerm:
     """Test fetch_entry_links_for_term function"""
     
     def test_no_regions_returns_empty(self, monkeypatch):
-        """When no regions provided, return empty list"""
-        mock_generate = MagicMock(return_value='entry123')
+        """When no regions provided, return empty list without any API calls"""
+        mock_get_number = MagicMock(return_value='123')
+        mock_fetch_region = MagicMock()
         
-        monkeypatch.setattr(entrylinks_export.business_glossary_utils,
-                          'generate_entry_name_from_term_name', mock_generate)
+        monkeypatch.setattr(entrylinks_export.api_layer, 'get_project_number', mock_get_number)
+        monkeypatch.setattr(entrylinks_export, 'fetch_entry_links_for_region', mock_fetch_region)
         
         result = entrylinks_export.fetch_entry_links_for_term(
-            {'name': 'term1'}, [], 'test-project'
+            {'name': TERM_NAME}, [], 'test-project'
         )
         
         assert result == []
+        mock_get_number.assert_not_called()
+        mock_fetch_region.assert_not_called()
     
     def test_aggregates_links_from_all_regions(self, monkeypatch):
-        """Should aggregate links from all queried regions"""
-        mock_generate = MagicMock(return_value='entry123')
-        mock_fetch_region = MagicMock(return_value=[{'entryLinkType': 'test'}])
-        mock_to_rows = MagicMock(return_value=[['row1'], ['row2']])
+        """Should return the raw links of all queried regions for the term's entry"""
+        links_by_region = {'us': [{'name': 'links/us'}], 'eu': [{'name': 'links/eu'}]}
+        mock_fetch_region = MagicMock(side_effect=lambda entry, region, project: links_by_region[region])
         
-        monkeypatch.setattr(entrylinks_export.business_glossary_utils,
-                          'generate_entry_name_from_term_name', mock_generate)
+        monkeypatch.setattr(entrylinks_export.api_layer, 'get_project_number', MagicMock(return_value='123'))
         monkeypatch.setattr(entrylinks_export, 'fetch_entry_links_for_region', mock_fetch_region)
-        monkeypatch.setattr(entrylinks_export.sheet_utils, 'entry_links_to_rows', mock_to_rows)
         
         result = entrylinks_export.fetch_entry_links_for_term(
-            {'name': 'term1'}, ['us', 'eu'], 'test-project'
+            {'name': TERM_NAME}, ['us', 'eu'], 'test-project'
         )
         
-        assert mock_to_rows.called
+        assert sorted(link['name'] for link in result) == ['links/eu', 'links/us']
+        term_entry = 'projects/123/locations/us/entryGroups/@dataplex/entries/projects/123/locations/us/glossaries/g/terms/t1'
+        mock_fetch_region.assert_has_calls(
+            [call(term_entry, 'us', 'test-project'), call(term_entry, 'eu', 'test-project')], any_order=True
+        )
+
+    def test_uses_project_id_when_project_number_unavailable(self, monkeypatch):
+        """If the project number can't be resolved, the term's entry name uses the project ID"""
+        mock_fetch_region = MagicMock(return_value=[])
+
+        monkeypatch.setattr(entrylinks_export.api_layer, 'get_project_number', MagicMock(side_effect=Exception("403")))
+        monkeypatch.setattr(entrylinks_export, 'fetch_entry_links_for_region', mock_fetch_region)
+
+        entrylinks_export.fetch_entry_links_for_term({'name': TERM_NAME}, ['us'], 'test-project')
+
+        mock_fetch_region.assert_called_once_with(
+            'projects/my-proj/locations/us/entryGroups/@dataplex/entries/projects/my-proj/locations/us/glossaries/g/terms/t1',
+            'us', 'test-project'
+        )
 
 
 class TestFetchAllEntryLinks:
@@ -276,7 +367,7 @@ class TestFetchAllEntryLinks:
     def test_fetches_links_for_all_terms(self, monkeypatch):
         """Should fetch links for each term"""
         terms = [{'name': 'term1'}, {'name': 'term2'}]
-        mock_fetch = MagicMock(return_value=[['link1']])
+        mock_fetch = MagicMock(return_value=[{'name': 'link1'}])
         
         monkeypatch.setattr(entrylinks_export, 'fetch_entry_links_for_term', mock_fetch)
         
@@ -287,13 +378,60 @@ class TestFetchAllEntryLinks:
     def test_continues_on_single_term_failure(self, monkeypatch):
         """Failure for one term propagates since fetch_all_entry_links doesn't catch per-term exceptions"""
         terms = [{'name': 'term1'}, {'name': 'term2'}]
-        mock_fetch = MagicMock(side_effect=[Exception("Error"), [['link2']]])
+        mock_fetch = MagicMock(side_effect=[Exception("Error"), [{'name': 'link2'}]])
         
         monkeypatch.setattr(entrylinks_export, 'fetch_entry_links_for_term', mock_fetch)
         
         # Exception from first term propagates through the ThreadPoolExecutor
         with pytest.raises(Exception, match="Error"):
             entrylinks_export.fetch_all_entry_links(terms, ['us'], 'test-project')
+
+
+class TestConvertEntryLinksToRows:
+    """Test convert_entry_links_to_rows function"""
+
+    @pytest.fixture
+    def converted_links(self, monkeypatch):
+        """Mock entry_link_to_row and record the (link name, user project) of every conversion.
+
+        The link 'links/invalid' can't be represented as a row.
+        """
+        converted = []
+
+        def mock_entry_link_to_row(entry_link, dataplex_service, user_project):
+            converted.append((entry_link['name'], user_project))
+            if entry_link['name'] == 'links/invalid':
+                return None
+            return ['synonym', entry_link['name'], 'source-id', '', 'target', 'target-id']
+
+        monkeypatch.setattr(entrylinks_export.sheet_utils, 'entry_link_to_row', mock_entry_link_to_row)
+        monkeypatch.setattr(entrylinks_export.api_layer, 'get_dataplex_service', MagicMock())
+        return converted
+
+    def test_converts_each_unique_visible_link_once(self, monkeypatch, converted_links):
+        """Duplicate and redacted links are skipped, links without a row are dropped, order is kept"""
+        info_messages = []
+        monkeypatch.setattr(entrylinks_export.logger, 'info', info_messages.append)
+        links = [
+            _synonym_link('links/1', TERM_A_ENTRY, TERM_B_ENTRY),
+            _synonym_link('links/1', TERM_A_ENTRY, TERM_B_ENTRY),  # Returned for both of its terms
+            _synonym_link('links/redacted', TERM_A_ENTRY, 'projects/*/locations/*/entryGroups/*/entries/*'),
+            _definition_link('links/invalid', TABLE_ENTRY, TERM_A_ENTRY, 'Schema.col1'),
+            _definition_link('links/2', TABLE_ENTRY, TERM_B_ENTRY),
+        ]
+
+        rows = entrylinks_export.convert_entry_links_to_rows(links, 'test-project')
+
+        assert [row[1] for row in rows] == ['links/1', 'links/2']
+        assert sorted(converted_links) == [
+            ('links/1', 'test-project'), ('links/2', 'test-project'), ('links/invalid', 'test-project')
+        ]
+        assert info_messages == ['Skipped 1 redacted entrylink(s) during export']
+
+    def test_empty_input_returns_empty(self, converted_links):
+        """No links means no rows and no conversions"""
+        assert entrylinks_export.convert_entry_links_to_rows([], 'test-project') == []
+        assert converted_links == []
 
 
 # ============================================================================
@@ -305,7 +443,7 @@ class TestWriteEntryLinksToSheet:
     
     def test_writes_with_headers(self, monkeypatch):
         """Should include headers row when writing"""
-        entry_links = [['definition', 'src', 'tgt', '/path']]
+        entry_links = [_row('definition', TABLE, TERM_A, 'col1')]
         mock_get_id = MagicMock(return_value='sheet123')
         mock_write = MagicMock(return_value='Sheet1')
         
@@ -347,7 +485,7 @@ class TestExportEntryLinks:
         assert result is False
     
     def test_returns_false_when_no_links(self, monkeypatch):
-        """Returns False when terms have no entry links"""
+        """Returns False (and clears the sheet) when terms have no entry links"""
         mock_auth_dataplex = MagicMock()
         mock_auth_sheets = MagicMock()
         mock_init_cache = MagicMock()
@@ -369,16 +507,48 @@ class TestExportEntryLinks:
         )
         
         assert result is False
-    
-    def test_returns_true_on_success(self, monkeypatch):
-        """Returns True when export succeeds"""
+        mock_clear.assert_called_once()
+
+    def test_returns_false_when_no_link_can_be_exported(self, monkeypatch):
+        """Returns False (and clears the sheet) when all fetched links are skipped"""
         mock_auth_dataplex = MagicMock()
         mock_auth_sheets = MagicMock()
         mock_init_cache = MagicMock()
         mock_list_terms = MagicMock(return_value=[{'name': 'term1'}])
         mock_resolve = MagicMock(return_value=['us'])
-        mock_fetch_all = MagicMock(return_value=[['link1']])
-        mock_dedup = MagicMock(return_value=[['link1']])
+        mock_fetch_all = MagicMock(return_value=[{'name': 'links/redacted'}])
+        mock_convert = MagicMock(return_value=[])
+        mock_clear = MagicMock()
+        mock_write = MagicMock()
+
+        monkeypatch.setattr(entrylinks_export.api_layer, 'authenticate_dataplex', mock_auth_dataplex)
+        monkeypatch.setattr(entrylinks_export.sheet_utils, 'authenticate_sheets', mock_auth_sheets)
+        monkeypatch.setattr(entrylinks_export.api_layer, 'initialize_locations_cache', mock_init_cache)
+        monkeypatch.setattr(entrylinks_export.api_layer, 'list_glossary_terms', mock_list_terms)
+        monkeypatch.setattr(entrylinks_export, '_resolve_regions_for_glossary', mock_resolve)
+        monkeypatch.setattr(entrylinks_export, 'fetch_all_entry_links', mock_fetch_all)
+        monkeypatch.setattr(entrylinks_export, 'convert_entry_links_to_rows', mock_convert)
+        monkeypatch.setattr(entrylinks_export, '_clear_sheet_with_headers', mock_clear)
+        monkeypatch.setattr(entrylinks_export, '_write_entry_links_to_sheet', mock_write)
+
+        result = entrylinks_export.export_entry_links(
+            'glossary/path', 'http://sheet', 'project'
+        )
+
+        assert result is False
+        mock_clear.assert_called_once()
+        mock_write.assert_not_called()
+    
+    def test_returns_true_on_success(self, monkeypatch):
+        """Returns True when export succeeds, writing the converted rows without duplicates"""
+        rows = [_row('synonym', TERM_A, TERM_B), _row('synonym', TERM_B, TERM_A)]
+        mock_auth_dataplex = MagicMock()
+        mock_auth_sheets = MagicMock()
+        mock_init_cache = MagicMock()
+        mock_list_terms = MagicMock(return_value=[{'name': 'term1'}])
+        mock_resolve = MagicMock(return_value=['us'])
+        mock_fetch_all = MagicMock(return_value=[{'name': 'links/1'}])
+        mock_convert = MagicMock(return_value=rows)
         mock_write = MagicMock(return_value='Sheet1')
         
         monkeypatch.setattr(entrylinks_export.api_layer, 'authenticate_dataplex', mock_auth_dataplex)
@@ -387,7 +557,7 @@ class TestExportEntryLinks:
         monkeypatch.setattr(entrylinks_export.api_layer, 'list_glossary_terms', mock_list_terms)
         monkeypatch.setattr(entrylinks_export, '_resolve_regions_for_glossary', mock_resolve)
         monkeypatch.setattr(entrylinks_export, 'fetch_all_entry_links', mock_fetch_all)
-        monkeypatch.setattr(entrylinks_export, 'deduplicate_entry_links', mock_dedup)
+        monkeypatch.setattr(entrylinks_export, 'convert_entry_links_to_rows', mock_convert)
         monkeypatch.setattr(entrylinks_export, '_write_entry_links_to_sheet', mock_write)
         
         result = entrylinks_export.export_entry_links(
@@ -395,6 +565,75 @@ class TestExportEntryLinks:
         )
         
         assert result is True
+        mock_convert.assert_called_once_with([{'name': 'links/1'}], 'project')
+        assert mock_write.call_args[0][0] == rows[:1]
+
+    def test_caches_the_listed_terms(self, monkeypatch):
+        """The listed terms are cached before their entry links are fetched"""
+        terms = [{'name': 'term1'}]
+        mock_cache = MagicMock()
+
+        monkeypatch.setattr(entrylinks_export.api_layer, 'authenticate_dataplex', MagicMock())
+        monkeypatch.setattr(entrylinks_export.sheet_utils, 'authenticate_sheets', MagicMock())
+        monkeypatch.setattr(entrylinks_export.api_layer, 'initialize_locations_cache', MagicMock())
+        monkeypatch.setattr(entrylinks_export.api_layer, 'list_glossary_terms', MagicMock(return_value=terms))
+        monkeypatch.setattr(entrylinks_export, '_cache_listed_terms', mock_cache)
+        monkeypatch.setattr(entrylinks_export, '_resolve_regions_for_glossary', MagicMock(return_value=[]))
+        monkeypatch.setattr(entrylinks_export, '_clear_sheet_with_headers', MagicMock())
+
+        entrylinks_export.export_entry_links('glossary/path', 'http://sheet', 'project')
+
+        mock_cache.assert_called_once_with('glossary/path', terms, 'project')
+
+
+class TestCacheListedTerms:
+    """Test _cache_listed_terms: the display names of the listed terms need no API calls."""
+
+    GLOSSARY = 'projects/my-proj/locations/global/glossaries/g1'
+    TERM = {'name': GLOSSARY + '/terms/t1', 'displayName': 'Revenue'}
+    # Entry links name the term's project by number.
+    TERM_ENTRY = (
+        'projects/123/locations/global/entryGroups/@dataplex/entries/'
+        'projects/123/locations/global/glossaries/g1/terms/t1'
+    )
+
+    def setup_method(self):
+        entrylinks_export.api_layer.clear_caches()
+
+    def test_resolving_a_linked_term_needs_no_term_or_project_calls(self, monkeypatch):
+        api_layer = entrylinks_export.api_layer
+        project_info = Mock(return_value={'name': 'projects/123', 'projectId': 'my-proj'})
+        monkeypatch.setattr(api_layer, '_fetch_project_info', project_info)
+        service = MagicMock()
+        service.projects().locations().glossaries().get().execute.return_value = {'displayName': 'Sales'}
+        terms_get = service.projects().locations().glossaries().terms().get
+
+        entrylinks_export._cache_listed_terms(self.GLOSSARY, [self.TERM], 'billing-proj')
+        identifier = api_layer.resolve_term_entry_to_display_identifier(service, self.TERM_ENTRY, 'billing-proj')
+
+        assert identifier == 'my-proj.global.Sales.Revenue'
+        terms_get.assert_not_called()
+        project_info.assert_called_once_with('my-proj', 'billing-proj')
+
+    def test_caches_terms_by_project_id_when_project_number_cannot_be_read(self, monkeypatch):
+        api_layer = entrylinks_export.api_layer
+        monkeypatch.setattr(
+            api_layer, '_fetch_project_info', Mock(side_effect=entrylinks_export.error.DataplexAPIError('denied'))
+        )
+        service = MagicMock()
+
+        entrylinks_export._cache_listed_terms(self.GLOSSARY, [self.TERM], 'billing-proj')
+
+        assert api_layer.get_term(service, self.TERM['name'])['displayName'] == 'Revenue'
+        service.projects().locations().glossaries().terms().get.assert_not_called()
+
+    def test_ignores_glossary_names_without_a_project(self, monkeypatch):
+        mock_cache = MagicMock()
+        monkeypatch.setattr(entrylinks_export.api_layer, 'cache_glossary_terms', mock_cache)
+
+        entrylinks_export._cache_listed_terms('glossary/path', [self.TERM], 'billing-proj')
+
+        mock_cache.assert_not_called()
 
 
 # ============================================================================

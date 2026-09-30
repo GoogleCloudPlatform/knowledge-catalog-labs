@@ -49,11 +49,9 @@ Share the Google Sheet with the service account (`SA_EMAIL`) as a **Viewer** so 
 
 *   **Glossary Import**: The sheet should contain the following header row:
     `id, parent, display_name, description, overview, type, contact1_email, contact1_name, contact2_email, contact2_name, label1_key, label1_value, label2_key, label2_value`
-*   **EntryLinks Import**: The sheet should contain the following columns in the header row:
-    *   `entry_link_type` - Type of link: `definition`, `related`, or `synonym`
-    *   `source_entry` - Full entry name of the source (e.g., `projects/PROJECT/locations/LOCATION/entryGroups/ENTRY_GROUP/entries/ENTRY_ID`)
-    *   `target_entry` - Full entry name of the target
-    *   `source_path` - (Optional) Column/field path for definition links (e.g., `Schema.column_name`)
+*   **EntryLinks Import**: The sheet should contain the following header row (the format written by the EntryLinks export):
+    `Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
+    See [Sheets file schema (EntryLinks)](#sheets-file-schema-entrylinks) for what each column contains.
 
 ### Authentication
 
@@ -144,13 +142,28 @@ python3 entrylinks-import.py \
 
 ### Sheets file schema (EntryLinks)
 
-The first row of the sheet should contain the following header:
+The first row of the sheet should contain the following headers (the format written by the EntryLinks export):
 
-`entry_link_type, source_entry, target_entry, source_path`
+`Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
 
 Where:
 
-*   `entry_link_type` (required): Type of EntryLink. Valid values: `definition`, `synonym`, `related`.
-*   `source_entry` (required): Full Dataplex entry resource path for the source (e.g. `projects/my-project/locations/us/entryGroups/@bigquery/entries/my-entry`).
-*   `target_entry` (required): Full Dataplex entry resource path for the target.
-*   `source_path` (optional): Path within the source entry (e.g. a BigQuery column path like `Schema.Field1`). Used for definition entrylinks.
+*   `Entry link type` (required): Type of EntryLink: `definition`, `synonym` or `related`.
+*   `Source Name`, `Source ID`: The source of the link.
+    *   For `definition` links, a data asset: `Source Name` (required) is its Fully Qualified Name (FQN), e.g. `bigquery:my-project.sales.orders`. `Source ID` is for information only and is not used by the import.
+    *   For `synonym` and `related` links, a glossary term (see below).
+*   `Column` (optional): For `definition` links, the column to link the term to (e.g. `order_id` or `Schema.order_id`). Leave empty to link the whole data asset. Not used for `synonym` and `related` links.
+*   `Target Name`, `Target ID`: The target glossary term (see below).
+
+A glossary term needs both cells:
+
+*   Name (required): `<project>.<location>.<glossary>.<termDisplayName>`, where `<project>` is the project ID and `<glossary>` is the display name or ID of the glossary. It identifies the glossary. The term display name only makes the sheet readable: if it doesn't match the term found by ID, the import logs a warning and uses the term ID.
+*   ID (required): The term ID (the `id` column of the glossary export). It identifies the term in the glossary.
+
+Instead, the Name or ID cell of a term or data asset can hold a full Dataplex resource name (starting with `projects/`), which is used as is: an entry name, or for a term, its resource name `projects/<project>/locations/<location>/glossaries/<glossary>/terms/<term>`. Use this when the project ID contains a dot (domain-scoped projects such as `example.com:my-project`), as the dot-separated Name can't express it. Sheets written by earlier versions of the export (headers `entry_link_type, source_entry, target_entry, source_path`, with full entry names) can still be imported.
+
+Data assets are found with Dataplex Catalog search, which may take a few minutes to include newly created assets (BigQuery tables that search doesn't return yet are read directly). If an asset isn't found, check its FQN or give its full entry name instead.
+
+Before importing, the script lists the rows that can't be imported (with the reason) and the referenced entries that don't exist in Dataplex, and asks whether to continue without them.
+
+Looking up the terms and data assets of the rows is retried for up to 10 minutes when it fails with network or server errors (HTTP 429 or 5xx). If it still fails, the script stops before importing anything, instead of listing every remaining row as one that can't be imported; run it again once the connection or service is back.
