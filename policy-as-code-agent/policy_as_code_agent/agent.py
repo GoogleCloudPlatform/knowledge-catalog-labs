@@ -48,7 +48,7 @@ try:
 except Exception as e:
     logging.error(f"Failed to initialize Vertex AI globally: {e}")
 
-from .simulation import run_simulation
+from .simulation import run_simulation, validate_code_safety
 
 # Get the absolute path of the directory where the script is located
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +84,12 @@ def generate_policy_code_from_gcs(query: str, gcs_uri: str) -> dict:
     ):
         logging.error(f"Error generating policy code: {policy_code}")
         return {"status": "error", "error_message": policy_code}
+
+    security_errors = validate_code_safety(policy_code)
+    if security_errors:
+        error_msg = "; ".join(security_errors)
+        logging.error(f"Generated policy code failed safety check: {error_msg}")
+        return {"status": "error", "error_message": error_msg}
 
     return {"status": "success", "policy_code": policy_code}
 
@@ -413,6 +419,14 @@ def generate_policy_code_from_dataplex(
 
             if policy_code.startswith("# Error:"):
                 return {"status": "error", "error_message": policy_code}
+
+            security_errors = validate_code_safety(policy_code)
+            if security_errors:
+                error_msg = "; ".join(security_errors)
+                logging.error(
+                    f"Generated policy code failed safety check: {error_msg}"
+                )
+                return {"status": "error", "error_message": error_msg}
 
             return {"status": "success", "policy_code": policy_code}
 
