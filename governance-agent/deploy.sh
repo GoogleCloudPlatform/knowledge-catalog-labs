@@ -58,6 +58,15 @@ if [ -f .env ]; then
   fi
 fi
 
+# The app refuses to start without an explicit auth mode (no silent ADC fallback).
+if ! { [[ ",${ENV_VARS}," =~ ,GOOGLE_CLIENT_ID=[^,]+, ]] && [[ ",${ENV_VARS}," =~ ,GOOGLE_CLIENT_SECRET=[^,]+, ]]; } \
+   && [[ ! ",${ENV_VARS}," =~ ,BYPASS_OAUTH=true, ]]; then
+  echo "❌ Error: no authentication mode configured in .env."
+  echo "   Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET (plus SESSION_SECRET_KEY) for Google OAuth,"
+  echo "   or BYPASS_OAUTH=true for Service Account (ADC) mode behind IAP. See DEPLOYMENT_GUIDE.md."
+  exit 1
+fi
+
 # 4. Deploy to Cloud Run
 echo "☸️ Deploying to Cloud Run..."
 gcloud run deploy "${SERVICE_NAME}" \

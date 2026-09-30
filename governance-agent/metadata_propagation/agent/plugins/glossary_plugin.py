@@ -17,7 +17,12 @@ from metadata_propagation.dataplex_integration.lineage_propagation import (
     LineageGraphTraverser,
 )
 
-from .context import get_credentials, get_oauth_token, set_oauth_token
+from .context import (
+    get_credentials,
+    get_oauth_token,
+    is_oauth_enabled,
+    set_oauth_token,
+)
 from .doc_description_plugin import DocDescriptionPlugin
 from .similarity_engine import SimilarityEngine
 
@@ -556,10 +561,12 @@ class GlossaryPlugin(BasePlugin):
         recommendations = []
         from concurrent.futures import ThreadPoolExecutor
 
+        oauth_active = is_oauth_enabled()
         main_token = get_oauth_token()
 
         def process_column(args):
-            set_oauth_token(main_token)
+            if oauth_active or main_token is not None:
+                set_oauth_token(main_token)
             i, col_meta = args
             col_recs = []
             col_name = col_meta["name"]

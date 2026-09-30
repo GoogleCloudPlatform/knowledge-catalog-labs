@@ -31,7 +31,15 @@ class DQPropagationEngine:
 
     def _get_sql_fetcher(self):
         if not self._sql_fetcher:
-            self._sql_fetcher = SQLFetcher(self.project_id, self.location)
+            from metadata_propagation.agent.plugins.context import (
+                get_credentials,
+            )
+
+            self._sql_fetcher = SQLFetcher(
+                self.project_id,
+                self.location,
+                credentials=get_credentials(self.project_id),
+            )
         return self._sql_fetcher
 
     def get_column_dq_lineage(

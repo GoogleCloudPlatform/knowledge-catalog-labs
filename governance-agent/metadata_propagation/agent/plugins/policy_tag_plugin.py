@@ -12,7 +12,12 @@ from metadata_propagation.dataplex_integration.lineage_propagation import (
     TransformationEnricher,
 )
 
-from .context import get_credentials, get_oauth_token, set_oauth_token
+from .context import (
+    get_credentials,
+    get_oauth_token,
+    is_oauth_enabled,
+    set_oauth_token,
+)
 from .doc_description_plugin import DocDescriptionPlugin
 
 logger = logging.getLogger(__name__)
@@ -88,10 +93,12 @@ class PolicyTagPlugin(BasePlugin):
 
         lock = threading.Lock()
 
+        oauth_active = is_oauth_enabled()
         main_token = get_oauth_token()
 
         def scan_table(table_item):
-            set_oauth_token(main_token)
+            if oauth_active or main_token is not None:
+                set_oauth_token(main_token)
             table_ref = f"{dataset_ref}.{table_item.table_id}"
             try:
                 thread_client = self._get_bq_client()
@@ -188,10 +195,12 @@ class PolicyTagPlugin(BasePlugin):
         # Parallel processing of columns using ThreadPoolExecutor
         from concurrent.futures import ThreadPoolExecutor
 
+        oauth_active = is_oauth_enabled()
         main_token = get_oauth_token()
 
         def process_field(field):
-            set_oauth_token(main_token)
+            if oauth_active or main_token is not None:
+                set_oauth_token(main_token)
             col_recs = []
             logger.info(f"Searching source for column '{field.name}'...")
             # For policy tags, we might only care about direct upstream or a few hops
