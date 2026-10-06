@@ -155,10 +155,16 @@ Where:
 *   `Column` (optional): For `definition` links, the column to link the term to (e.g. `order_id` or `Schema.order_id`). Leave empty to link the whole data asset. Not used for `synonym` and `related` links.
 *   `Target Name`, `Target ID`: The target glossary term (see below).
 
-A glossary term needs both cells:
+A glossary term is given by its Name and ID cells:
 
-*   Name (required): `<project>.<location>.<glossary>.<termDisplayName>`, where `<project>` is the project ID and `<glossary>` is the display name or ID of the glossary. It identifies the glossary. The term display name only makes the sheet readable: if it doesn't match the term found by ID, the import logs a warning and uses the term ID.
-*   ID (required): The term ID (the `id` column of the glossary export). It identifies the term in the glossary.
+*   Name (required): `<project>.<location>.<glossary>.<termDisplayName>`, where `<project>` is the project ID and `<glossary>` is the display name or ID of the glossary. It identifies the glossary and, when the ID is empty, the term.
+*   ID (optional): The term ID (the `id` column of the glossary export). The export always fills it in.
+
+How the term is found:
+
+*   ID given: the term with this ID in the glossary. If the Name also has a term display name, it must exactly match that term's display name, or the row fails (e.g. `Target Name 'Net Revenue' does not match Target ID 'gross-revenue' ('Gross Revenue'). Update or clear Target ID.`). To rename the link target, change both cells or clear the ID.
+*   ID empty: the term whose display name exactly matches the term display name in Name (case-sensitive). If several terms in the glossary have that display name, the row fails and lists their IDs; put the right one in the ID cell.
+*   Name without a term display name (`<project>.<location>.<glossary>`): the ID is required.
 
 Instead, the Name or ID cell of a term or data asset can hold a full Dataplex resource name (starting with `projects/`), which is used as is: an entry name, or for a term, its resource name `projects/<project>/locations/<location>/glossaries/<glossary>/terms/<term>`. Use this when the project ID contains a dot (domain-scoped projects such as `example.com:my-project`), as the dot-separated Name can't express it. Sheets written by earlier versions of the export (headers `entry_link_type, source_entry, target_entry, source_path`, with full entry names) can still be imported.
 

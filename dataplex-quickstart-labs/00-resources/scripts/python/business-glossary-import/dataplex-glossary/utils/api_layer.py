@@ -36,6 +36,7 @@ from .error import (
     InvalidEntryIdFormatError,
     InvalidTermIdentifierError,
     InvalidTermNameError,
+    TermNameMismatchError,
     TermNotFoundError,
     TransientAPIError,
 )
@@ -611,9 +612,9 @@ def _term_display_name(term: Dict) -> str:
 
 
 def _matches_term_display_name(term: Dict, term_parts: List[str]) -> bool:
-    """Whether any non-empty term part of a sheet name equals the term's display name (case-insensitive)."""
-    display_name = _term_display_name(term).casefold()
-    return any(part.casefold() == display_name for part in term_parts if part)
+    """Whether any non-empty term part of a sheet name is exactly the term's display name (case-sensitive)."""
+    display_name = _term_display_name(term)
+    return any(part == display_name for part in term_parts if part)
 
 
 def _glossary_match_rank(glossary: Dict, part: str) -> Optional[int]:
@@ -656,28 +657,103 @@ def _match_glossaries(glossaries: List[Dict], splits: List[tuple]) -> Dict[str, 
     return matched
 
 
+def _resolve_term_by_id(
+    dataplex_service: build, identifier: str, term_id: str, candidates: Dict[str, tuple]
+) -> tuple:
+    """Return (glossary, term) for the term with this ID in the best-matching candidate glossary.
+
+    The term display name in the Name, if given, must be exactly the term's display name.
+    """
+    resolved = []
+    for rank, glossary, term_parts in candidates.values():
+        term = _find_term_by_id(_get_glossary_terms(dataplex_service, glossary['name']), term_id)
+        if term:
+            resolved.append((rank, glossary, term, term_parts))
+
+    if not resolved:
+        checked = ", ".join(candidates)
+        noun = "glossary" if len(candidates) == 1 else "glossaries"
+        raise TermNotFoundError(f"Term ID '{term_id}' not found in {noun} {checked}")
+    best_rank = min(rank for rank, _, _, _ in resolved)
+    resolved = [(glossary, term, term_parts) for rank, glossary, term, term_parts in resolved if rank == best_rank]
+    if len(resolved) > 1:
+        by_display_name = [r for r in resolved if _matches_term_display_name(r[1], r[2])]
+        if len(by_display_name) != 1:
+            matched = ", ".join(glossary['name'] for glossary, _, _ in resolved)
+            raise AmbiguousTermError(
+                f"'{identifier}' matches more than one glossary containing term ID '{term_id}' ({matched}). "
+                f"Use the glossary ID instead of its display name, or put the full "
+                f"'projects/.../glossaries/.../terms/{term_id}' resource name in the ID column."
+            )
+        resolved = by_display_name
+
+    glossary, term, term_parts = resolved[0]
+    named = [part for part in term_parts if part]
+    if named and not _matches_term_display_name(term, named):
+        raise TermNameMismatchError(named[0], term_id, _term_display_name(term))
+    return glossary, term
+
+
+def _resolve_term_by_display_name(
+    dataplex_service: build, identifier: str, candidates: Dict[str, tuple]
+) -> tuple:
+    """Return (glossary, term) for the only term whose display name is exactly the term part of the Name."""
+    if not any(part for _, _, term_parts in candidates.values() for part in term_parts):
+        raise InvalidTermIdentifierError(
+            f"'{identifier}' has no term display name: add it to the Name or put the term ID in the ID column"
+        )
+
+    resolved = []
+    for rank, glossary, term_parts in candidates.values():
+        for term in _get_glossary_terms(dataplex_service, glossary['name']).values():
+            if _matches_term_display_name(term, term_parts):
+                resolved.append((rank, glossary, term))
+
+    if not resolved:
+        checked = ", ".join(candidates)
+        noun = "glossary" if len(candidates) == 1 else "glossaries"
+        raise TermNotFoundError(
+            f"No term with display name matching '{identifier}' in {noun} {checked} "
+            f"(display names are case-sensitive)"
+        )
+    best_rank = min(rank for rank, _, _ in resolved)
+    resolved = [(glossary, term) for rank, glossary, term in resolved if rank == best_rank]
+    if len(resolved) > 1:
+        several_glossaries = len({glossary['name'] for glossary, _ in resolved}) > 1
+        term_ids = sorted(
+            f"{glossary['name'].split('/')[-1]}/{term['name'].split('/')[-1]}" if several_glossaries
+            else term['name'].split('/')[-1]
+            for glossary, term in resolved
+        )
+        raise AmbiguousTermError(
+            f"'{identifier}' matches more than one term ({', '.join(term_ids)}). "
+            f"Put the term ID in the ID column."
+        )
+    return resolved[0]
+
+
 def lookup_term_by_display_identifier(
     dataplex_service: build, identifier: str, user_project: str = "", term_id: str = ""
 ) -> str:
     """Resolves a term reference from a sheet row to the Dataplex entry name of the term.
 
     `identifier` (the Name cell, '<project>.<location>.<glossaryDisplayName>.<termDisplayName>')
-    selects the glossary and `term_id` (the ID cell) selects the term in it. Glossary and term
-    display names may contain dots, so every split point after the location is tried. The
-    glossary part may be the glossary's display name or ID; if several named glossaries contain
-    the term ID, an exact display name beats an exact ID, which beats a case-insensitive match,
-    and then the term display name decides. The term display name is otherwise informational:
-    if it doesn't match the term found by ID, a warning is logged and the term ID is used.
+    selects the glossary. Glossary and term display names may contain dots, so every split point
+    after the location is tried. The glossary part may be the glossary's display name or ID; an
+    exact display name beats an exact ID, which beats a case-insensitive match.
+
+    If `term_id` (the ID cell) is given, it selects the term; the term display name, if present in
+    the Name, must then be exactly the display name of that term. If `term_id` is empty, the term
+    is the one whose display name is exactly (case-sensitive) the term part of the Name.
 
     Raises:
-        InvalidTermIdentifierError: If the name is malformed or the term ID is missing.
+        InvalidTermIdentifierError: If the name is malformed, or has no term display name and no term ID.
+        TermNameMismatchError: If the term display name doesn't match the term found by ID.
         GlossaryNotFoundError: If no glossary matches the name.
-        TermNotFoundError: If no matching glossary has a term with this ID.
-        AmbiguousTermError: If more than one matching glossary has a term with this ID.
+        TermNotFoundError: If no matching glossary has the term.
+        AmbiguousTermError: If the reference matches more than one term.
     """
     cleaned_term_id = (term_id or "").strip()
-    if not cleaned_term_id:
-        raise InvalidTermIdentifierError(f"A term ID is required to resolve '{identifier}'")
     parsed = business_glossary_utils.parse_term_display_identifier(identifier, allow_three_part=True)
     rest = identifier.strip().split(".", 2)[2]
     splits = [(rest[:i].strip(), rest[i + 1:].strip()) for i, char in enumerate(rest) if char == "."]
@@ -690,35 +766,10 @@ def lookup_term_by_display_identifier(
             f"No glossary in project '{parsed.project_id}' location '{parsed.location}' matches '{identifier}'"
         )
 
-    resolved = []
-    for rank, glossary, term_parts in candidates.values():
-        term = _find_term_by_id(_get_glossary_terms(dataplex_service, glossary['name']), cleaned_term_id)
-        if term:
-            resolved.append((rank, glossary, term, term_parts))
-
-    if not resolved:
-        checked = ", ".join(candidates)
-        noun = "glossary" if len(candidates) == 1 else "glossaries"
-        raise TermNotFoundError(f"Term ID '{cleaned_term_id}' not found in {noun} {checked}")
-    best_rank = min(rank for rank, _, _, _ in resolved)
-    resolved = [(glossary, term, term_parts) for rank, glossary, term, term_parts in resolved if rank == best_rank]
-    if len(resolved) > 1:
-        by_display_name = [r for r in resolved if _matches_term_display_name(r[1], r[2])]
-        if len(by_display_name) != 1:
-            matched = ", ".join(glossary['name'] for glossary, _, _ in resolved)
-            raise AmbiguousTermError(
-                f"'{identifier}' matches more than one glossary containing term ID '{cleaned_term_id}' ({matched}). "
-                f"Use the glossary ID instead of its display name, or put the full "
-                f"'projects/.../glossaries/.../terms/{cleaned_term_id}' resource name in the ID column."
-            )
-        resolved = by_display_name
-
-    glossary, term, term_parts = resolved[0]
-    if any(term_parts) and not _matches_term_display_name(term, term_parts):
-        logger.warning(
-            f"'{identifier}' does not match the display name '{_term_display_name(term)}' of term ID "
-            f"'{cleaned_term_id}' in glossary '{glossary['name']}'; using the term ID."
-        )
+    if cleaned_term_id:
+        _, term = _resolve_term_by_id(dataplex_service, identifier, cleaned_term_id, candidates)
+    else:
+        _, term = _resolve_term_by_display_name(dataplex_service, identifier, candidates)
 
     try:
         project_number = get_project_number(parsed.project_id, user_project or parsed.project_id)

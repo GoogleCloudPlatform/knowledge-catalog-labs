@@ -22,6 +22,7 @@ from utils.constants import (
     PROCESSED_DIRECTORY,
     SOURCE_ENTRY_PATTERN,
 )
+from utils.error import TermNameMismatchError
 from utils.models import EntryLink, EntryReference, SpreadsheetRow
 
 logger = logging_utils.get_logger()
@@ -340,22 +341,30 @@ def _resolve_term_entry_name(
 ) -> str:
     """Resolve the Name / ID cells of a glossary term to the term's Dataplex entry name.
 
-    Name ('<project>.<location>.<glossary>.<term>') identifies the glossary and ID identifies the
-    term in it; both are required. A full 'projects/...' resource name in either cell is used as is.
+    Name ('<project>.<location>.<glossary>.<term>') identifies the glossary. ID, if given,
+    identifies the term, and the term display name in Name (if any) must match it exactly;
+    otherwise the term is found by its exact display name. A full 'projects/...' resource name in
+    either cell is used as is.
     """
     full_name = _full_resource_name(name, term_id)
     if full_name:
         return _resolve_explicit_resource_name(full_name, user_project)
     if not name:
         raise ValueError(f"{label} Name is required: '<project>.<location>.<glossary>.<term>'")
-    if not term_id:
+    if not term_id and len(name.split(".")) < 4:
         raise ValueError(
-            f"{label} ID is required for glossary terms (the export fills it in); "
-            f"or put the full 'projects/...' resource name in {label} ID"
+            f"{label} ID is required when {label} Name has no term display name; "
+            f"use '<project>.<location>.<glossary>.<term>' or put the term ID in {label} ID"
         )
     if not dataplex_service:
         raise ValueError(f"Cannot resolve term '{name}' without Dataplex service")
-    return api_layer.lookup_term_by_display_identifier(dataplex_service, name, user_project, term_id=term_id)
+    try:
+        return api_layer.lookup_term_by_display_identifier(dataplex_service, name, user_project, term_id=term_id)
+    except TermNameMismatchError as mismatch:
+        raise ValueError(
+            f"{label} Name '{mismatch.term_name}' does not match {label} ID '{mismatch.term_id}' "
+            f"('{mismatch.display_name}'). Update or clear {label} ID."
+        ) from mismatch
 
 
 def _record_failed_row(row_number: int, reason: str, failed_rows: Optional[List[Tuple[int, str]]]) -> None:

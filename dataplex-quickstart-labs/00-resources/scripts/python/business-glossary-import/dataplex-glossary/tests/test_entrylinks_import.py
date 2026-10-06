@@ -32,7 +32,7 @@ spec = importlib.util.spec_from_file_location(
 entrylinks_import = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(entrylinks_import)
 
-from utils.error import EntryFQNNotFoundError, TransientAPIError
+from utils.error import EntryFQNNotFoundError, TermNameMismatchError, TransientAPIError
 from utils.models import EntryLink, EntryReference, SpreadsheetRow
 
 TABLE_ENTRY = (
@@ -599,13 +599,46 @@ class TestResolutionHelpers:
         assert captured == [('my_proj.global.Sales.Order Number', 'my_proj', 'order_number')]
 
     @pytest.mark.parametrize('name, term_id, message', [
-        ('my_proj.global.Sales.Order ID', '', 'Target ID is required'),
+        ('my_proj.global.Sales', '', 'Target ID is required'),
         ('', 'order_id', 'Target Name is required'),
     ])
-    def test_resolve_term_requires_name_and_id(self, name, term_id, message):
-        """Glossary terms need both cells: Name selects the glossary and ID the term in it"""
+    def test_resolve_term_requires_name_and_term(self, name, term_id, message):
+        """Name selects the glossary; the term needs the ID or a term display name in Name"""
         with pytest.raises(ValueError, match=message):
             entrylinks_import._resolve_target_entry_name(name, target_id=term_id, dataplex_service=Mock())
+
+    def test_resolve_term_by_name_without_id(self, monkeypatch):
+        """A 4-part Name without an ID is looked up by the term display name"""
+        captured = []
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured.append((identifier, term_id))
+            return TERM_ENTRY
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_term_by_display_identifier', fake_lookup_term)
+
+        result = entrylinks_import._resolve_target_entry_name(
+            'my_proj.global.Sales.Order ID', target_id='', dataplex_service=Mock()
+        )
+
+        assert result == TERM_ENTRY
+        assert captured == [('my_proj.global.Sales.Order ID', '')]
+
+    def test_name_id_mismatch_names_the_cells(self, monkeypatch):
+        """A Name that doesn't match the term found by ID fails with the Source/Target cell names"""
+        def raise_mismatch(s, identifier, p="", term_id=""):
+            raise TermNameMismatchError('Net Revenue', 'gross-revenue', 'Gross Revenue')
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_term_by_display_identifier', raise_mismatch)
+
+        with pytest.raises(ValueError) as exc_info:
+            entrylinks_import._resolve_target_entry_name(
+                'my_proj.global.Finance.Net Revenue', target_id='gross-revenue', dataplex_service=Mock()
+            )
+        assert str(exc_info.value) == (
+            "Target Name 'Net Revenue' does not match Target ID 'gross-revenue' ('Gross Revenue'). "
+            "Update or clear Target ID."
+        )
 
     def test_resolve_definition_source_requires_name(self):
         """The data asset of a definition link is found by its FQN, so Source Name is required"""
@@ -737,8 +770,8 @@ class TestBuildEntryLinkFailures:
     @pytest.mark.parametrize('overrides, reason', [
         ({'entry_link_type': 'defintion'}, "Invalid entry link type 'defintion'"),
         ({'source_name': ''}, 'Source Name is required'),
-        ({'target_id': ''}, 'Target ID is required'),
-        ({'entry_link_type': 'synonym', 'source_name': 'proj.global.Sales.Order Number', 'source_id': ''},
+        ({'target_name': 'proj.global.Sales', 'target_id': ''}, 'Target ID is required'),
+        ({'entry_link_type': 'synonym', 'source_name': 'proj.global.Sales', 'source_id': ''},
          'Source ID is required'),
     ])
     def test_invalid_row_is_recorded_with_reason(self, overrides, reason):
@@ -769,7 +802,7 @@ class TestBuildEntryLinkFailures:
         warnings = []
         monkeypatch.setattr(entrylinks_import.logger, 'warning', warnings.append)
 
-        assert self.build(target_id='') is None
+        assert self.build(target_name='proj.global.Sales', target_id='') is None
         assert len(warnings) == 1
         assert warnings[0].startswith('Row 7 skipped: Target ID is required')
 
@@ -794,8 +827,9 @@ class TestConvertSpreadsheetToEntrylinks:
             ['Entry link type', 'Source Name', 'Source ID', 'Column', 'Target Name', 'Target ID'],
             ['definition', 'bigquery:proj.ds.orders', 'proj.ds.orders', 'order_id', 'proj.global.Sales.Order ID', 'order_id'],
             [],
-            # The Sheets API leaves out trailing empty cells, so this row has no Target ID cell
-            ['synonym', 'proj.global.Sales.Order ID', 'order_id', '', 'proj.global.Sales.Order Number'],
+            # The Sheets API leaves out trailing empty cells, so this row has no Target ID cell (and
+            # its Target Name has no term display name to find the term by)
+            ['synonym', 'proj.global.Sales.Order ID', 'order_id', '', 'proj.global.Sales'],
         ]
         monkeypatch.setattr(
             entrylinks_import.sheet_utils, 'read_from_spreadsheet_url', lambda url, sheet_name=None: sheet_data

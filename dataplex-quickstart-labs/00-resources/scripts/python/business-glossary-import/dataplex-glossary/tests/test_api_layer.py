@@ -33,6 +33,7 @@ from utils.error import (
     EntryFQNNotFoundError,
     GlossaryNotFoundError,
     InvalidTermIdentifierError,
+    TermNameMismatchError,
     TermNotFoundError,
     TransientAPIError,
 )
@@ -601,11 +602,36 @@ class TestLookupTermByDisplayIdentifier:
         assert api_layer.is_known_entry(entry_name)
 
     @pytest.mark.parametrize('term_id', ['', '   '])
-    def test_requires_term_id(self, mock_glossaries, term_id):
+    def test_resolves_term_by_display_name_without_term_id(self, mock_glossaries, term_id):
+        mock_glossaries({'sales': ('Sales', {'order_total': 'Order Total', 'order_id': 'Order ID'})})
+
+        assert self.lookup('my-proj.global.Sales.Order Total', term_id) == _term_entry('sales', 'order_total')
+
+    def test_display_name_shared_by_several_terms_is_ambiguous(self, mock_glossaries):
+        mock_glossaries({'sales': ('Sales', {'status_order': 'Status', 'status_customer': 'Status'})})
+
+        with pytest.raises(AmbiguousTermError) as exc_info:
+            self.lookup('my-proj.global.Sales.Status', '')
+        assert 'matches more than one term (status_customer, status_order)' in str(exc_info.value)
+
+    def test_display_name_match_is_case_sensitive(self, mock_glossaries):
+        mock_glossaries({'sales': ('Sales', {'order_id': 'Order ID'})})
+
+        with pytest.raises(TermNotFoundError) as exc_info:
+            self.lookup('my-proj.global.Sales.order id', '')
+        assert type(exc_info.value) is TermNotFoundError
+        assert 'case-sensitive' in str(exc_info.value)
+
+    def test_resolves_dotted_display_names_without_term_id(self, mock_glossaries):
+        mock_glossaries({'finance': ('Finance v2.0', {'net_rev': 'Net.Revenue', 'rev': 'Revenue'})})
+
+        assert self.lookup('my-proj.global.Finance v2.0.Net.Revenue', '') == _term_entry('finance', 'net_rev')
+
+    def test_requires_term_id_without_term_display_name(self, mock_glossaries):
         mock_glossaries({'sales': ('Sales', {'order_total': 'Order Total'})})
 
-        with pytest.raises(InvalidTermIdentifierError):
-            self.lookup('my-proj.global.Sales.Order Total', term_id)
+        with pytest.raises(InvalidTermIdentifierError, match='no term display name'):
+            self.lookup('my-proj.global.Sales', '')
 
     def test_term_id_selects_among_duplicate_term_display_names(self, mock_glossaries):
         mock_glossaries({'sales': ('Sales', {'status_order': 'Status', 'status_customer': 'Status'})})
@@ -666,23 +692,24 @@ class TestLookupTermByDisplayIdentifier:
 
         assert self.lookup('my-proj.global.SALES.Order ID', 'ORDER_ID') == _term_entry('sales', 'order_id')
 
-    def test_warns_when_term_display_name_does_not_match(self, mock_glossaries, monkeypatch):
+    @pytest.mark.parametrize('identifier, term_name', [
+        ('my-proj.global.Sales.Order Number', 'Order Number'),
+        ('my-proj.global.Sales.order id', 'order id'),  # Term display names are case-sensitive.
+    ])
+    def test_raises_when_term_display_name_does_not_match_term_id(self, mock_glossaries, identifier, term_name):
         mock_glossaries({'sales': ('Sales', {'order_id': 'Order ID'})})
-        warnings = []
-        monkeypatch.setattr(api_layer.logger, 'warning', warnings.append)
 
-        assert self.lookup('my-proj.global.Sales.Order Number', 'order_id') == _term_entry('sales', 'order_id')
-        assert len(warnings) == 1
-        assert "does not match the display name 'Order ID' of term ID 'order_id'" in warnings[0]
+        with pytest.raises(TermNameMismatchError) as exc_info:
+            self.lookup(identifier, 'order_id')
+        assert (exc_info.value.term_name, exc_info.value.term_id, exc_info.value.display_name) == (
+            term_name, 'order_id', 'Order ID'
+        )
 
-    @pytest.mark.parametrize('identifier', ['my-proj.global.Sales.order id', 'my-proj.global.Sales'])
-    def test_no_warning_when_term_display_name_matches_or_is_omitted(self, mock_glossaries, monkeypatch, identifier):
+    @pytest.mark.parametrize('identifier', ['my-proj.global.Sales.Order ID', 'my-proj.global.Sales'])
+    def test_term_id_resolves_when_term_display_name_matches_or_is_omitted(self, mock_glossaries, identifier):
         mock_glossaries({'sales': ('Sales', {'order_id': 'Order ID'})})
-        warnings = []
-        monkeypatch.setattr(api_layer.logger, 'warning', warnings.append)
 
         assert self.lookup(identifier, 'order_id') == _term_entry('sales', 'order_id')
-        assert warnings == []
 
     def test_resolves_display_names_containing_dots(self, mock_glossaries):
         mock_glossaries({'finance': ('Finance v2.0', {'net_rev': 'Net.Revenue'})})
