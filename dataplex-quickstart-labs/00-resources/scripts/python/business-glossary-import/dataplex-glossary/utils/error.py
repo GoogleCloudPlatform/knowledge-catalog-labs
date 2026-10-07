@@ -40,3 +40,11 @@ class InvalidCategoryNameError(Exception):
 class InvalidEntryIdFormatError(Exception):
     """Raised when the entry ID format is invalid."""
     pass
+
+class InvalidAspectIdentifierError(Exception):
+    """Raised when an 'Aspect name' cell cannot be parsed."""
+    pass
+
+class AspectValidationError(Exception):
+    """Raised when an aspect row fails validation."""
+    pass
