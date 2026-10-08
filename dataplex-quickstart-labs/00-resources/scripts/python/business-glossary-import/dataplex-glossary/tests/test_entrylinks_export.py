@@ -606,6 +606,10 @@ class TestCacheListedTerms:
         monkeypatch.setattr(api_layer, '_fetch_project_info', project_info)
         service = MagicMock()
         service.projects().locations().glossaries().get().execute.return_value = {'displayName': 'Sales'}
+        service.projects().locations().glossaries().list().execute.return_value = {
+            'glossaries': [{'name': self.GLOSSARY, 'displayName': 'Sales'}]
+        }
+        service.projects().locations().glossaries().list_next.return_value = None
         terms_get = service.projects().locations().glossaries().terms().get
 
         entrylinks_export._cache_listed_terms(self.GLOSSARY, [self.TERM], 'billing-proj')

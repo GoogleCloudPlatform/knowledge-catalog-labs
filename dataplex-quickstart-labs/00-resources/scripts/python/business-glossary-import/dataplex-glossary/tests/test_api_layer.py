@@ -19,7 +19,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, patch, call, PropertyMock
+from unittest.mock import ANY, MagicMock, Mock, patch, call, PropertyMock
 import httplib2
 import pytest
 from googleapiclient.errors import HttpError
@@ -450,10 +450,15 @@ class TestListGlossaries:
 class TestResolveTermEntryToDisplayIdentifier:
     """Test resolve_term_entry_to_display_identifier."""
 
+    ENTRY_NAME = (
+        'projects/my-proj/locations/global/entryGroups/@dataplex/entries/'
+        'projects/my-proj/locations/global/glossaries/sales_glossary/terms/revenue_term'
+    )
+
     def setup_method(self):
         api_layer.clear_caches()
 
-    def test_resolves_dataplex_entry_to_display_identifier(self):
+    def _service(self, glossaries):
         mock_service = MagicMock()
         mock_service.projects().locations().glossaries().get().execute.return_value = {
             'name': 'projects/my-proj/locations/global/glossaries/sales_glossary',
@@ -463,12 +468,34 @@ class TestResolveTermEntryToDisplayIdentifier:
             'name': 'projects/my-proj/locations/global/glossaries/sales_glossary/terms/revenue_term',
             'displayName': 'Revenue'
         }
+        mock_service.projects().locations().glossaries().list().execute.return_value = {'glossaries': glossaries}
+        mock_service.projects().locations().glossaries().list_next.return_value = None
+        return mock_service
 
-        entry_name = (
-            'projects/my-proj/locations/global/entryGroups/@dataplex/entries/'
-            'projects/my-proj/locations/global/glossaries/sales_glossary/terms/revenue_term'
-        )
-        identifier = api_layer.resolve_term_entry_to_display_identifier(mock_service, entry_name)
+    def test_resolves_dataplex_entry_to_display_identifier(self):
+        mock_service = self._service([
+            {'name': 'projects/my-proj/locations/global/glossaries/sales_glossary', 'displayName': 'Sales Glossary'},
+            {'name': 'projects/my-proj/locations/global/glossaries/hr', 'displayName': 'HR'},
+        ])
+
+        identifier = api_layer.resolve_term_entry_to_display_identifier(mock_service, self.ENTRY_NAME)
+        assert identifier == 'my-proj.global.Sales Glossary.Revenue'
+
+    def test_uses_glossary_id_when_another_glossary_has_the_same_display_name(self):
+        """The import can't tell glossaries with the same display name apart, so the export uses the ID"""
+        mock_service = self._service([
+            {'name': 'projects/my-proj/locations/global/glossaries/sales_glossary', 'displayName': 'Sales Glossary'},
+            {'name': 'projects/my-proj/locations/global/glossaries/sales_glossary_v2', 'displayName': ' Sales Glossary'},
+        ])
+
+        identifier = api_layer.resolve_term_entry_to_display_identifier(mock_service, self.ENTRY_NAME)
+        assert identifier == 'my-proj.global.sales_glossary.Revenue'
+
+    def test_keeps_display_name_when_glossaries_cannot_be_listed(self):
+        mock_service = self._service([])
+        mock_service.projects().locations().glossaries().list().execute.side_effect = _http_error(403)
+
+        identifier = api_layer.resolve_term_entry_to_display_identifier(mock_service, self.ENTRY_NAME)
         assert identifier == 'my-proj.global.Sales Glossary.Revenue'
 
 
@@ -490,34 +517,37 @@ class TestGetEntryFQN:
         assert api_layer.get_entry_fqn(mock_service, self.ENTRY, 'user-proj') == self.FQN
         lookup.assert_called_once_with(mock_service, self.ENTRY, 'projects/user-proj/locations/us')
 
-    def test_falls_back_to_entry_project(self, monkeypatch):
-        lookup = Mock(side_effect=[None, {'name': self.ENTRY, 'fullyQualifiedName': self.FQN}])
-        monkeypatch.setattr(api_layer, 'lookup_entry', lookup)
-
-        assert api_layer.get_entry_fqn(MagicMock(), self.ENTRY, 'user-proj') == self.FQN
-        assert [c.args[2] for c in lookup.call_args_list] == [
-            'projects/user-proj/locations/us',
-            'projects/my-proj/locations/us',
-        ]
-
-    def test_does_not_repeat_lookup_when_user_project_is_entry_project(self, monkeypatch):
-        lookup = Mock(return_value=None)
-        monkeypatch.setattr(api_layer, 'lookup_entry', lookup)
-        monkeypatch.setattr(api_layer.logger, 'warning', [].append)
-
-        assert api_layer.get_entry_fqn(MagicMock(), self.ENTRY, 'my-proj') == self.ENTRY
-        lookup.assert_called_once()
-
-    def test_returns_entry_name_and_warns_once_without_fqn(self, monkeypatch):
+    def test_looks_up_once_under_user_project(self, monkeypatch):
+        """The request's project is only billed, so a failed read is not retried under the entry's project."""
         lookup = Mock(return_value=None)
         warnings = []
         monkeypatch.setattr(api_layer, 'lookup_entry', lookup)
         monkeypatch.setattr(api_layer.logger, 'warning', warnings.append)
 
         assert api_layer.get_entry_fqn(MagicMock(), self.ENTRY, 'user-proj') == self.ENTRY
+        assert [c.args[2] for c in lookup.call_args_list] == ['projects/user-proj/locations/us']
+        assert warnings == [
+            f"Could not read entry {self.ENTRY} (not found, or no permission to read it); "
+            "writing the entry name instead of its FQN."
+        ]
+
+    def test_uses_entry_project_without_user_project(self, monkeypatch):
+        lookup = Mock(return_value={'name': self.ENTRY, 'fullyQualifiedName': self.FQN})
+        monkeypatch.setattr(api_layer, 'lookup_entry', lookup)
+
+        assert api_layer.get_entry_fqn(MagicMock(), self.ENTRY, '') == self.FQN
+        lookup.assert_called_once_with(ANY, self.ENTRY, 'projects/my-proj/locations/us')
+
+    def test_returns_entry_name_and_warns_once_without_fqn(self, monkeypatch):
+        lookup = Mock(return_value={'name': self.ENTRY})
+        warnings = []
+        monkeypatch.setattr(api_layer, 'lookup_entry', lookup)
+        monkeypatch.setattr(api_layer.logger, 'warning', warnings.append)
+
         assert api_layer.get_entry_fqn(MagicMock(), self.ENTRY, 'user-proj') == self.ENTRY
-        assert lookup.call_count == 2  # Both projects are tried once; the second call is cached.
-        assert len(warnings) == 1
+        assert api_layer.get_entry_fqn(MagicMock(), self.ENTRY, 'user-proj') == self.ENTRY
+        lookup.assert_called_once()  # The second call is cached.
+        assert warnings == [f"Entry {self.ENTRY} has no fullyQualifiedName; writing the entry name instead."]
 
     @pytest.mark.parametrize('entry_id, fqn', [
         ('bigquery.googleapis.com/projects/my-proj/datasets/Sales_ds/tables/orders-2024', 'bigquery:my-proj.Sales_ds.orders-2024'),
@@ -799,8 +829,9 @@ def _fake_catalog(searchable=(), readable=(), get_error=None, search_delay=0):
     """A Dataplex service mock backed by lists of entries.
 
     searchEntries returns every `searchable` entry whose FQN contains the queried FQN, so the
-    caller has to keep only the exact match. entries.get returns the `readable` entry with the
-    requested name, raises `get_error` if given, and raises a 404 otherwise.
+    caller has to keep only the exact match. lookupEntry returns the `readable` entry with the
+    requested name, raises `get_error` if given, and otherwise raises a 403, as the live API
+    does for entries that don't exist.
     """
     service = MagicMock()
     readable_by_name = {entry['name']: entry for entry in readable}
@@ -814,18 +845,18 @@ def _fake_catalog(searchable=(), readable=(), get_error=None, search_delay=0):
         }
         return request
 
-    def get_entry(name):
+    def lookup_entry(name, entry, **kwargs):
         request = MagicMock()
         if get_error is not None:
             request.execute.side_effect = get_error
-        elif name in readable_by_name:
-            request.execute.return_value = dict(readable_by_name[name])
+        elif entry in readable_by_name:
+            request.execute.return_value = dict(readable_by_name[entry])
         else:
-            request.execute.side_effect = _http_error(404)
+            request.execute.side_effect = _http_error(403)
         return request
 
     _search_mock(service).side_effect = search_entries
-    _get_mock(service).side_effect = get_entry
+    _lookup_mock(service).side_effect = lookup_entry
     return service
 
 
@@ -833,8 +864,13 @@ def _search_mock(service):
     return service.projects.return_value.locations.return_value.searchEntries
 
 
-def _get_mock(service):
-    return service.projects.return_value.locations.return_value.entryGroups.return_value.entries.return_value.get
+def _lookup_mock(service):
+    return service.projects.return_value.locations.return_value.lookupEntry
+
+
+def _read_entries(service):
+    """The entry names that lookupEntry was called for."""
+    return [c.kwargs['entry'] for c in _lookup_mock(service).call_args_list]
 
 
 class TestLookupEntryByFQN:
@@ -883,7 +919,8 @@ class TestLookupEntryByFQN:
 
         assert entry['name'] == _with_project_number(table['name'])
         assert api_layer.is_known_entry(entry['name'])
-        _get_mock(service).assert_called_once_with(name=table['name'])
+        # Read with lookupEntry under the user project (source-system permissions), not entries.get.
+        _lookup_mock(service).assert_called_once_with(name='projects/user-proj/locations/asia-south1', entry=table['name'])
 
     def test_reads_other_tables_of_a_found_dataset_directly(self):
         first, second = _bq_entry(f'{DATASET_FQN}.first'), _bq_entry(f'{DATASET_FQN}.second')
@@ -895,7 +932,7 @@ class TestLookupEntryByFQN:
         assert entry['name'] == _with_project_number(second['name'])
         assert api_layer.is_known_entry(entry['name'])
         _search_mock(service).assert_called_once()  # For the first table only.
-        _get_mock(service).assert_called_once_with(name=second['name'])
+        assert _read_entries(service) == [second['name']]
 
     def test_unindexed_tables_cost_one_read_after_the_first_of_their_dataset(self):
         tables = [_bq_entry(f'{DATASET_FQN}.t{i}') for i in range(3)]
@@ -910,7 +947,7 @@ class TestLookupEntryByFQN:
             f'fully_qualified_name="{DATASET_FQN}.t0"',
             f'fully_qualified_name="{DATASET_FQN}"',
         ]
-        assert [c.kwargs['name'] for c in _get_mock(service).call_args_list] == [t['name'] for t in tables]
+        assert _read_entries(service) == [t['name'] for t in tables]
 
     def test_searches_when_direct_read_finds_nothing(self):
         # A BigQuery model's FQN looks like a table's, but its entry is under /models/.
@@ -925,7 +962,7 @@ class TestLookupEntryByFQN:
         entry = api_layer.lookup_entry_by_fqn(service, model['fullyQualifiedName'], 'user-proj')
 
         assert entry['name'] == _with_project_number(model['name'])
-        _get_mock(service).assert_called_once()  # Reading '.../tables/churn' found nothing.
+        _lookup_mock(service).assert_called_once()  # Reading '.../tables/churn' found nothing.
 
     def test_missing_table_of_a_found_dataset_is_negatively_cached(self):
         missing_fqn = f'{DATASET_FQN}.missing'
@@ -936,7 +973,7 @@ class TestLookupEntryByFQN:
             with pytest.raises(EntryFQNNotFoundError):
                 api_layer.lookup_entry_by_fqn(service, missing_fqn, 'user-proj')
 
-        _get_mock(service).assert_called_once()
+        _lookup_mock(service).assert_called_once()
         assert [c.kwargs['query'] for c in _search_mock(service).call_args_list] == [
             f'fully_qualified_name="{TABLE_FQN}"',
             f'fully_qualified_name="{missing_fqn}"',
@@ -946,7 +983,7 @@ class TestLookupEntryByFQN:
         service = _fake_catalog(searchable=[_bq_entry(TABLE_FQN)], get_error=_http_error(403))
 
         api_layer.lookup_entry_by_fqn(service, TABLE_FQN, 'user-proj')
-        with pytest.raises(EntryFQNNotFoundError, match='Permission denied'):
+        with pytest.raises(EntryFQNNotFoundError, match='not found, or permission denied'):
             api_layer.lookup_entry_by_fqn(service, f'{DATASET_FQN}.restricted', 'user-proj')
 
         assert _search_mock(service).call_count == 2  # Search was tried after the read was denied.
@@ -962,7 +999,7 @@ class TestLookupEntryByFQN:
             'fully_qualified_name="bigquery:missing.ds.tbl"',
             'fully_qualified_name="bigquery:missing.ds"',
         ]
-        _get_mock(service).assert_not_called()
+        _lookup_mock(service).assert_not_called()
 
     def test_missing_table_entry_is_negatively_cached(self):
         service = _fake_catalog(searchable=[_bq_entry(DATASET_FQN)])
@@ -971,16 +1008,16 @@ class TestLookupEntryByFQN:
             with pytest.raises(EntryFQNNotFoundError):
                 api_layer.lookup_entry_by_fqn(service, TABLE_FQN, 'user-proj')
 
-        _get_mock(service).assert_called_once()
+        _lookup_mock(service).assert_called_once()
 
     def test_permission_denied_on_table_entry_is_cached(self):
         service = _fake_catalog(searchable=[_bq_entry(DATASET_FQN)], get_error=_http_error(403))
 
         for _ in range(2):
-            with pytest.raises(EntryFQNNotFoundError, match='Permission denied'):
+            with pytest.raises(EntryFQNNotFoundError, match='not found, or permission denied'):
                 api_layer.lookup_entry_by_fqn(service, TABLE_FQN, 'user-proj')
 
-        _get_mock(service).assert_called_once()
+        _lookup_mock(service).assert_called_once()
 
     def test_search_outage_is_not_cached(self, monkeypatch):
         monkeypatch.setattr(api_layer, 'execute_with_retry', lambda operation, name: operation())  # No retry delays.
@@ -1193,3 +1230,133 @@ class TestGetProjectNumberFailures:
                 api_layer.get_project_number('my-proj', 'user-proj')
             assert not api_layer.is_transient_error(exc_info.value)
         fetch.assert_called_once()
+
+
+class TestRateLimiter:
+    """Test _RateLimiter and that searchEntries and lookupEntry calls go through their limiters."""
+
+    def setup_method(self):
+        api_layer.clear_caches()
+
+    def test_spaces_calls_across_threads(self):
+        limiter = api_layer._RateLimiter(0.05)
+        call_times = []
+
+        def call():
+            limiter.wait()
+            call_times.append(time.monotonic())
+
+        threads = [threading.Thread(target=call) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        call_times.sort()
+        gaps = [later - earlier for earlier, later in zip(call_times, call_times[1:])]
+        assert len(gaps) == 3
+        assert min(gaps) >= 0.045
+
+    def test_waits_before_every_attempt(self, monkeypatch):
+        def retry_once(operation, description):
+            try:
+                return operation()
+            except HttpError:
+                return operation()
+
+        monkeypatch.setattr(api_layer, 'execute_with_retry', retry_once)
+        limiter = Mock()
+        request = Mock()
+        request.execute.side_effect = [_http_error(503), {'ok': True}]
+
+        assert api_layer._execute_rate_limited(limiter, request, 'test call') == {'ok': True}
+        assert limiter.wait.call_count == 2
+
+    def test_search_and_table_reads_are_rate_limited(self, monkeypatch):
+        monkeypatch.setattr(api_layer, 'get_project_number', lambda project_id, user_project='': '123')
+        search_limiter, read_limiter = Mock(), Mock()
+        monkeypatch.setattr(api_layer, '_search_rate_limiter', search_limiter)
+        monkeypatch.setattr(api_layer, '_entry_read_rate_limiter', read_limiter)
+        table = _bq_entry(TABLE_FQN)
+        service = _fake_catalog(searchable=[_bq_entry(DATASET_FQN)], readable=[table])
+
+        api_layer.lookup_entry_by_fqn(service, TABLE_FQN, 'user-proj')
+
+        assert search_limiter.wait.call_count == _search_mock(service).call_count == 2  # Table, then dataset.
+        assert read_limiter.wait.call_count == _lookup_mock(service).call_count == 1
+
+    def test_lookup_entry_is_rate_limited(self, monkeypatch):
+        read_limiter = Mock()
+        monkeypatch.setattr(api_layer, '_entry_read_rate_limiter', read_limiter)
+        service = MagicMock()
+        service.projects().locations().lookupEntry().execute.return_value = {'name': 'e'}
+
+        assert api_layer.lookup_entry(service, 'e', 'projects/p/locations/us') == {'name': 'e'}
+        read_limiter.wait.assert_called_once()
+
+    @pytest.mark.parametrize('status', [401, 403, 404])
+    def test_lookup_entry_returns_none_without_warning_when_missing_or_unreadable(self, monkeypatch, status):
+        """lookupEntry answers a missing entry with 403 too; callers report these entries, so no warning here."""
+        warnings = []
+        monkeypatch.setattr(api_layer.logger, 'warning', warnings.append)
+        service = MagicMock()
+        service.projects().locations().lookupEntry().execute.side_effect = HttpError(
+            Mock(status=status), b'{"error": {"message": "denied"}}'
+        )
+
+        assert api_layer.lookup_entry(service, 'e', 'projects/p/locations/us') is None
+        assert warnings == []
+
+
+class TestCheckTermMatchesDisplayIdentifier:
+    """Test check_term_matches_display_identifier (a full term resource name in the ID cell)."""
+
+    TERM = 'projects/my-proj/locations/global/glossaries/sales/terms/revenue'
+
+    def setup_method(self):
+        api_layer.clear_caches()
+
+    @pytest.fixture
+    def service(self):
+        service = MagicMock()
+        service.projects().locations().glossaries().get().execute.return_value = {
+            'name': 'projects/my-proj/locations/global/glossaries/sales', 'displayName': 'Sales'
+        }
+        service.projects().locations().glossaries().terms().get().execute.return_value = {
+            'name': self.TERM, 'displayName': 'Revenue'
+        }
+        return service
+
+    @pytest.mark.parametrize('name', [
+        'my-proj.global.Sales.Revenue',
+        'my-proj.global.sales.Revenue',  # Glossary ID.
+        'my-proj.global.SALES.Revenue',  # Glossary names ignore case.
+        'my-proj.global.Sales',  # No term display name: the ID selects the term.
+    ])
+    def test_accepts_name_of_the_term(self, service, name):
+        api_layer.check_term_matches_display_identifier(service, name, self.TERM, self.TERM)
+
+    @pytest.mark.parametrize('name', [
+        'my-proj.global.Sales.Net Revenue',  # Other term display name.
+        'my-proj.global.Sales.revenue',  # Term display names are case-sensitive.
+        'my-proj.global.HR.Revenue',  # Other glossary.
+        'other-proj.global.Sales.Revenue',  # Other project.
+        'my-proj.us.Sales.Revenue',  # Other location.
+    ])
+    def test_rejects_name_of_another_term(self, service, name):
+        with pytest.raises(TermNameMismatchError) as exc_info:
+            api_layer.check_term_matches_display_identifier(service, name, self.TERM, self.TERM)
+
+        assert (exc_info.value.term_name, exc_info.value.term_id) == (name, self.TERM)
+        assert exc_info.value.display_name == 'Sales.Revenue'
+
+    @pytest.mark.parametrize('project_number, matches', [('123', True), ('456', False)])
+    def test_compares_project_id_with_project_number(self, service, monkeypatch, project_number, matches):
+        monkeypatch.setattr(api_layer, 'get_project_number', lambda project_id, user_project='': project_number)
+        term = self.TERM.replace('projects/my-proj/', 'projects/123/')
+
+        if matches:
+            api_layer.check_term_matches_display_identifier(service, 'my-proj.global.Sales.Revenue', term, term)
+        else:
+            with pytest.raises(TermNameMismatchError):
+                api_layer.check_term_matches_display_identifier(service, 'my-proj.global.Sales.Revenue', term, term)

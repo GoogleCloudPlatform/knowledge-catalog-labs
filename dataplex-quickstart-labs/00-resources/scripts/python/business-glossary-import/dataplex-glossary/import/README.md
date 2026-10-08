@@ -73,6 +73,19 @@ gcloud auth application-default login \
 export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT="${SA_EMAIL}"
 ```
 
+### Required permissions (EntryLinks import)
+
+The account the script runs as (the impersonated service account) needs:
+
+| Used for | Permissions | Predefined role that includes them |
+|---|---|---|
+| Quota and billing of the API calls, on `--user-project` | `serviceusage.services.use` | Service Usage Consumer (`roles/serviceusage.serviceUsageConsumer`) |
+| Finding data assets by FQN (Catalog search and `lookupEntry`), on `--user-project` | `dataplex.projects.search` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Reading the data assets' entries: `lookupEntry` checks access in the source system | Read access to each asset, e.g. `bigquery.tables.get` for BigQuery tables | BigQuery Metadata Viewer (`roles/bigquery.metadataViewer`) |
+| Finding glossaries and terms by name, on the glossaries' projects | `dataplex.glossaries.list`, `dataplex.glossaries.get`, `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Translating project IDs to project numbers and back | `resourcemanager.projects.get` on the projects named in the sheet | Browser (`roles/browser`) |
+| Creating the entry links with metadata import jobs | See [Import metadata](https://cloud.google.com/dataplex/docs/import-metadata) | |
+
 ---
 
 ## 1. Glossary Import
@@ -166,7 +179,9 @@ How the term is found:
 *   ID empty: the term whose display name exactly matches the term display name in Name (case-sensitive). If several terms in the glossary have that display name, the row fails and lists their IDs; put the right one in the ID cell.
 *   Name without a term display name (`<project>.<location>.<glossary>`): the ID is required.
 
-Instead, the Name or ID cell of a term or data asset can hold a full Dataplex resource name (starting with `projects/`), which is used as is: an entry name, or for a term, its resource name `projects/<project>/locations/<location>/glossaries/<glossary>/terms/<term>`. Use this when the project ID contains a dot (domain-scoped projects such as `example.com:my-project`), as the dot-separated Name can't express it. Sheets written by earlier versions of the export (headers `entry_link_type, source_entry, target_entry, source_path`, with full entry names) can still be imported.
+Instead, the Name cell of a term or data asset can hold a full Dataplex resource name (starting with `projects/`), which is used as is: an entry name, or for a term, its resource name `projects/<project>/locations/<location>/glossaries/<glossary>/terms/<term>`. Use this when the project ID contains a dot (domain-scoped projects such as `example.com:my-project`), as the dot-separated Name can't express it. If the ID cell is filled in too, it must name the same term. Sheets written by earlier versions of the export (headers `entry_link_type, source_entry, target_entry, source_path`, with full entry names) can still be imported.
+
+The ID cell of a term can also hold the term's full resource name, for example to choose between two glossaries with the same display name. If the Name is filled in too, it must name that same term (its project, location, glossary display name or ID, and exact term display name), or the row fails. For `definition` links, `Source ID` is ignored even if it holds a full resource name.
 
 Data assets are found with Dataplex Catalog search, which may take a few minutes to include newly created assets (BigQuery tables that search doesn't return yet are read directly). If an asset isn't found, check its FQN or give its full entry name instead.
 

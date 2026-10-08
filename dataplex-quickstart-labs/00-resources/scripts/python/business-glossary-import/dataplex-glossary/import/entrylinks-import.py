@@ -75,8 +75,8 @@ def confirm_import(failed_rows: List[Tuple[int, str]], missing_entries: Iterable
         logger.warning(f"{len(failed_rows)} row(s) can't be imported and will be skipped:")
         _log_items(_format_failed_rows(failed_rows), logger.warning)
     if missing_entries:
-        logger.warning(f"{len(missing_entries)} referenced entry(ies) were not found in Dataplex; "
-                       f"entry links that use them may fail during import:")
+        logger.warning(f"{len(missing_entries)} referenced entry(ies) were not found in Dataplex, or you don't have "
+                       f"permission to read them; entry links that use them may fail during import:")
         _log_items(missing_entries, logger.warning)
 
     user_response = get_user_input_with_timeout("Continue with import? [y/N]: ")
@@ -164,9 +164,9 @@ def _lookup_and_check_entry(entry_ref, missing_entries: set, failed_entries: set
     try:
         result = api_layer.lookup_entry(dataplex_service, entry_name, project_location)
         if result is None:
-            # Entry genuinely not found (404)
+            # Not found, or no permission to read it (lookupEntry answers both with 403)
             missing_entries.add(entry_name)
-            logger.debug(f"Entry not found (404): {entry_name}")
+            logger.debug(f"Entry not found, or no permission to read it: {entry_name}")
     except Exception as e:
         # Network/SSL error - entry lookup failed, not necessarily missing
         failed_entries.add(entry_name)
@@ -180,7 +180,8 @@ def check_entry_existence(entrylinks: List[EntryLink]) -> tuple:
 
     Returns:
         tuple: (missing_entry_names, failed_entry_names)
-            - missing_entry_names: Entries that returned 404 (don't exist)
+            - missing_entry_names: Entries that don't exist or can't be read (lookupEntry
+              answers both with 403, so they can't be told apart)
             - failed_entry_names: Entries that failed due to network errors
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -288,12 +289,9 @@ def _resolve_explicit_resource_name(resource_name: str, user_project: str = "") 
     return api_layer.normalize_entry_name_project_number(resource_name, user_project)
 
 
-def _full_resource_name(name: str, resource_id: str) -> str:
-    """Return the full 'projects/...' resource name given in the ID or Name cell, if any."""
-    for value in (resource_id, name):
-        if value.startswith('projects/'):
-            return value
-    return ""
+def _is_full_resource_name(value: str) -> bool:
+    """Whether a Name or ID cell holds a full Dataplex resource name ('projects/...')."""
+    return value.startswith('projects/')
 
 
 def _resolve_source_entry_name(
@@ -305,16 +303,15 @@ def _resolve_source_entry_name(
 ) -> str:
     """Resolve the Source Name / Source ID cells to a Dataplex entry name.
 
-    For definition links the source is a data asset, found by the FQN in Source Name
-    (Source ID is informational). Otherwise it is a glossary term (see _resolve_term_entry_name).
-    A full 'projects/...' resource name in either cell is used as is.
+    For definition links the source is a data asset, found by the FQN in Source Name, or given
+    by a full 'projects/...' entry name in Source Name. Source ID is informational and ignored.
+    Otherwise the source is a glossary term (see _resolve_term_entry_name).
     """
     if link_type != DP_LINK_TYPE_DEFINITION:
         return _resolve_term_entry_name("Source", source_name, source_id, dataplex_service, user_project)
 
-    full_name = _full_resource_name(source_name, source_id)
-    if full_name:
-        return _resolve_explicit_resource_name(full_name, user_project)
+    if _is_full_resource_name(source_name):
+        return _resolve_explicit_resource_name(source_name, user_project)
     if not source_name:
         raise ValueError("Source Name is required: the data asset's fully qualified name, e.g. 'bigquery:project.dataset.table'")
     if not dataplex_service:
@@ -332,6 +329,46 @@ def _resolve_target_entry_name(
     return _resolve_term_entry_name("Target", target_name, target_id, dataplex_service, user_project)
 
 
+def _name_id_mismatch(label: str, mismatch: TermNameMismatchError) -> ValueError:
+    """The row error for a Name cell that doesn't match the term selected by the ID cell."""
+    return ValueError(
+        f"{label} Name '{mismatch.term_name}' does not match {label} ID '{mismatch.term_id}' "
+        f"('{mismatch.display_name}'). Update or clear {label} ID."
+    )
+
+
+def _resolve_full_term_name_cells(
+    label: str, name: str, term_id: str, dataplex_service=None, user_project: str = ""
+) -> str:
+    """Resolve the Name / ID cells of a term when one of them is a full 'projects/...' resource name.
+
+    A full resource name in Name is used as is; an ID next to it must name the same term. A full
+    resource name in ID (e.g. to pick one of two glossaries with the same display name) is used
+    when the Name is empty or names that same term (see check_term_matches_display_identifier).
+    """
+    if _is_full_resource_name(name):
+        entry_name = _resolve_explicit_resource_name(name, user_project)
+        same_term = (
+            _resolve_explicit_resource_name(term_id, user_project) == entry_name if _is_full_resource_name(term_id)
+            else term_id.casefold() == name.rstrip('/').split('/')[-1].casefold()
+        )
+        if term_id and not same_term:
+            raise ValueError(f"{label} Name '{name}' and {label} ID '{term_id}' name different terms. Update or clear {label} ID.")
+        return entry_name
+
+    if name:
+        if not dataplex_service:
+            raise ValueError(f"Cannot check {label} Name '{name}' against {label} ID without Dataplex service")
+        term_resource_name = business_glossary_utils.extract_term_resource_from_entry_name(term_id)
+        try:
+            api_layer.check_term_matches_display_identifier(
+                dataplex_service, name, term_resource_name, term_id, user_project
+            )
+        except TermNameMismatchError as mismatch:
+            raise _name_id_mismatch(label, mismatch) from mismatch
+    return _resolve_explicit_resource_name(term_id, user_project)
+
+
 def _resolve_term_entry_name(
     label: str,
     name: str,
@@ -343,12 +380,11 @@ def _resolve_term_entry_name(
 
     Name ('<project>.<location>.<glossary>.<term>') identifies the glossary. ID, if given,
     identifies the term, and the term display name in Name (if any) must match it exactly;
-    otherwise the term is found by its exact display name. A full 'projects/...' resource name in
-    either cell is used as is.
+    otherwise the term is found by its exact display name. Either cell may instead hold a full
+    'projects/...' resource name (see _resolve_full_term_name_cells).
     """
-    full_name = _full_resource_name(name, term_id)
-    if full_name:
-        return _resolve_explicit_resource_name(full_name, user_project)
+    if _is_full_resource_name(name) or _is_full_resource_name(term_id):
+        return _resolve_full_term_name_cells(label, name, term_id, dataplex_service, user_project)
     if not name:
         raise ValueError(f"{label} Name is required: '<project>.<location>.<glossary>.<term>'")
     if not term_id and len(name.split(".")) < 4:
@@ -361,10 +397,7 @@ def _resolve_term_entry_name(
     try:
         return api_layer.lookup_term_by_display_identifier(dataplex_service, name, user_project, term_id=term_id)
     except TermNameMismatchError as mismatch:
-        raise ValueError(
-            f"{label} Name '{mismatch.term_name}' does not match {label} ID '{mismatch.term_id}' "
-            f"('{mismatch.display_name}'). Update or clear {label} ID."
-        ) from mismatch
+        raise _name_id_mismatch(label, mismatch) from mismatch
 
 
 def _record_failed_row(row_number: int, reason: str, failed_rows: Optional[List[Tuple[int, str]]]) -> None:

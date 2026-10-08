@@ -737,6 +737,73 @@ class TestResolutionHelpers:
             'projects/p/locations/global/glossaries/g1/terms/t2'
         )
 
+    def test_definition_source_id_does_not_override_source_name(self, monkeypatch):
+        """Source ID is informational for definition links, even when it holds a full entry name"""
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_entry_by_fqn', lambda s, fqn, p: {'name': TABLE_ENTRY}
+        )
+        other_entry = 'projects/123/locations/us/entryGroups/@bigquery/entries/other'
+
+        result = entrylinks_import._resolve_source_entry_name(
+            'bigquery:proj.ds.orders', 'definition', source_id=other_entry, dataplex_service=Mock()
+        )
+
+        assert result == TABLE_ENTRY
+
+    def test_definition_source_needs_name_even_with_full_source_id(self):
+        with pytest.raises(ValueError, match='Source Name is required'):
+            entrylinks_import._resolve_source_entry_name(
+                '', 'definition', source_id='projects/123/locations/us/entryGroups/@bigquery/entries/t',
+                dataplex_service=Mock()
+            )
+
+    def test_full_resource_name_in_id_is_checked_against_name(self, monkeypatch):
+        """A full term resource name in the ID cell is used only if the Name names that term"""
+        checked = []
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'check_term_matches_display_identifier',
+            lambda s, name, term, id_cell, p='': checked.append((name, term, id_cell))
+        )
+        target_id = 'projects/p/locations/global/glossaries/g1/terms/t2'
+
+        result = entrylinks_import._resolve_target_entry_name(
+            'p.global.Sales.Revenue', target_id=target_id, dataplex_service=Mock(), user_project='p'
+        )
+
+        assert result.endswith('/entries/projects/p/locations/global/glossaries/g1/terms/t2')
+        assert checked == [('p.global.Sales.Revenue', target_id, target_id)]
+
+    def test_full_resource_name_in_id_that_does_not_match_name_fails(self, monkeypatch):
+        def raise_mismatch(s, name, term, id_cell, p=''):
+            raise TermNameMismatchError(name, id_cell, 'Sales.Gross Revenue')
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'check_term_matches_display_identifier', raise_mismatch)
+        target_id = 'projects/p/locations/global/glossaries/g1/terms/t2'
+
+        with pytest.raises(ValueError) as exc_info:
+            entrylinks_import._resolve_target_entry_name(
+                'p.global.Sales.Net Revenue', target_id=target_id, dataplex_service=Mock()
+            )
+        assert str(exc_info.value) == (
+            f"Target Name 'p.global.Sales.Net Revenue' does not match Target ID '{target_id}' "
+            f"('Sales.Gross Revenue'). Update or clear Target ID."
+        )
+
+    @pytest.mark.parametrize('term_id, ok', [
+        ('t2', True),
+        ('T2', True),
+        ('projects/p/locations/global/glossaries/g1/terms/t2', True),
+        ('t3', False),
+        ('projects/p/locations/global/glossaries/g2/terms/t2', False),
+    ])
+    def test_id_next_to_full_resource_name_in_name_must_name_the_same_term(self, term_id, ok):
+        name = 'projects/p/locations/global/glossaries/g1/terms/t2'
+        if ok:
+            assert entrylinks_import._resolve_target_entry_name(name, target_id=term_id).endswith('/g1/terms/t2')
+        else:
+            with pytest.raises(ValueError, match='name different terms'):
+                entrylinks_import._resolve_target_entry_name(name, target_id=term_id)
+
 
 class TestBuildEntryLinkFailures:
     """Rows that can't be imported are reported with their row number and the reason"""
@@ -1014,7 +1081,8 @@ class TestConfirmImport:
             "2 row(s) can't be imported and will be skipped:",
             '  - Row 3: Invalid entry link type',
             '  - Row 5: Target ID is required',
-            '1 referenced entry(ies) were not found in Dataplex; entry links that use them may fail during import:',
+            "1 referenced entry(ies) were not found in Dataplex, or you don't have permission to read them; "
+            'entry links that use them may fail during import:',
             f'  - {TERM_ENTRY}',
         ]
 

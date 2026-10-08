@@ -22,10 +22,12 @@ from .constants import (
     CLOUD_RESOURCE_MANAGER_BASE_URL,
     DATAPLEX_BASE_URL,
     ENTRY_NAME_PATTERN,
+    ENTRY_READ_API_CALL_DELAY_SECONDS,
     EXCLUDED_LOCATIONS,
     PAGE_SIZE,
     PLAIN_BIGQUERY_ENTRY_ID_PATTERN,
     PROJECT_PATTERN,
+    SEARCH_API_CALL_DELAY_SECONDS,
     TERM_NAME_PATTERN,
 )
 from .error import (
@@ -142,11 +144,38 @@ def _get_or_fetch(cache: dict, key: Any, fetch: Callable[[], Any]) -> Any:
     return value
 
 
-# Global throttle lock for lookupEntryLinks API calls.
-# Ensures a minimum delay of API_CALL_DELAY_SECONDS (240ms) between
-# consecutive calls across all threads, keeping within the 500 QPM quota.
-_entry_links_throttle_lock = threading.Lock()
-_last_entry_links_call_time = 0.0
+class _RateLimiter:
+    """Spaces the calls to one API at least `min_interval_seconds` apart across all threads.
+
+    Worker threads resolve sheet rows and look up entry links in parallel; without a shared
+    limiter they could exceed the per-user Dataplex quotas (see the *_DELAY_SECONDS constants).
+    """
+
+    def __init__(self, min_interval_seconds: float):
+        self.min_interval_seconds = min_interval_seconds
+        self._lock = threading.Lock()
+        self._last_call_time = float('-inf')
+
+    def wait(self) -> None:
+        """Block until the next call is allowed, then record it."""
+        with self._lock:
+            delay = self._last_call_time + self.min_interval_seconds - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            self._last_call_time = time.monotonic()
+
+
+_entry_links_rate_limiter = _RateLimiter(API_CALL_DELAY_SECONDS)  # lookupEntryLinks
+_search_rate_limiter = _RateLimiter(SEARCH_API_CALL_DELAY_SECONDS)  # searchEntries
+_entry_read_rate_limiter = _RateLimiter(ENTRY_READ_API_CALL_DELAY_SECONDS)  # lookupEntry
+
+
+def _execute_rate_limited(rate_limiter: _RateLimiter, request, description: str) -> Any:
+    """Execute a Google API client request with retries, waiting for `rate_limiter` before every attempt."""
+    def attempt():
+        rate_limiter.wait()
+        return request.execute()
+    return execute_with_retry(attempt, description)
 
 
 def initialize_locations_cache(user_project: str) -> List[str]:
@@ -226,21 +255,6 @@ def parse_entry_name(entry_name: str) -> tuple:
     )
 
 
-def _throttle_entry_links_call():
-    """Enforce minimum delay between consecutive lookupEntryLinks API calls.
-    
-    With API_CALL_DELAY_SECONDS=0.24s and 5 threads, each thread effectively
-    waits ~1.2s, yielding ~250 QPM — safely within the 500 QPM quota.
-    """
-    global _last_entry_links_call_time
-    with _entry_links_throttle_lock:
-        now = time.time()
-        elapsed = now - _last_entry_links_call_time
-        if elapsed < API_CALL_DELAY_SECONDS:
-            time.sleep(API_CALL_DELAY_SECONDS - elapsed)
-        _last_entry_links_call_time = time.time()
-
-
 def _fetch_entry_links_page(
     term_entry_name: str, 
     project_id: str, 
@@ -252,7 +266,7 @@ def _fetch_entry_links_page(
     
     Applies throttling to stay within the 500 QPM lookupEntryLinks quota.
     """
-    _throttle_entry_links_call()
+    _entry_links_rate_limiter.wait()
     lookup_url = build_entry_link_lookup_url(term_entry_name, project_id, location_id, page_token=page_token)
     
     api_response = fetch_api_response(
@@ -319,13 +333,17 @@ def build_entry_link_lookup_url(
     return url
 
 def lookup_entry(dataplex_service: build, entry_name: str, project_location_name: str) -> Optional[Dict]:
-    """Looks up an entry using the Dataplex API."""
+    """Looks up an entry using the Dataplex API.
+
+    Returns None if the entry doesn't exist or can't be read: lookupEntry answers both with 403
+    (permission denied), so they can't be told apart. Callers report such entries.
+    """
     logger.debug(f"Request: lookupEntry(entry={entry_name}, location={project_location_name})")
     try:
         request = dataplex_service.projects().locations().lookupEntry(
             name=project_location_name, entry=entry_name, view="ALL"
         )
-        response = execute_with_retry(request.execute, f"Lookup entry {entry_name}")
+        response = _execute_rate_limited(_entry_read_rate_limiter, request, f"Lookup entry {entry_name}")
         logger.debug(f"Response: found entry {response.get('name', 'N/A')}")
         return response
     except HttpError as e:
@@ -333,7 +351,7 @@ def lookup_entry(dataplex_service: build, entry_name: str, project_location_name
         if status_code == 404:
             return None
         if status_code in (401, 403):
-            logger.warning(f"Permission denied for entry {entry_name}")
+            logger.debug(f"Entry {entry_name} not found, or no permission to read it (HTTP {status_code})")
             return None
         raise
 
@@ -515,10 +533,36 @@ def list_glossaries(dataplex_service: build, parent: str) -> List[Dict]:
     return list(_get_or_fetch(_project_glossaries_cache, parent, fetch))
 
 
+def _is_glossary_display_name_shared(dataplex_service: build, glossary_name: str, display_name: str) -> bool:
+    """Whether another glossary in the same project and location has this display name.
+
+    The import can't tell such glossaries apart by display name (see _glossary_match_rank), so
+    the export names them by glossary ID instead. If the glossaries can't be listed (for a reason
+    other than an outage), the display name is kept.
+    """
+    parent, glossary_id = glossary_name.rsplit('/glossaries/', 1)
+    try:
+        glossaries = list_glossaries(dataplex_service, parent)
+    except Exception as e:
+        if is_transient_error(e):
+            raise
+        logger.warning(f"Could not list the glossaries of {parent} to check that '{display_name}' is unique: {e}")
+        return False
+    return any(
+        (other.get('displayName') or '').strip() == display_name.strip()
+        and other.get('name', '').split('/')[-1] != glossary_id
+        for other in glossaries
+    )
+
+
 def resolve_term_entry_to_display_identifier(
     dataplex_service: build, term_entry_name: str, user_project: str = ""
 ) -> str:
-    """Resolves a Dataplex term entry resource name into '<project>.<location>.<glossaryDisplayName>.<termDisplayName>'."""
+    """Resolves a Dataplex term entry resource name into '<project>.<location>.<glossaryDisplayName>.<termDisplayName>'.
+
+    If another glossary in the same project and location has the same display name, the glossary
+    ID is used instead of the display name, so that the import finds the right glossary.
+    """
     term_resource_name = business_glossary_utils.extract_term_resource_from_entry_name(term_entry_name)
 
     match = TERM_NAME_PATTERN.match(term_resource_name)
@@ -543,6 +587,10 @@ def resolve_term_entry_to_display_identifier(
     term = get_term(dataplex_service, term_resource_name)
 
     glossary_display_name = glossary.get('displayName') or glossary_id
+    if glossary_display_name != glossary_id and _is_glossary_display_name_shared(
+        dataplex_service, glossary_resource_name, glossary_display_name
+    ):
+        glossary_display_name = glossary_id
     term_display_name = term.get('displayName') or match.group('term_id')
 
     return business_glossary_utils.format_term_display_identifier(
@@ -567,7 +615,9 @@ def get_entry_fqn(dataplex_service: build, entry_resource_name: str, user_projec
     """Resolve an entry resource name to its Fully Qualified Name (FQN) with caching.
 
     The FQNs of BigQuery datasets and tables with plain names are built from the entry name.
-    Other entries are looked up under the user project first, then under the entry's own project.
+    Other entries are looked up once, under the user project (or the entry's own project if
+    there is no user project): that project is only billed for the call, while read access is
+    checked on the entry itself.
     Returns the entry resource name itself (warning once) if the entry has no FQN or cannot be read.
     """
     plain_fqn = _plain_bigquery_fqn(entry_resource_name)
@@ -576,14 +626,17 @@ def get_entry_fqn(dataplex_service: build, entry_resource_name: str, user_projec
 
     def fetch() -> Optional[str]:
         project_id, location_id, _, _ = parse_entry_name(entry_resource_name)
-        entry_dict = None
-        for project in dict.fromkeys(p for p in (user_project, project_id) if p):
-            entry_dict = lookup_entry(dataplex_service, entry_resource_name, f"projects/{project}/locations/{location_id}")
-            if entry_dict:
-                break
+        entry_dict = lookup_entry(
+            dataplex_service, entry_resource_name, f"projects/{user_project or project_id}/locations/{location_id}"
+        )
         fqn = entry_dict.get("fullyQualifiedName") if entry_dict else None
-        if not fqn:
-            logger.warning(f"Could not retrieve fullyQualifiedName for entry {entry_resource_name}, falling back to entry name.")
+        if not entry_dict:
+            logger.warning(
+                f"Could not read entry {entry_resource_name} (not found, or no permission to read it); "
+                f"writing the entry name instead of its FQN."
+            )
+        elif not fqn:
+            logger.warning(f"Entry {entry_resource_name} has no fullyQualifiedName; writing the entry name instead.")
         return fqn or None
 
     return _get_or_fetch(_entry_to_fqn_cache, entry_resource_name, fetch) or entry_resource_name
@@ -755,9 +808,7 @@ def lookup_term_by_display_identifier(
     """
     cleaned_term_id = (term_id or "").strip()
     parsed = business_glossary_utils.parse_term_display_identifier(identifier, allow_three_part=True)
-    rest = identifier.strip().split(".", 2)[2]
-    splits = [(rest[:i].strip(), rest[i + 1:].strip()) for i, char in enumerate(rest) if char == "."]
-    splits.append((rest.strip(), ""))
+    splits = _name_splits(identifier)
 
     parent = f"projects/{parsed.project_id}/locations/{parsed.location}"
     candidates = _match_glossaries(list_glossaries(dataplex_service, parent), splits)
@@ -784,6 +835,73 @@ def lookup_term_by_display_identifier(
     if project_number:
         _known_entry_names.add(entry_name)
     return entry_name
+
+
+def _name_splits(identifier: str) -> List[tuple]:
+    """All (glossary part, term part) splits of a '<project>.<location>.<glossary>[.<term>]' Name.
+
+    Glossary and term display names may contain dots, so every dot after the location is a
+    possible split point; the last split has the whole rest as glossary part and no term part.
+    """
+    rest = identifier.strip().split(".", 2)[2]
+    splits = [(rest[:i].strip(), rest[i + 1:].strip()) for i, char in enumerate(rest) if char == "."]
+    splits.append((rest.strip(), ""))
+    return splits
+
+
+def _is_same_project(project: str, other_project: str, user_project: str = "") -> bool:
+    """Whether two project IDs or numbers name the same project.
+
+    A project ID and a project number are compared by looking up the number of the ID. If that
+    fails (for a reason other than an outage), they are assumed to be the same project.
+    """
+    if project == other_project or project.isdigit() == other_project.isdigit():
+        return project == other_project
+    project_id, project_number = (other_project, project) if project.isdigit() else (project, other_project)
+    try:
+        return get_project_number(project_id, user_project or project_id) == project_number
+    except Exception as e:
+        if is_transient_error(e):
+            raise
+        logger.warning(f"Could not resolve the project number of '{project_id}' to compare it with {project_number}: {e}")
+        return True
+
+
+def check_term_matches_display_identifier(
+    dataplex_service: build, identifier: str, term_resource_name: str, id_cell: str, user_project: str = ""
+) -> None:
+    """Check that a Name cell ('<project>.<location>.<glossary>[.<term>]') names the given term.
+
+    Used when the ID cell holds the term's full resource name: the Name's project and location
+    must be the term's, its glossary part must name the term's glossary (by display name or ID,
+    see _glossary_match_rank), and its term display name, if any, must be exactly the term's.
+
+    Raises:
+        InvalidTermIdentifierError: If the Name is malformed.
+        InvalidTermNameError: If `term_resource_name` is not a term resource name.
+        TermNameMismatchError: If the Name doesn't name this term.
+    """
+    parsed = business_glossary_utils.parse_term_display_identifier(identifier, allow_three_part=True)
+    match = TERM_NAME_PATTERN.match(term_resource_name)
+    if not match:
+        raise InvalidTermNameError(f"Invalid term resource name: {term_resource_name}")
+    glossary = get_glossary(
+        dataplex_service,
+        f"projects/{match.group('project_id')}/locations/{match.group('location_id')}/glossaries/{match.group('glossary_id')}",
+    )
+    term = get_term(dataplex_service, term_resource_name)
+    term_display_name = _term_display_name(term)
+    names_term = (
+        parsed.location == match.group('location_id')
+        and _is_same_project(parsed.project_id, match.group('project_id'), user_project)
+        and any(
+            _glossary_match_rank(glossary, glossary_part) is not None and term_part in ("", term_display_name)
+            for glossary_part, term_part in _name_splits(identifier)
+        )
+    )
+    if not names_term:
+        glossary_display_name = (glossary.get('displayName') or '').strip() or match.group('glossary_id')
+        raise TermNameMismatchError(identifier, id_cell, f"{glossary_display_name}.{term_display_name}")
 
 
 def normalize_entry_name_project_number(entry_name: str, user_project: str = "") -> str:
@@ -827,7 +945,7 @@ def _search_entry_by_fqn(dataplex_service: build, fqn: str, user_project: str) -
     logger.debug(f"Request: searchEntries({search_params})")
     try:
         request = dataplex_service.projects().locations().searchEntries(**search_params)
-        search_res = execute_with_retry(request.execute, f"Search entry by FQN {fqn}")
+        search_res = _execute_rate_limited(_search_rate_limiter, request, f"Search entry by FQN {fqn}")
     except Exception as e:
         raise DataplexAPIError(f"Search for entry with FQN '{fqn}' failed: {e}")
 
@@ -859,11 +977,15 @@ def _known_bigquery_table_location(fqn: str) -> Optional[str]:
     return _bigquery_dataset_locations.get(match.group('project_id', 'dataset_id'))
 
 
-def _read_bigquery_table_entry(dataplex_service: build, fqn: str, location_id: str) -> Optional[Dict]:
+def _read_bigquery_table_entry(dataplex_service: build, fqn: str, location_id: str, user_project: str) -> Optional[Dict]:
     """Read the entry of a BigQuery table FQN in `location_id`, or return None if it isn't there.
 
+    Uses lookupEntry under the user project, which checks read access to the table in BigQuery
+    (like the export), so no Dataplex role on the table's project is needed. lookupEntry answers
+    a missing table with 403 as well, so that can't be told apart from a denied read.
+
     Raises:
-        EntryFQNNotFoundError: If reading the table entry is not permitted.
+        EntryFQNNotFoundError: If the table entry doesn't exist or reading it is not permitted.
         DataplexAPIError: If reading the table entry fails for another reason.
     """
     project_id, dataset_id, table_id = BIGQUERY_FQN_PATTERN.match(fqn).group('project_id', 'dataset_id', 'table_id')
@@ -871,16 +993,20 @@ def _read_bigquery_table_entry(dataplex_service: build, fqn: str, location_id: s
         f"projects/{project_id}/locations/{location_id}/entryGroups/{BIGQUERY_SYSTEM_ENTRY_GROUP}/entries/"
         f"bigquery.googleapis.com/projects/{project_id}/datasets/{dataset_id}/tables/{table_id}"
     )
-    logger.debug(f"Request: entries.get(name={entry_name})")
+    lookup_scope = f"projects/{user_project or project_id}/locations/{location_id}"
+    logger.debug(f"Request: lookupEntry(name={lookup_scope}, entry={entry_name})")
     try:
-        request = dataplex_service.projects().locations().entryGroups().entries().get(name=entry_name)
-        return execute_with_retry(request.execute, f"Get BigQuery entry {entry_name}")
+        request = dataplex_service.projects().locations().lookupEntry(name=lookup_scope, entry=entry_name)
+        return _execute_rate_limited(_entry_read_rate_limiter, request, f"Look up BigQuery entry {entry_name}")
     except HttpError as e:
         status = getattr(e.resp, 'status', None)
         if status == 404:
             return None
         if status in (401, 403):
-            raise EntryFQNNotFoundError(f"Permission denied reading entry '{entry_name}' for FQN '{fqn}': {e}")
+            raise EntryFQNNotFoundError(
+                f"BigQuery table for FQN '{fqn}' not found, or permission denied reading its entry '{entry_name}' "
+                f"(reading it needs read access to the table, e.g. bigquery.tables.get): {e}"
+            )
         raise DataplexAPIError(f"Error reading entry '{entry_name}' for FQN '{fqn}': {e}")
     except Exception as e:
         raise DataplexAPIError(f"Error reading entry '{entry_name}' for FQN '{fqn}': {e}")
@@ -893,7 +1019,7 @@ def _get_bigquery_table_entry(dataplex_service: build, fqn: str, user_project: s
     usually is searchable already and tells which location the table entry is in.
 
     Raises:
-        EntryFQNNotFoundError: If reading the table entry is not permitted.
+        EntryFQNNotFoundError: If the table entry doesn't exist or reading it is not permitted.
         DataplexAPIError: If reading the table entry fails for another reason.
     """
     match = BIGQUERY_FQN_PATTERN.match(fqn)
@@ -905,7 +1031,7 @@ def _get_bigquery_table_entry(dataplex_service: build, fqn: str, user_project: s
     except EntryFQNNotFoundError:
         return None
     _, location_id, _, _ = parse_entry_name(dataset_entry['name'])
-    return _read_bigquery_table_entry(dataplex_service, fqn, location_id)
+    return _read_bigquery_table_entry(dataplex_service, fqn, location_id, user_project)
 
 
 def lookup_entry_by_fqn(dataplex_service: build, fqn: str, user_project: str) -> Dict:
@@ -925,7 +1051,7 @@ def lookup_entry_by_fqn(dataplex_service: build, fqn: str, user_project: str) ->
         known_location = _known_bigquery_table_location(fqn)
         if known_location:
             try:
-                entry = _read_bigquery_table_entry(dataplex_service, fqn, known_location)
+                entry = _read_bigquery_table_entry(dataplex_service, fqn, known_location, user_project)
             except EntryFQNNotFoundError as e:
                 read_error = e
         if not entry:

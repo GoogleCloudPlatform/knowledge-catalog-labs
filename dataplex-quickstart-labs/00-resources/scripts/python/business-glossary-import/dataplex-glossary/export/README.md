@@ -88,6 +88,19 @@ gcloud auth application-default login \
 export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT="${SA_EMAIL}"
 ```
 
+### Required permissions (EntryLinks export)
+
+The roles above cover the export. The individual permissions it uses are:
+
+| Used for | Permissions | Predefined role that includes them |
+|---|---|---|
+| Quota and billing of the API calls, on `--user-project` | `serviceusage.services.use` | Service Usage Consumer (`roles/serviceusage.serviceUsageConsumer`) |
+| Listing the glossary's terms and naming glossaries and terms in the sheet | `dataplex.glossaries.list`, `dataplex.glossaries.get`, `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Looking up the terms' entry links (`lookupEntryLinks`) and the FQNs of linked entries (`lookupEntry`, which checks access in the source system) | `dataplex.entries.get`, `dataplex.glossaryTerms.get`, and read access to the linked assets, e.g. `bigquery.tables.get` | Dataplex Catalog Viewer, BigQuery Metadata Viewer (`roles/bigquery.metadataViewer`) |
+| Writing project IDs instead of project numbers | `resourcemanager.projects.get` on the projects of the glossaries and assets | Browser (`roles/browser`) |
+
+Links that can't be read with these permissions are left out of the export or written with the raw entry name (see below).
+
 ---
 
 ## 1. Glossary Export

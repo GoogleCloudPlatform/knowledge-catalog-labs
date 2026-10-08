@@ -91,6 +91,15 @@ PAGE_SIZE = 1000
 # yielding ~250 QPM — safely within the 500 QPM per-project/user/region quota.
 API_CALL_DELAY_SECONDS = 0.24
 
+# Minimum delay between consecutive searchEntries calls across all threads: at most 600 per
+# minute, below the default Dataplex search quota of 900 per minute per project per user
+# (1,200 per minute per project).
+SEARCH_API_CALL_DELAY_SECONDS = 0.1
+
+# Minimum delay between consecutive lookupEntry calls across all threads: at most 600 per minute,
+# well within the default quota for reading entries.
+ENTRY_READ_API_CALL_DELAY_SECONDS = 0.1
+
 # Symmetric link types (A,B) and (B,A) are equivalent
 SYMMETRIC_LINK_TYPES = {"synonym", "related"}
 PROJECT_NUMBER = "655216118709"
