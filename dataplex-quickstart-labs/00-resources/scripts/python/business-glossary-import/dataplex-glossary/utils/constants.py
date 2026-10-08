@@ -91,6 +91,15 @@ PAGE_SIZE = 1000
 # yielding ~250 QPM — safely within the 500 QPM per-project/user/region quota.
 API_CALL_DELAY_SECONDS = 0.24
 
+# Minimum delay between consecutive searchEntries calls across all threads: at most 600 per
+# minute, below the default Dataplex search quota of 900 per minute per project per user
+# (1,200 per minute per project).
+SEARCH_API_CALL_DELAY_SECONDS = 0.1
+
+# Minimum delay between consecutive lookupEntry calls across all threads: at most 600 per minute,
+# well within the default quota for reading entries.
+ENTRY_READ_API_CALL_DELAY_SECONDS = 0.1
+
 # Symmetric link types (A,B) and (B,A) are equivalent
 SYMMETRIC_LINK_TYPES = {"synonym", "related"}
 PROJECT_NUMBER = "655216118709"
@@ -120,3 +129,29 @@ LINK_TYPES = {
     DP_LINK_TYPE_SYNONYM: 'projects/dataplex-types/locations/global/entryLinkTypes/synonym',
     DP_LINK_TYPE_RELATED: 'projects/dataplex-types/locations/global/entryLinkTypes/related'
 }
+
+# --- BigQuery Patterns ---
+# Plain BigQuery FQN: bigquery:project.dataset or bigquery:project.dataset.table
+BIGQUERY_FQN_PATTERN = re.compile(r"^bigquery:(?P<project_id>[^.:`]+)\.(?P<dataset_id>[^.:`]+)(?:\.(?P<table_id>[^.:`]+))?$")
+# Entry ID of a BigQuery dataset or table entry in the @bigquery entry group
+BIGQUERY_ENTRY_ID_PATTERN = re.compile(r"bigquery\.googleapis\.com/projects/(?P<project_id>[^/]+)/datasets/(?P<dataset_id>[^/]+)(?:/[^/]+/(?P<table_id>[^/]+))?$")
+# Entry ID of a BigQuery dataset or table whose names need no backticks in its FQN, which is then
+# bigquery:project.dataset[.table]. Other entries have other FQNs: date-sharded tables (entry IDs
+# ending in '@BigQueryDateShardedTable'), routines, and names with reserved characters.
+PLAIN_BIGQUERY_ENTRY_ID_PATTERN = re.compile(
+    r"^bigquery\.googleapis\.com/projects/(?P<project_id>[a-z][a-z0-9-]*)"
+    r"/datasets/(?P<dataset_id>[A-Za-z0-9_]+)(?:/tables/(?P<table_id>[A-Za-z0-9_-]+))?$"
+)
+
+# --- Google Sheets Headers ---
+ENTRYLINK_SHEET_HEADERS = ["Entry link type", "Source Name", "Source ID", "Column", "Target Name", "Target ID"]
+
+# Accepted (lowercased) header names. The snake_case aliases are the headers
+# written by earlier versions of the export (entry_link_type, source_entry,
+# target_entry, source_path), so those sheets can still be imported.
+TYPE_HEADER_ALIASES = ["entry link type", "entry_link_type"]
+SOURCE_NAME_HEADER_ALIASES = ["source name", "source_entry"]
+SOURCE_ID_HEADER_ALIASES = ["source id"]
+COLUMN_HEADER_ALIASES = ["column", "source_path"]
+TARGET_NAME_HEADER_ALIASES = ["target name", "target_entry"]
+TARGET_ID_HEADER_ALIASES = ["target id"]

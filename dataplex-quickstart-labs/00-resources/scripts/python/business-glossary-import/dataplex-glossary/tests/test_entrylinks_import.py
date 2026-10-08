@@ -5,15 +5,20 @@ Test coverage:
 - Input helpers (_read_user_input_with_select)
 - Archive management (get_existing_archive_files, _remove_archive_files)
 - Entry parsing (_parse_source_entry_components, _generate_entrylink_name)
-- Path formatting (_format_source_path_for_bigquery)
-- Definition references (_build_definition_references)
+- Entry references (build_entry_references, _build_definition_references)
 - Link type extraction (_extract_normalized_link_type)
 - Entrylink grouping (_add_entrylink_to_group)
+- Row resolution (_resolve_source_entry_name, _resolve_target_entry_name, build_entry_link,
+  convert_spreadsheet_to_entrylinks)
+- Import validation (check_entry_existence, confirm_import)
 - Import workflow (_run_import_workflow, main)
 """
 
 import sys
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch, call
 import pytest
 
@@ -26,6 +31,22 @@ spec = importlib.util.spec_from_file_location(
 )
 entrylinks_import = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(entrylinks_import)
+
+from utils.error import EntryFQNNotFoundError, TermNameMismatchError, TransientAPIError
+from utils.models import EntryLink, EntryReference, SpreadsheetRow
+
+TABLE_ENTRY = (
+    'projects/123/locations/us/entryGroups/@bigquery/entries/'
+    'bigquery.googleapis.com/projects/proj/datasets/ds/tables/orders'
+)
+TERM_ENTRY = (
+    'projects/123/locations/global/entryGroups/@dataplex/entries/'
+    'projects/123/locations/global/glossaries/g1/terms/order_id'
+)
+OTHER_TERM_ENTRY = (
+    'projects/123/locations/global/entryGroups/@dataplex/entries/'
+    'projects/123/locations/global/glossaries/g1/terms/order_number'
+)
 
 
 # ============================================================================
@@ -208,67 +229,39 @@ class TestGenerateEntrylinkName:
 
 
 # ============================================================================
-# PATH FORMATTING TESTS  
+# ENTRY REFERENCES TESTS
 # ============================================================================
 
-class TestFormatSourcePathForBigquery:
-    """Test _format_source_path_for_bigquery function"""
+class TestBuildEntryReferences:
+    """Test build_entry_references and _build_definition_references functions"""
     
-    def test_formats_simple_bigquery_path(self):
-        """Format simple BigQuery dataset.table path"""
-        result = entrylinks_import._format_source_path_for_bigquery(
-            'datasets/my_dataset/tables/my_table', '@bigquery'
-        )
+    def test_definition_link_has_source_column_and_target(self):
+        """Definition links reference the data asset (with the column path) as SOURCE and the term as TARGET"""
+        result = entrylinks_import.build_entry_references(TABLE_ENTRY, TERM_ENTRY, 'order_id', 'definition')
         
-        assert 'Schema.' in result
+        assert [ref.to_dict() for ref in result] == [
+            {'name': TABLE_ENTRY, 'path': 'Schema.order_id', 'type': 'SOURCE'},
+            {'name': TERM_ENTRY, 'type': 'TARGET'},
+        ]
     
-    def test_handles_non_bigquery_entry_group(self):
-        """Non-bigquery entry group should return path as-is"""
-        result = entrylinks_import._format_source_path_for_bigquery(
-            'some/path', 'custom_group'
-        )
+    def test_definition_link_without_column_applies_to_whole_asset(self):
+        """Without a column the source reference has no path"""
+        result = entrylinks_import._build_definition_references(TABLE_ENTRY, TERM_ENTRY)
         
-        assert isinstance(result, str)
-        assert result == 'some/path'
-
-
-# ============================================================================
-# DEFINITION REFERENCES TESTS
-# ============================================================================
-
-class TestBuildDefinitionReferences:
-    """Test _build_definition_references function"""
+        assert result[0].path == ''
     
-    def test_creates_source_reference(self):
-        """Should create a source reference entry"""
-        from utils.models import SpreadsheetRow
-        row = SpreadsheetRow(
-            entry_link_type='definition',
-            source_entry='projects/proj/locations/us/entryGroups/bigquery/entries/tables/t1',
-            target_entry='projects/proj/locations/us/entryGroups/@dataplex/entries/target',
-            source_path='/project.dataset.table'
-        )
+    def test_column_with_schema_prefix_is_not_prefixed_again(self):
+        """A column already given as a 'Schema.' path is used as is"""
+        result = entrylinks_import.build_entry_references(TABLE_ENTRY, TERM_ENTRY, 'Schema.order_id', 'definition')
         
-        result = entrylinks_import._build_definition_references(row, 'bigquery')
-        
-        assert isinstance(result, list)
-        assert len(result) == 2
+        assert result[0].path == 'Schema.order_id'
     
-    def test_includes_target_reference(self):
-        """Result should reference target entry"""
-        from utils.models import SpreadsheetRow
-        row = SpreadsheetRow(
-            entry_link_type='definition',
-            source_entry='projects/proj/locations/us/entryGroups/bigquery/entries/tables/t1',
-            target_entry='target_entry_name',
-            source_path='/path'
-        )
+    @pytest.mark.parametrize('link_type', ['synonym', 'related'])
+    def test_term_links_ignore_column(self, link_type):
+        """Synonym and related links have no direction and no column"""
+        result = entrylinks_import.build_entry_references(TERM_ENTRY, OTHER_TERM_ENTRY, 'order_id', link_type)
         
-        result = entrylinks_import._build_definition_references(row, 'bigquery')
-        
-        # Find reference that contains target
-        has_target = any('target_entry_name' in str(ref) for ref in result)
-        assert has_target
+        assert [ref.to_dict() for ref in result] == [{'name': TERM_ENTRY}, {'name': OTHER_TERM_ENTRY}]
 
 
 # ============================================================================
@@ -440,6 +433,16 @@ class TestImportEntryLinksToDataplex:
         # Should not raise, but handle error gracefully
 
 
+ENTRY_LINK = EntryLink(
+    name='projects/123/locations/us/entryGroups/@bigquery/entryLinks/link1',
+    entryLinkType='projects/dataplex-types/locations/global/entryLinkTypes/definition',
+    entryReferences=[
+        EntryReference(name=TABLE_ENTRY, path='Schema.order_id', type='SOURCE'),
+        EntryReference(name=TERM_ENTRY, type='TARGET'),
+    ],
+)
+
+
 class TestRunImportWorkflow:
     """Test _run_import_workflow function"""
     
@@ -452,12 +455,652 @@ class TestRunImportWorkflow:
         monkeypatch.setattr(entrylinks_import.sheet_utils, 'get_sheet_name_for_url', lambda url: 'Sheet1')
         monkeypatch.setattr(entrylinks_import.api_layer, 'authenticate_dataplex', MagicMock)
         monkeypatch.setattr(entrylinks_import, 'check_and_clean_archive_folder', lambda d: True)
-        monkeypatch.setattr(entrylinks_import, 'convert_spreadsheet_to_entrylinks', lambda url, sheet_name: [])
+        monkeypatch.setattr(entrylinks_import, 'convert_spreadsheet_to_entrylinks', lambda *args, **kwargs: [])
         
         result = entrylinks_import._run_import_workflow(mock_parsed_args)
         
         assert result == 1
 
+    def run_workflow(self, monkeypatch, entrylinks, failed_rows=(), missing_entries=(), user_response='y'):
+        """Run the workflow with mocked dependencies. Returns (exit code, prompt mock, import mock)."""
+        def mock_convert(spreadsheet_url, **kwargs):
+            self.convert_kwargs = kwargs
+            kwargs['failed_rows'].extend(failed_rows)
+            return list(entrylinks)
+
+        mock_prompt = MagicMock(return_value=user_response)
+        mock_execute = MagicMock(return_value=0)
+        monkeypatch.setattr(entrylinks_import.sheet_utils, 'get_sheet_name_for_url', lambda url: 'Sheet1')
+        monkeypatch.setattr(entrylinks_import.api_layer, 'authenticate_dataplex', MagicMock())
+        monkeypatch.setattr(entrylinks_import, 'check_and_clean_archive_folder', lambda d: True)
+        monkeypatch.setattr(entrylinks_import, 'convert_spreadsheet_to_entrylinks', mock_convert)
+        monkeypatch.setattr(entrylinks_import, '_validate_bucket_permissions_for_projects', lambda *args: True)
+        monkeypatch.setattr(entrylinks_import, 'check_entry_existence', lambda links: (set(missing_entries), set()))
+        monkeypatch.setattr(entrylinks_import, 'get_user_input_with_timeout', mock_prompt)
+        monkeypatch.setattr(entrylinks_import, '_execute_import', mock_execute)
+
+        parsed_args = SimpleNamespace(
+            spreadsheet_url='https://docs.google.com/spreadsheets/d/abc/edit', buckets=['bucket'], user_project='my-project'
+        )
+        return entrylinks_import._run_import_workflow(parsed_args), mock_prompt, mock_execute
+
+    def test_returns_1_without_prompt_when_no_row_can_be_imported(self, monkeypatch):
+        """If every row fails, the reasons are logged as errors and nothing is imported"""
+        errors = []
+        monkeypatch.setattr(entrylinks_import.logger, 'error', errors.append)
+
+        result, mock_prompt, mock_execute = self.run_workflow(
+            monkeypatch, entrylinks=[], failed_rows=[(2, 'Target ID is required')]
+        )
+
+        assert result == 1
+        mock_prompt.assert_not_called()
+        mock_execute.assert_not_called()
+        assert errors == ['None of the 1 row(s) can be imported:', '  - Row 2: Target ID is required']
+
+    def test_imports_without_prompt_when_nothing_to_report(self, monkeypatch):
+        """No failed rows and no missing entries: import right away"""
+        result, mock_prompt, mock_execute = self.run_workflow(monkeypatch, entrylinks=[ENTRY_LINK])
+
+        assert result == 0
+        mock_prompt.assert_not_called()
+        mock_execute.assert_called_once_with([ENTRY_LINK], ['bucket'])
+
+    def test_asks_once_and_imports_when_confirmed(self, monkeypatch):
+        """Failed rows and missing entries are confirmed with a single prompt"""
+        result, mock_prompt, mock_execute = self.run_workflow(
+            monkeypatch, entrylinks=[ENTRY_LINK], failed_rows=[(3, 'Invalid entry link type')],
+            missing_entries=[TERM_ENTRY], user_response='y'
+        )
+
+        assert result == 0
+        mock_prompt.assert_called_once()
+        mock_execute.assert_called_once_with([ENTRY_LINK], ['bucket'])
+
+    def test_returns_1_when_declined(self, monkeypatch):
+        """Declining the prompt (or letting it time out) aborts the import with exit code 1"""
+        result, mock_prompt, mock_execute = self.run_workflow(
+            monkeypatch, entrylinks=[ENTRY_LINK], missing_entries=[TERM_ENTRY], user_response=''
+        )
+
+        assert result == 1
+        mock_prompt.assert_called_once()
+        mock_execute.assert_not_called()
+
+    def test_does_not_share_its_dataplex_client_with_worker_threads(self, monkeypatch):
+        """Rows are resolved in parallel, and a Dataplex client can't be used by several threads"""
+        self.run_workflow(monkeypatch, entrylinks=[ENTRY_LINK])
+
+        assert 'dataplex_service' not in self.convert_kwargs
+
+
+class TestResolutionHelpers:
+    """Test resolution of the Name / ID cells to Dataplex entry names"""
+
+    @pytest.fixture(autouse=True)
+    def setup_api_layer_mocks(self, monkeypatch):
+        monkeypatch.setattr(entrylinks_import.api_layer, 'get_project_number', lambda p, u=None: p)
+
+    def test_resolve_source_entry_passthrough_full_path(self):
+        """Full entry paths starting with projects/ should pass through unchanged"""
+        full_path = 'projects/p/locations/l/entryGroups/@dataplex/entries/.../terms/t'
+        result = entrylinks_import._resolve_source_entry_name(full_path, 'definition')
+        assert result == full_path
+
+    def test_resolve_source_entry_definition_fqn(self, monkeypatch):
+        """Definition sources are looked up by the FQN in Source Name (Source ID is informational)"""
+        mock_service = Mock()
+        looked_up = []
+
+        def fake_lookup_entry(s, fqn, p):
+            looked_up.append((fqn, p))
+            return {'name': TABLE_ENTRY, 'fullyQualifiedName': fqn}
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_entry_by_fqn', fake_lookup_entry)
+        result = entrylinks_import._resolve_source_entry_name(
+            'bigquery:proj.ds.orders', 'definition', source_id='proj.ds.orders',
+            dataplex_service=mock_service, user_project='my_proj'
+        )
+        assert result == TABLE_ENTRY
+        assert looked_up == [('bigquery:proj.ds.orders', 'my_proj')]
+
+    def test_resolve_source_entry_synonym_identifier(self, monkeypatch):
+        """Synonym source terms are resolved via lookup_term_by_display_identifier using the Source ID"""
+        mock_service = Mock()
+        captured = []
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured.append((identifier, p, term_id))
+            return TERM_ENTRY
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_term_by_display_identifier', fake_lookup_term)
+        result = entrylinks_import._resolve_source_entry_name(
+            'my_proj.global.Sales.Order ID', 'synonym', source_id='order_id',
+            dataplex_service=mock_service, user_project='my_proj'
+        )
+        assert result == TERM_ENTRY
+        assert captured == [('my_proj.global.Sales.Order ID', 'my_proj', 'order_id')]
+
+    def test_resolve_target_entry_identifier(self, monkeypatch):
+        """Target terms are resolved via lookup_term_by_display_identifier using the Target ID"""
+        mock_service = Mock()
+        captured = []
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured.append((identifier, p, term_id))
+            return OTHER_TERM_ENTRY
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_term_by_display_identifier', fake_lookup_term)
+        result = entrylinks_import._resolve_target_entry_name(
+            'my_proj.global.Sales.Order Number', target_id='order_number',
+            dataplex_service=mock_service, user_project='my_proj'
+        )
+        assert result == OTHER_TERM_ENTRY
+        assert captured == [('my_proj.global.Sales.Order Number', 'my_proj', 'order_number')]
+
+    @pytest.mark.parametrize('name, term_id, message', [
+        ('my_proj.global.Sales', '', 'Target ID is required'),
+        ('', 'order_id', 'Target Name is required'),
+    ])
+    def test_resolve_term_requires_name_and_term(self, name, term_id, message):
+        """Name selects the glossary; the term needs the ID or a term display name in Name"""
+        with pytest.raises(ValueError, match=message):
+            entrylinks_import._resolve_target_entry_name(name, target_id=term_id, dataplex_service=Mock())
+
+    def test_resolve_term_by_name_without_id(self, monkeypatch):
+        """A 4-part Name without an ID is looked up by the term display name"""
+        captured = []
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured.append((identifier, term_id))
+            return TERM_ENTRY
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_term_by_display_identifier', fake_lookup_term)
+
+        result = entrylinks_import._resolve_target_entry_name(
+            'my_proj.global.Sales.Order ID', target_id='', dataplex_service=Mock()
+        )
+
+        assert result == TERM_ENTRY
+        assert captured == [('my_proj.global.Sales.Order ID', '')]
+
+    def test_name_id_mismatch_names_the_cells(self, monkeypatch):
+        """A Name that doesn't match the term found by ID fails with the Source/Target cell names"""
+        def raise_mismatch(s, identifier, p="", term_id=""):
+            raise TermNameMismatchError('Net Revenue', 'gross-revenue', 'Gross Revenue')
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_term_by_display_identifier', raise_mismatch)
+
+        with pytest.raises(ValueError) as exc_info:
+            entrylinks_import._resolve_target_entry_name(
+                'my_proj.global.Finance.Net Revenue', target_id='gross-revenue', dataplex_service=Mock()
+            )
+        assert str(exc_info.value) == (
+            "Target Name 'Net Revenue' does not match Target ID 'gross-revenue' ('Gross Revenue'). "
+            "Update or clear Target ID."
+        )
+
+    def test_resolve_definition_source_requires_name(self):
+        """The data asset of a definition link is found by its FQN, so Source Name is required"""
+        with pytest.raises(ValueError, match='Source Name is required'):
+            entrylinks_import._resolve_source_entry_name(
+                '', 'definition', source_id='proj.ds.orders', dataplex_service=Mock()
+            )
+
+    def test_build_entry_link_resolves_and_builds(self, monkeypatch):
+        """build_entry_link resolves the row's cells and creates the link in the source entry's group"""
+        mock_service = Mock()
+        captured_term_ids = []
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_entry_by_fqn',
+            lambda s, fqn, p: {'name': TABLE_ENTRY}
+        )
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured_term_ids.append((identifier, term_id))
+            return TERM_ENTRY
+
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
+            fake_lookup_term
+        )
+
+        row = SpreadsheetRow(
+            entry_link_type='definition',
+            source_name='bigquery:proj.ds.orders',
+            source_id='proj.ds.orders',
+            column='order_id',
+            target_name='my_proj.global.Sales.Order ID',
+            target_id='order_id'
+        )
+
+        link = entrylinks_import.build_entry_link(row, dataplex_service=mock_service, user_project='my_proj')
+        assert link.name.startswith('projects/123/locations/us/entryGroups/@bigquery/entryLinks/')
+        assert link.entryLinkType == 'projects/dataplex-types/locations/global/entryLinkTypes/definition'
+        assert [ref.to_dict() for ref in link.entryReferences] == [
+            {'name': TABLE_ENTRY, 'path': 'Schema.order_id', 'type': 'SOURCE'},
+            {'name': TERM_ENTRY, 'type': 'TARGET'},
+        ]
+        assert captured_term_ids == [('my_proj.global.Sales.Order ID', 'order_id')]
+
+    def test_build_entry_link_synonym_passes_both_source_id_and_target_id(self, monkeypatch):
+        """Synonym link with 6 columns should pass both source_id and target_id to lookup_term_by_display_identifier"""
+        from utils.models import SpreadsheetRow
+        mock_service = Mock()
+        captured = []
+
+        def fake_lookup_term(s, identifier, p="", term_id=""):
+            captured.append((identifier, term_id))
+            return (
+                f'projects/p/locations/global/entryGroups/@dataplex/entries/'
+                f'projects/p/locations/global/glossaries/g1/terms/{term_id}'
+            )
+
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
+            fake_lookup_term
+        )
+
+        row = SpreadsheetRow(
+            entry_link_type='synonym',
+            source_name='my_proj.global.Sales.Order ID',
+            source_id='order_id_v1',
+            column='',
+            target_name='my_proj.global.Sales.Order ID',
+            target_id='order_id_v2'
+        )
+
+        link = entrylinks_import.build_entry_link(row, dataplex_service=mock_service, user_project='my_proj')
+        assert link is not None
+        assert captured == [
+            ('my_proj.global.Sales.Order ID', 'order_id_v1'),
+            ('my_proj.global.Sales.Order ID', 'order_id_v2'),
+        ]
+
+    def test_resolve_with_full_resource_ids(self):
+        """Resolving with full term resource names in ID columns generates correct entry names"""
+        source_id = 'projects/p/locations/global/glossaries/g1/terms/t1'
+        result = entrylinks_import._resolve_source_entry_name('', 'synonym', source_id=source_id)
+        assert 'entryGroups/@dataplex/entries/' in result
+        assert 'glossaries/g1/terms/t1' in result
+
+        target_id = 'projects/p/locations/global/glossaries/g1/terms/t2'
+        result = entrylinks_import._resolve_target_entry_name('', target_id=target_id)
+        assert 'entryGroups/@dataplex/entries/' in result
+        assert 'glossaries/g1/terms/t2' in result
+
+    def test_resolve_with_full_resource_name_in_name_cell(self):
+        """A full term resource name in the Name cell is used when the ID cell is empty"""
+        result = entrylinks_import._resolve_target_entry_name('projects/p/locations/global/glossaries/g1/terms/t2')
+        assert result == (
+            'projects/p/locations/global/entryGroups/@dataplex/entries/'
+            'projects/p/locations/global/glossaries/g1/terms/t2'
+        )
+
+    def test_definition_source_id_does_not_override_source_name(self, monkeypatch):
+        """Source ID is informational for definition links, even when it holds a full entry name"""
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_entry_by_fqn', lambda s, fqn, p: {'name': TABLE_ENTRY}
+        )
+        other_entry = 'projects/123/locations/us/entryGroups/@bigquery/entries/other'
+
+        result = entrylinks_import._resolve_source_entry_name(
+            'bigquery:proj.ds.orders', 'definition', source_id=other_entry, dataplex_service=Mock()
+        )
+
+        assert result == TABLE_ENTRY
+
+    def test_definition_source_needs_name_even_with_full_source_id(self):
+        with pytest.raises(ValueError, match='Source Name is required'):
+            entrylinks_import._resolve_source_entry_name(
+                '', 'definition', source_id='projects/123/locations/us/entryGroups/@bigquery/entries/t',
+                dataplex_service=Mock()
+            )
+
+    def test_full_resource_name_in_id_is_checked_against_name(self, monkeypatch):
+        """A full term resource name in the ID cell is used only if the Name names that term"""
+        checked = []
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'check_term_matches_display_identifier',
+            lambda s, name, term, id_cell, p='': checked.append((name, term, id_cell))
+        )
+        target_id = 'projects/p/locations/global/glossaries/g1/terms/t2'
+
+        result = entrylinks_import._resolve_target_entry_name(
+            'p.global.Sales.Revenue', target_id=target_id, dataplex_service=Mock(), user_project='p'
+        )
+
+        assert result.endswith('/entries/projects/p/locations/global/glossaries/g1/terms/t2')
+        assert checked == [('p.global.Sales.Revenue', target_id, target_id)]
+
+    def test_full_resource_name_in_id_that_does_not_match_name_fails(self, monkeypatch):
+        def raise_mismatch(s, name, term, id_cell, p=''):
+            raise TermNameMismatchError(name, id_cell, 'Sales.Gross Revenue')
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'check_term_matches_display_identifier', raise_mismatch)
+        target_id = 'projects/p/locations/global/glossaries/g1/terms/t2'
+
+        with pytest.raises(ValueError) as exc_info:
+            entrylinks_import._resolve_target_entry_name(
+                'p.global.Sales.Net Revenue', target_id=target_id, dataplex_service=Mock()
+            )
+        assert str(exc_info.value) == (
+            f"Target Name 'p.global.Sales.Net Revenue' does not match Target ID '{target_id}' "
+            f"('Sales.Gross Revenue'). Update or clear Target ID."
+        )
+
+    @pytest.mark.parametrize('term_id, ok', [
+        ('t2', True),
+        ('T2', True),
+        ('projects/p/locations/global/glossaries/g1/terms/t2', True),
+        ('t3', False),
+        ('projects/p/locations/global/glossaries/g2/terms/t2', False),
+    ])
+    def test_id_next_to_full_resource_name_in_name_must_name_the_same_term(self, term_id, ok):
+        name = 'projects/p/locations/global/glossaries/g1/terms/t2'
+        if ok:
+            assert entrylinks_import._resolve_target_entry_name(name, target_id=term_id).endswith('/g1/terms/t2')
+        else:
+            with pytest.raises(ValueError, match='name different terms'):
+                entrylinks_import._resolve_target_entry_name(name, target_id=term_id)
+
+
+class TestBuildEntryLinkFailures:
+    """Rows that can't be imported are reported with their row number and the reason"""
+
+    VALID_ROW = dict(
+        entry_link_type='definition', source_name='bigquery:proj.ds.orders', source_id='proj.ds.orders',
+        column='order_id', target_name='proj.global.Sales.Order ID', target_id='order_id', row_number=7
+    )
+
+    @pytest.fixture(autouse=True)
+    def setup_api_layer_mocks(self, monkeypatch):
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_entry_by_fqn', lambda s, fqn, p: {'name': TABLE_ENTRY})
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
+            lambda s, identifier, p="", term_id="": TERM_ENTRY
+        )
+
+    def build(self, failed_rows=None, **overrides):
+        row = SpreadsheetRow(**{**self.VALID_ROW, **overrides})
+        return entrylinks_import.build_entry_link(
+            row, dataplex_service=Mock(), user_project='my-project', failed_rows=failed_rows
+        )
+
+    def test_valid_row_is_not_recorded(self):
+        """A row that resolves builds a link and records nothing"""
+        failed_rows = []
+
+        assert self.build(failed_rows) is not None
+        assert failed_rows == []
+
+    @pytest.mark.parametrize('overrides, reason', [
+        ({'entry_link_type': 'defintion'}, "Invalid entry link type 'defintion'"),
+        ({'source_name': ''}, 'Source Name is required'),
+        ({'target_name': 'proj.global.Sales', 'target_id': ''}, 'Target ID is required'),
+        ({'entry_link_type': 'synonym', 'source_name': 'proj.global.Sales', 'source_id': ''},
+         'Source ID is required'),
+    ])
+    def test_invalid_row_is_recorded_with_reason(self, overrides, reason):
+        """The row number and the reason are recorded, and no link is built"""
+        failed_rows = []
+
+        assert self.build(failed_rows, **overrides) is None
+        assert len(failed_rows) == 1
+        row_number, recorded_reason = failed_rows[0]
+        assert row_number == 7
+        assert reason in recorded_reason
+
+    def test_unknown_data_asset_is_recorded(self, monkeypatch):
+        """A Source Name FQN that doesn't match any entry is recorded with the lookup error"""
+        def raise_not_found(s, fqn, p):
+            raise EntryFQNNotFoundError(f"Entry with FQN '{fqn}' not found in Dataplex under project '{p}'")
+
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_entry_by_fqn', raise_not_found)
+        failed_rows = []
+
+        assert self.build(failed_rows, source_name='bigquery:proj.ds.ordrs') is None
+        assert failed_rows == [
+            (7, "Entry with FQN 'bigquery:proj.ds.ordrs' not found in Dataplex under project 'my-project'")
+        ]
+
+    def test_reason_is_logged_without_failed_rows_list(self, monkeypatch):
+        """Without a failed_rows list the reason is logged as a warning"""
+        warnings = []
+        monkeypatch.setattr(entrylinks_import.logger, 'warning', warnings.append)
+
+        assert self.build(target_name='proj.global.Sales', target_id='') is None
+        assert len(warnings) == 1
+        assert warnings[0].startswith('Row 7 skipped: Target ID is required')
+
+    def test_outage_is_raised_instead_of_recorded(self, monkeypatch):
+        """Network or server errors that outlast the retries stop the import: the other rows would fail too"""
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_entry_by_fqn', Mock(side_effect=TransientAPIError('unavailable'))
+        )
+        failed_rows = []
+
+        with pytest.raises(TransientAPIError):
+            self.build(failed_rows)
+        assert failed_rows == []
+
+
+class TestConvertSpreadsheetToEntrylinks:
+    """Test convert_spreadsheet_to_entrylinks function"""
+
+    def test_converts_rows_and_collects_failed_rows(self, monkeypatch):
+        """Valid rows become entry links, blank rows are skipped and failed rows keep their sheet row number"""
+        sheet_data = [
+            ['Entry link type', 'Source Name', 'Source ID', 'Column', 'Target Name', 'Target ID'],
+            ['definition', 'bigquery:proj.ds.orders', 'proj.ds.orders', 'order_id', 'proj.global.Sales.Order ID', 'order_id'],
+            [],
+            # The Sheets API leaves out trailing empty cells, so this row has no Target ID cell (and
+            # its Target Name has no term display name to find the term by)
+            ['synonym', 'proj.global.Sales.Order ID', 'order_id', '', 'proj.global.Sales'],
+        ]
+        monkeypatch.setattr(
+            entrylinks_import.sheet_utils, 'read_from_spreadsheet_url', lambda url, sheet_name=None: sheet_data
+        )
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_entry_by_fqn', lambda s, fqn, p: {'name': TABLE_ENTRY})
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
+            lambda s, identifier, p="", term_id="": TERM_ENTRY
+        )
+        failed_rows = []
+
+        entrylinks = entrylinks_import.convert_spreadsheet_to_entrylinks(
+            'https://docs.google.com/spreadsheets/d/abc/edit',
+            dataplex_service=Mock(), user_project='my-project', failed_rows=failed_rows
+        )
+
+        assert [link.entryReferences[0].name for link in entrylinks] == [TABLE_ENTRY]
+        assert len(failed_rows) == 1
+        assert failed_rows[0][0] == 4
+        assert 'Target ID is required' in failed_rows[0][1]
+
+    @staticmethod
+    def _table_entry(fqn):
+        return TABLE_ENTRY.replace('/tables/orders', '/tables/' + fqn.rsplit('.', 1)[-1])
+
+    def convert_table_rows(self, monkeypatch, row_count, lookup_entry_by_fqn, **kwargs):
+        """Convert a sheet of definition rows for tables bigquery:proj.ds.t0, t1, ..."""
+        sheet_data = [['Entry link type', 'Source Name', 'Source ID', 'Column', 'Target Name', 'Target ID']] + [
+            ['definition', f'bigquery:proj.ds.t{i}', f'proj.ds.t{i}', '', 'proj.global.Sales.Order ID', 'order_id']
+            for i in range(row_count)
+        ]
+        monkeypatch.setattr(
+            entrylinks_import.sheet_utils, 'read_from_spreadsheet_url', lambda url, sheet_name=None: sheet_data
+        )
+        monkeypatch.setattr(entrylinks_import.api_layer, 'lookup_entry_by_fqn', lookup_entry_by_fqn)
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'lookup_term_by_display_identifier',
+            lambda s, identifier, p="", term_id="": TERM_ENTRY
+        )
+        return entrylinks_import.convert_spreadsheet_to_entrylinks(
+            'https://docs.google.com/spreadsheets/d/abc/edit', user_project='my-project', **kwargs
+        )
+
+    def test_keeps_row_order_when_rows_resolve_out_of_order(self, monkeypatch):
+        """Rows are resolved in parallel, and the entry links keep the order of the rows"""
+        resolved = []
+        others_resolved = threading.Event()
+
+        def lookup(service, fqn, project):
+            if fqn.endswith('.t0'):
+                others_resolved.wait(timeout=5)  # The first row is resolved last.
+            resolved.append(fqn)
+            if len(resolved) == 2:
+                others_resolved.set()
+            return {'name': self._table_entry(fqn)}
+
+        entrylinks = self.convert_table_rows(monkeypatch, 3, lookup, dataplex_service=Mock())
+
+        assert resolved[-1] == 'bigquery:proj.ds.t0'
+        assert [link.entryReferences[0].name for link in entrylinks] == [
+            self._table_entry(f'bigquery:proj.ds.t{i}') for i in range(3)
+        ]
+
+    def test_stops_resolving_rows_after_an_outage(self, monkeypatch):
+        """An outage error is raised, and rows whose resolution hasn't started are skipped"""
+        looked_up = []
+
+        def lookup(service, fqn, project):
+            looked_up.append(fqn)
+            if fqn.endswith('.t0'):
+                raise TransientAPIError('unavailable')
+            time.sleep(0.2)
+            return {'name': self._table_entry(fqn)}
+
+        failed_rows = []
+        with pytest.raises(TransientAPIError):
+            self.convert_table_rows(monkeypatch, 20, lookup, dataplex_service=Mock(), failed_rows=failed_rows)
+
+        assert len(looked_up) < 20
+        assert failed_rows == []
+
+    def test_interrupt_does_not_wait_for_rows_being_resolved(self, monkeypatch):
+        """Ctrl+C stops right away: rows being resolved are not waited for, and no other row starts"""
+        workers = entrylinks_import.MAX_WORKERS
+        started, failed_rows = [], []
+        release = threading.Event()
+
+        def lookup(service, fqn, project):
+            started.append(fqn)
+            release.wait(timeout=5)
+            raise ValueError('released')  # Ends the row without further (unmocked) lookups.
+
+        def interrupted_wait(futures, return_when):
+            deadline = time.monotonic() + 5
+            while len(started) < workers and time.monotonic() < deadline:
+                time.sleep(0.01)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(entrylinks_import, 'wait', interrupted_wait)
+        try:
+            begin = time.monotonic()
+            with pytest.raises(KeyboardInterrupt):
+                self.convert_table_rows(monkeypatch, 20, lookup, dataplex_service=Mock(), failed_rows=failed_rows)
+            assert time.monotonic() - begin < 2
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while len(failed_rows) < len(started) and time.monotonic() < deadline:
+                time.sleep(0.01)
+        assert len(started) == workers
+
+    def test_worker_threads_use_their_own_dataplex_clients(self, monkeypatch):
+        """Without a given Dataplex service, each worker thread uses its own client"""
+        used = []
+        monkeypatch.setattr(
+            entrylinks_import.api_layer, 'get_dataplex_service', lambda: f'client of {threading.current_thread().name}'
+        )
+
+        def lookup(service, fqn, project):
+            used.append((service, threading.current_thread().name))
+            return {'name': self._table_entry(fqn)}
+
+        self.convert_table_rows(monkeypatch, 3, lookup)
+
+        assert len(used) == 3
+        assert all(service == f'client of {thread}' for service, thread in used)
+        assert threading.main_thread().name not in {thread for _, thread in used}
+
+
+class TestCheckEntryExistence:
+    """Test check_entry_existence function"""
+
+    def test_only_looks_up_entries_not_confirmed_while_resolving_rows(self, monkeypatch):
+        """Entries found while resolving the sheet rows are not looked up again"""
+        looked_up = []
+        monkeypatch.setattr(entrylinks_import.api_layer, 'is_known_entry', lambda name: name == TABLE_ENTRY)
+        monkeypatch.setattr(
+            entrylinks_import, '_lookup_and_check_entry', lambda ref, missing, failed: looked_up.append(ref.name)
+        )
+
+        missing_entries, failed_entries = entrylinks_import.check_entry_existence([ENTRY_LINK])
+
+        assert looked_up == [TERM_ENTRY]
+        assert (missing_entries, failed_entries) == (set(), set())
+
+    def test_no_lookups_when_all_entries_are_known(self, monkeypatch):
+        """Nothing is looked up when every referenced entry was already found"""
+        mock_lookup = MagicMock()
+        monkeypatch.setattr(entrylinks_import.api_layer, 'is_known_entry', lambda name: True)
+        monkeypatch.setattr(entrylinks_import, '_lookup_and_check_entry', mock_lookup)
+
+        assert entrylinks_import.check_entry_existence([ENTRY_LINK]) == (set(), set())
+        mock_lookup.assert_not_called()
+
+
+class TestConfirmImport:
+    """Test confirm_import function"""
+
+    def test_nothing_to_report_continues_without_prompt(self, monkeypatch):
+        """No failed rows and no missing entries: continue without asking"""
+        mock_prompt = MagicMock()
+        monkeypatch.setattr(entrylinks_import, 'get_user_input_with_timeout', mock_prompt)
+
+        assert entrylinks_import.confirm_import([], set()) is True
+        mock_prompt.assert_not_called()
+
+    @pytest.mark.parametrize('response, expected', [('y', True), ('Yes', True), ('n', False), ('', False)])
+    def test_reports_everything_then_asks_once(self, monkeypatch, response, expected):
+        """Failed rows (ordered by row number) and missing entries are listed before a single prompt"""
+        warnings = []
+        mock_prompt = MagicMock(return_value=response)
+        monkeypatch.setattr(entrylinks_import.logger, 'warning', warnings.append)
+        monkeypatch.setattr(entrylinks_import, 'get_user_input_with_timeout', mock_prompt)
+
+        result = entrylinks_import.confirm_import(
+            [(5, 'Target ID is required'), (3, 'Invalid entry link type')], {TERM_ENTRY}
+        )
+
+        assert result is expected
+        mock_prompt.assert_called_once()
+        assert warnings == [
+            "2 row(s) can't be imported and will be skipped:",
+            '  - Row 3: Invalid entry link type',
+            '  - Row 5: Target ID is required',
+            "1 referenced entry(ies) were not found in Dataplex, or you don't have permission to read them; "
+            'entry links that use them may fail during import:',
+            f'  - {TERM_ENTRY}',
+        ]
+
+    def test_long_lists_are_shortened_on_the_console(self, monkeypatch):
+        """At most MAX_LISTED_ITEMS items are shown on the console; the rest go to the log file"""
+        warnings = []
+        debug_messages = []
+        monkeypatch.setattr(entrylinks_import.logger, 'warning', warnings.append)
+        monkeypatch.setattr(entrylinks_import.logger, 'debug', debug_messages.append)
+        monkeypatch.setattr(entrylinks_import, 'get_user_input_with_timeout', MagicMock(return_value='y'))
+        max_items = entrylinks_import.MAX_LISTED_ITEMS
+        failed_rows = [(row_number, 'Target ID is required') for row_number in range(2, max_items + 5)]
+
+        entrylinks_import.confirm_import(failed_rows, set())
+
+        assert len([w for w in warnings if w.startswith('  - Row')]) == max_items
+        assert warnings[-1] == '  ... and 3 more (see the log file)'
+        assert debug_messages == [f'  - Row {row}: Target ID is required' for row in range(max_items + 2, max_items + 5)]
 
 # ============================================================================
 # MAIN FLOW TESTS
@@ -509,6 +1152,22 @@ class TestMain:
         result = entrylinks_import.main()
         
         assert result == 1
+
+    def test_returns_1_and_explains_when_api_calls_keep_failing(self, monkeypatch):
+        """An outage that outlasts the retries ends the import with exit code 1"""
+        errors = []
+        monkeypatch.setattr(entrylinks_import.logging_utils, 'setup_file_logging', MagicMock())
+        monkeypatch.setattr(entrylinks_import.argument_parser, 'get_import_entrylinks_arguments', MagicMock())
+        monkeypatch.setattr(
+            entrylinks_import, '_run_import_workflow', MagicMock(side_effect=TransientAPIError('unavailable'))
+        )
+        monkeypatch.setattr(entrylinks_import.logger, 'error', errors.append)
+
+        assert entrylinks_import.main() == 1
+        assert errors == [
+            'Import stopped: API calls kept failing with network or server errors after retrying: unavailable',
+            'Please check your internet connection and try again.',
+        ]
 
 
 # ============================================================================

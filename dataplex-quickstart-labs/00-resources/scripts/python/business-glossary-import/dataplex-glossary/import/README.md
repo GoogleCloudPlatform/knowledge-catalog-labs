@@ -49,11 +49,9 @@ Share the Google Sheet with the service account (`SA_EMAIL`) as a **Viewer** so 
 
 *   **Glossary Import**: The sheet should contain the following header row:
     `id, parent, display_name, description, overview, type, contact1_email, contact1_name, contact2_email, contact2_name, label1_key, label1_value, label2_key, label2_value`
-*   **EntryLinks Import**: The sheet should contain the following columns in the header row:
-    *   `entry_link_type` - Type of link: `definition`, `related`, or `synonym`
-    *   `source_entry` - Full entry name of the source (e.g., `projects/PROJECT/locations/LOCATION/entryGroups/ENTRY_GROUP/entries/ENTRY_ID`)
-    *   `target_entry` - Full entry name of the target
-    *   `source_path` - (Optional) Column/field path for definition links (e.g., `Schema.column_name`)
+*   **EntryLinks Import**: The sheet should contain the following header row (the format written by the EntryLinks export):
+    `Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
+    See [Sheets file schema (EntryLinks)](#sheets-file-schema-entrylinks) for what each column contains.
 
 ### Authentication
 
@@ -74,6 +72,19 @@ gcloud auth application-default login \
 # (Optional) Export environment variable for additional safety
 export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT="${SA_EMAIL}"
 ```
+
+### Required permissions (EntryLinks import)
+
+The account the script runs as (the impersonated service account) needs:
+
+| Used for | Permissions | Predefined role that includes them |
+|---|---|---|
+| Quota and billing of the API calls, on `--user-project` | `serviceusage.services.use` | Service Usage Consumer (`roles/serviceusage.serviceUsageConsumer`) |
+| Finding data assets by FQN (Catalog search and `lookupEntry`), on `--user-project` | `dataplex.projects.search` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Reading the data assets' entries: `lookupEntry` checks access in the source system | Read access to each asset, e.g. `bigquery.tables.get` for BigQuery tables | BigQuery Metadata Viewer (`roles/bigquery.metadataViewer`) |
+| Finding glossaries and terms by name, on the glossaries' projects | `dataplex.glossaries.list`, `dataplex.glossaries.get`, `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Translating project IDs to project numbers and back | `resourcemanager.projects.get` on the projects named in the sheet | Browser (`roles/browser`) |
+| Creating the entry links with metadata import jobs | See [Import metadata](https://cloud.google.com/dataplex/docs/import-metadata) | |
 
 ---
 
@@ -144,13 +155,36 @@ python3 entrylinks-import.py \
 
 ### Sheets file schema (EntryLinks)
 
-The first row of the sheet should contain the following header:
+The first row of the sheet should contain the following headers (the format written by the EntryLinks export):
 
-`entry_link_type, source_entry, target_entry, source_path`
+`Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
 
 Where:
 
-*   `entry_link_type` (required): Type of EntryLink. Valid values: `definition`, `synonym`, `related`.
-*   `source_entry` (required): Full Dataplex entry resource path for the source (e.g. `projects/my-project/locations/us/entryGroups/@bigquery/entries/my-entry`).
-*   `target_entry` (required): Full Dataplex entry resource path for the target.
-*   `source_path` (optional): Path within the source entry (e.g. a BigQuery column path like `Schema.Field1`). Used for definition entrylinks.
+*   `Entry link type` (required): Type of EntryLink: `definition`, `synonym` or `related`.
+*   `Source Name`, `Source ID`: The source of the link.
+    *   For `definition` links, a data asset: `Source Name` (required) is its Fully Qualified Name (FQN), e.g. `bigquery:my-project.sales.orders`. `Source ID` is for information only and is not used by the import.
+    *   For `synonym` and `related` links, a glossary term (see below).
+*   `Column` (optional): For `definition` links, the column to link the term to (e.g. `order_id` or `Schema.order_id`). Leave empty to link the whole data asset. Not used for `synonym` and `related` links.
+*   `Target Name`, `Target ID`: The target glossary term (see below).
+
+A glossary term is given by its Name and ID cells:
+
+*   Name (required): `<project>.<location>.<glossary>.<termDisplayName>`, where `<project>` is the project ID and `<glossary>` is the display name or ID of the glossary. It identifies the glossary and, when the ID is empty, the term.
+*   ID (optional): The term ID (the `id` column of the glossary export). The export always fills it in.
+
+How the term is found:
+
+*   ID given: the term with this ID in the glossary. If the Name also has a term display name, it must exactly match that term's display name, or the row fails (e.g. `Target Name 'Net Revenue' does not match Target ID 'gross-revenue' ('Gross Revenue'). Update or clear Target ID.`). To rename the link target, change both cells or clear the ID.
+*   ID empty: the term whose display name exactly matches the term display name in Name (case-sensitive). If several terms in the glossary have that display name, the row fails and lists their IDs; put the right one in the ID cell.
+*   Name without a term display name (`<project>.<location>.<glossary>`): the ID is required.
+
+Instead, the Name cell of a term or data asset can hold a full Dataplex resource name (starting with `projects/`), which is used as is: an entry name, or for a term, its resource name `projects/<project>/locations/<location>/glossaries/<glossary>/terms/<term>`. Use this when the project ID contains a dot (domain-scoped projects such as `example.com:my-project`), as the dot-separated Name can't express it. If the ID cell is filled in too, it must name the same term. Sheets written by earlier versions of the export (headers `entry_link_type, source_entry, target_entry, source_path`, with full entry names) can still be imported.
+
+The ID cell of a term can also hold the term's full resource name, for example to choose between two glossaries with the same display name. If the Name is filled in too, it must name that same term (its project, location, glossary display name or ID, and exact term display name), or the row fails. For `definition` links, `Source ID` is ignored even if it holds a full resource name.
+
+Data assets are found with Dataplex Catalog search, which may take a few minutes to include newly created assets (BigQuery tables that search doesn't return yet are read directly). If an asset isn't found, check its FQN or give its full entry name instead.
+
+Before importing, the script lists the rows that can't be imported (with the reason) and the referenced entries that don't exist in Dataplex, and asks whether to continue without them.
+
+Looking up the terms and data assets of the rows is retried for up to 10 minutes when it fails with network or server errors (HTTP 429 or 5xx). If it still fails, the script stops before importing anything, instead of listing every remaining row as one that can't be imported; run it again once the connection or service is back.

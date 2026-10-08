@@ -88,6 +88,19 @@ gcloud auth application-default login \
 export GOOGLE_IMPERSONATE_SERVICE_ACCOUNT="${SA_EMAIL}"
 ```
 
+### Required permissions (EntryLinks export)
+
+The roles above cover the export. The individual permissions it uses are:
+
+| Used for | Permissions | Predefined role that includes them |
+|---|---|---|
+| Quota and billing of the API calls, on `--user-project` | `serviceusage.services.use` | Service Usage Consumer (`roles/serviceusage.serviceUsageConsumer`) |
+| Listing the glossary's terms and naming glossaries and terms in the sheet | `dataplex.glossaries.list`, `dataplex.glossaries.get`, `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Looking up the terms' entry links (`lookupEntryLinks`) and the FQNs of linked entries (`lookupEntry`, which checks access in the source system) | `dataplex.entries.get`, `dataplex.glossaryTerms.get`, and read access to the linked assets, e.g. `bigquery.tables.get` | Dataplex Catalog Viewer, BigQuery Metadata Viewer (`roles/bigquery.metadataViewer`) |
+| Writing project IDs instead of project numbers | `resourcemanager.projects.get` on the projects of the glossaries and assets | Browser (`roles/browser`) |
+
+Links that can't be read with these permissions are left out of the export or written with the raw entry name (see below).
+
 ---
 
 ## 1. Glossary Export
@@ -157,13 +170,21 @@ python3 entrylinks-export.py \
 
 ### Sheets file schema (EntryLinks)
 
-The first row of the sheet contains the following header:
+The first row of the sheet contains the following 6 column headers:
 
-`entry_link_type, source_entry, target_entry, source_path`
+`Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
 
 Where:
 
-*   `entry_link_type` (required): Type of EntryLink. Valid values: `definition`, `synonym`, `related`.
-*   `source_entry` (required): Full Dataplex entry resource path for the source (e.g. `projects/my-project/locations/us/entryGroups/@bigquery/entries/my-entry`).
-*   `target_entry` (required): Full Dataplex entry resource path for the target.
-*   `source_path` (optional): Path within the source entry (e.g. a BigQuery column path like `Schema.Field1`). Populated for definition entrylinks.
+*   `Entry link type`: Type of EntryLink: `definition`, `synonym` or `related`.
+*   `Source Name`:
+    *   For `definition` links: Fully Qualified Name (FQN) of the data asset (e.g. `bigquery:my-project.sales.orders`).
+    *   For `synonym` and `related` links: The term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>`.
+*   `Source ID`:
+    *   For `definition` links: Short ID of the data asset, for information only (e.g. `my-project.sales.orders` for a BigQuery table).
+    *   For `synonym` and `related` links: The term ID of the source term (the `id` column of the glossary export).
+*   `Column`: For `definition` links to a column, the column name (e.g. `order_id`). Empty for links to a whole data asset and for `synonym` and `related` links.
+*   `Target Name`: The term display identifier `<project>.<location>.<glossaryDisplayName>.<termDisplayName>` of the target term.
+*   `Target ID`: The term ID of the target term.
+
+If a name can't be resolved (for example, a data asset without an FQN), the export logs a warning and writes the full Dataplex entry name instead. The EntryLinks import reads this format, so an exported sheet can be imported as is.
