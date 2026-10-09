@@ -1,4 +1,0 @@
-google-cloud-bigquery
-Faker
-pandas
-pyarrow

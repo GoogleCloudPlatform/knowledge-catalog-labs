@@ -10,7 +10,6 @@ This repository features self-contained, hands-on-labs with detailed and step-by
 | 1. |Product-centric | [Dataplex Quickstart Labs](dataplex-quickstart-labs)| Lab series showcasing Dataplex features for a learning experience. <br><br>*If you dont know Dataplex and want to learn the product, with step by step instructions for every feature, as and when they are released* <br><br>| Anagha Khanolkar|
 | 2. |Solution-centric | [Dataplex Data Mesh Lab 1 - Banking](data-mesh-banking-labs) | Lab series showcasing Data Mesh architecture powered by Dataplex based on a Banking usecase. <br><br> *A L300 lab for architecting and implementing Data mesh using Dataplex and other core GCP services* <br><br>| Mansi Maharana |
 | 3. |Product-centric | [Lineage Use-Case based documentation](lineage-uses-cases-documentation) | Code accompanying the Lineage Use-Case based documentation, demonstrating practical applications of Data Lineage within Dataplex. <br><br>*Covers common use cases like impact analysis, root cause analysis, and PII tracking, using realistic scenarios and datasets. <br><br>| Ines Cardoso |
-| 4. |Solution-centric | [Policy-as-Code Agent](policy-as-code-agent) | A generative AI-powered agent designed to automate data governance on Google Cloud using Dataplex and BigQuery. <br><br>*Enables users to define and validate data policies using natural language.* | Vanshaj Bhatia |
 
 ## Contributing
 See the contributing [instructions](CONTRIBUTING.md) to get started contributing.
