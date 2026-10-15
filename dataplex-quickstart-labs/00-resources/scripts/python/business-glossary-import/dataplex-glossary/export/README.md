@@ -107,6 +107,10 @@ Links that can't be read with these permissions are left out of the export or wr
 
 Exports categories and terms from a Dataplex business glossary into Google Sheets.
 
+Values are written exactly as they are in Dataplex: Sheets doesn't convert them into numbers,
+dates, booleans or formulas, so the sheet can be imported back (with `glossary-import.py`) or
+used to update the glossary (with `glossary-update.py`) without changing them.
+
 ### Usage
 
 ```bash

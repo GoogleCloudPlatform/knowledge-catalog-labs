@@ -582,10 +582,13 @@ def _write_to_sheet(
     """
     target_range = f"'{sheet_name}'!A1" if sheet_name else 'A1'
     try:
+        # RAW keeps every value exactly as it is in Dataplex. With USER_ENTERED, Sheets would
+        # turn text such as '007', '2024-01-01', 'TRUE' or '=...' into a number, date, boolean
+        # or formula, and importing the sheet back would write the changed value.
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=target_range,
-            valueInputOption='USER_ENTERED',
+            valueInputOption='RAW',
             body={'values': data}
         ).execute()
         logging.info(f"Data written to spreadsheet: {spreadsheet_id}")
