@@ -338,7 +338,7 @@ sheet deletes anything, you must type `yes`.
 | `--glossary-url` | Yes | The glossary: any URL or text that contains `projects/<project>/locations/<location>/glossaries/<glossary>` |
 | `--dry-run` | No | Show the changes and write the results file, without changing anything |
 | `--yes` | No | Apply the changes without asking for confirmation |
-| `--max-qpm` | No | Maximum glossary/entry write calls per minute (default: 250) |
+| `--max-qpm` | No | Maximum term/category creates, updates and deletes per minute (default: 90; see [Time and quotas](#time-and-quotas)) |
 | `--skip-conflict-check` | No | Don't check that a term or category is unchanged since the script read it before changing it |
 | `--output-dir` | No | Directory for the results file (default: the current directory) |
 
@@ -362,8 +362,11 @@ sheet are left as they are.
 
 The same validations as the Glossary Import apply to each row. The parent of a
 row must be a category that is in the sheet or already in the glossary, and the
-glossary's limits (5,000 terms, 200 categories, at most 4 levels counting the
-glossary) are checked for the result.
+glossary's limits are checked for the result: at most 5,000 terms and 200
+categories, categories nested at most 3 deep, and terms in any category (so a
+term can be up to 4 levels below the glossary). These are the limits of the
+Dataplex API; only the terms and categories that the sheet creates or moves are
+checked.
 
 ### How changes are applied
 
@@ -388,12 +391,23 @@ its action (`CREATE`, `UPDATE`, `UNCHANGED`, `DELETE`, `SKIP`) and status
 run the update again with the same sheet: what was already applied is now
 unchanged, so only the rest is applied.
 
-### Time
+### Time and quotas
 
 The script reads the overview, contacts and aspects of every existing term or
 category that is in the sheet, so a full sheet takes about as long as an export
-even when only a few rows changed. Writes are limited to 250 per minute by
-default (`--max-qpm`); each created or changed term needs one or two writes.
+even when only a few rows changed.
+
+Dataplex limits glossary writes (creating, updating and deleting terms and
+categories) to 100 per minute per user and 250 per minute per project, and
+glossary reads to 200 per minute per user (default quotas). The script spaces
+its calls to stay under them: by default at most 90 term/category writes per
+minute (`--max-qpm`) and 180 reads per minute. Writing overview, contacts and
+aspects uses a separate, larger quota. A call that still exceeds a quota (for
+example because other jobs use the same project) is retried with exponential
+backoff for up to 10 minutes.
+
+So changing 1,000 terms takes about 12 minutes, and 5,000 terms about an hour.
+If your project has a higher quota, raise `--max-qpm`.
 
 ### Required permissions (Glossary Update)
 
@@ -403,7 +417,7 @@ The account the script runs as needs:
 |---|---|---|
 | Reading the terms and categories, and their entries | `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get`, `dataplex.glossaryCategories.list`, `dataplex.glossaryCategories.get`, `dataplex.entries.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
 | Creating, updating and deleting terms and categories | `dataplex.glossaryTerms.create`, `dataplex.glossaryTerms.update`, `dataplex.glossaryTerms.delete`, `dataplex.glossaryCategories.create`, `dataplex.glossaryCategories.update`, `dataplex.glossaryCategories.delete` | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
-| Writing overview, contacts and custom aspects (`entries.patch`) | `dataplex.entries.update`, and `dataplex.aspectTypes.use` on the custom aspect types | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
+| Writing overview, contacts and custom aspects (`entries.patch`) | `dataplex.entries.update`, `dataplex.entryGroups.useOverviewAspect` and `dataplex.entryGroups.useContactsAspect` on the glossary project's `@dataplex` entry group, and `dataplex.aspectTypes.use` on the custom aspect types | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
 | Reading the sheet | Viewer access to the spreadsheet | |
 
 ---

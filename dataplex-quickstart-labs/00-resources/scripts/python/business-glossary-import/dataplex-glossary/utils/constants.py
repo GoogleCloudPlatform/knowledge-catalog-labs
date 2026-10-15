@@ -283,13 +283,12 @@ OPERATION_DELETE = "delete"
 GLOSSARY_TERM_TYPE = "TERM"
 GLOSSARY_CATEGORY_TYPE = "CATEGORY"
 
-# Same limits as the full import: the glossary, its categories and the node itself form a
-# path of at most 4 levels, and a glossary holds at most 5,000 terms and 200 categories.
-GLOSSARY_MAX_DEPTH = 4
+# A glossary holds at most 5,000 terms and 200 categories.
 GLOSSARY_MAX_TERMS = 5000
 GLOSSARY_MAX_CATEGORIES = 200
-# The Dataplex API rejects a category move or creation that makes a category chain deeper
-# than this (CreateGlossaryCategory / UpdateGlossaryCategory). Used to order category moves.
+# The Dataplex API rejects a category creation or move that nests categories more than 3 deep
+# (CreateGlossaryCategory / UpdateGlossaryCategory). Terms can be in any category, so a term
+# can be up to 4 levels below the glossary: glossary > category > category > category > term.
 SERVER_MAX_CATEGORY_DEPTH = 3
 
 # Aspect keys written by the update script (the full import uses the same keys).
@@ -297,9 +296,19 @@ OVERVIEW_ASPECT_KEY = "dataplex-types.global.overview"
 CONTACTS_ASPECT_KEY = "dataplex-types.global.contacts"
 CONTACT_ROLE_STEWARD = "steward"
 
-# Minimum delay between consecutive glossary/entry write calls across all threads
-# (at most 250 per minute by default; see --max-qpm in glossary-update.py).
-WRITE_API_CALL_DELAY_SECONDS = 0.24
+# Dataplex quotas (standard tier) for the calls made by the update script, per project and region:
+#   - glossary writes (create/update/delete of terms and categories): 250 per minute per project
+#     and 100 per minute per user;
+#   - glossary reads (get/list of terms and categories): 500 per minute per project and 200 per
+#     minute per user;
+#   - catalog entry writes (entries.patch, for aspects): 1,500 per minute per project.
+# The delays below are the minimum time between two such calls across all threads, chosen to stay
+# under the per-user quotas. Calls that still get a 429 (quota exceeded) are retried with
+# exponential backoff (see retry_utils.execute_with_retry).
+DEFAULT_GLOSSARY_WRITES_PER_MINUTE = 90  # see --max-qpm in glossary-update.py
+GLOSSARY_WRITE_API_CALL_DELAY_SECONDS = 60 / DEFAULT_GLOSSARY_WRITES_PER_MINUTE
+GLOSSARY_READ_API_CALL_DELAY_SECONDS = 60 / 180
+ENTRY_WRITE_API_CALL_DELAY_SECONDS = 60 / 600
 
 # After creating a term or category, Dataplex creates its catalog entry asynchronously.
 # Its aspects (overview, contacts, custom aspects) can only be written once the entry exists.

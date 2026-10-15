@@ -23,15 +23,17 @@ from .constants import (
     DATAPLEX_BASE_URL,
     ENTRY_NAME_PATTERN,
     ENTRY_READ_API_CALL_DELAY_SECONDS,
+    ENTRY_WRITE_API_CALL_DELAY_SECONDS,
     EXCLUDED_LOCATIONS,
     GLOSSARY_CATEGORY_TYPE,
+    GLOSSARY_READ_API_CALL_DELAY_SECONDS,
     GLOSSARY_TERM_TYPE,
+    GLOSSARY_WRITE_API_CALL_DELAY_SECONDS,
     PAGE_SIZE,
     PLAIN_BIGQUERY_ENTRY_ID_PATTERN,
     PROJECT_PATTERN,
     SEARCH_API_CALL_DELAY_SECONDS,
     TERM_NAME_PATTERN,
-    WRITE_API_CALL_DELAY_SECONDS,
 )
 from .error import (
     AmbiguousTermError,
@@ -173,7 +175,9 @@ class _RateLimiter:
 _entry_links_rate_limiter = _RateLimiter(API_CALL_DELAY_SECONDS)  # lookupEntryLinks
 _search_rate_limiter = _RateLimiter(SEARCH_API_CALL_DELAY_SECONDS)  # searchEntries
 _entry_read_rate_limiter = _RateLimiter(ENTRY_READ_API_CALL_DELAY_SECONDS)  # lookupEntry
-_write_rate_limiter = _RateLimiter(WRITE_API_CALL_DELAY_SECONDS)  # glossary term/category and entry writes
+_write_rate_limiter = _RateLimiter(GLOSSARY_WRITE_API_CALL_DELAY_SECONDS)  # term/category create/patch/delete
+_glossary_read_rate_limiter = _RateLimiter(GLOSSARY_READ_API_CALL_DELAY_SECONDS)  # term/category get
+_entry_write_rate_limiter = _RateLimiter(ENTRY_WRITE_API_CALL_DELAY_SECONDS)  # entries.patch
 
 
 def _execute_rate_limited(rate_limiter: _RateLimiter, request, description: str) -> Any:
@@ -281,7 +285,7 @@ def list_glossary_categories(dataplex_service: build, glossary_name: str) -> Lis
 # -----------------------------------------------------------------------------
 
 def set_write_rate_limit(max_calls_per_minute: int) -> None:
-    """Limit glossary term/category and entry writes to `max_calls_per_minute` across all threads."""
+    """Limit term/category creates, updates and deletes to `max_calls_per_minute` across all threads."""
     if max_calls_per_minute <= 0:
         raise ValueError("max_calls_per_minute must be positive")
     _write_rate_limiter.min_interval_seconds = 60.0 / max_calls_per_minute
@@ -301,7 +305,7 @@ def get_glossary_resource(dataplex_service: build, resource_name: str, resource_
     """Fetch the current state of a glossary term or category (not cached)."""
     logger.debug(f"Request: glossaries.{resource_type.lower()}.get(name={resource_name})")
     request = _glossary_collection(dataplex_service, resource_type).get(name=resource_name)
-    return execute_with_retry(request.execute, f"Get {resource_type.lower()} {resource_name}")
+    return _execute_rate_limited(_glossary_read_rate_limiter, request, f"Get {resource_type.lower()} {resource_name}")
 
 
 def create_glossary_resource(
@@ -354,7 +358,7 @@ def update_entry_aspects(
     request = dataplex_service.projects().locations().entryGroups().entries().patch(
         name=entry_name, updateMask="aspects", aspectKeys=aspect_keys, body=body
     )
-    return _execute_rate_limited(_write_rate_limiter, request, f"Update aspects of {entry_name}")
+    return _execute_rate_limited(_entry_write_rate_limiter, request, f"Update aspects of {entry_name}")
 
 def parse_entry_name(entry_name: str) -> tuple:
     """Parse a full entry resource name to extract project, location, entry group, and entry ID."""
