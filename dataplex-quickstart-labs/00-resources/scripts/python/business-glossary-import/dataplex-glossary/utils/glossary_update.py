@@ -37,7 +37,6 @@ from utils.constants import (
     ENTRY_WAIT_TIMEOUT_SECONDS,
     GLOSSARY_CATEGORY_TYPE,
     GLOSSARY_MAX_CATEGORIES,
-    GLOSSARY_MAX_DEPTH,
     GLOSSARY_MAX_TERMS,
     GLOSSARY_SHEET_HEADERS,
     GLOSSARY_TERM_TYPE,
@@ -553,6 +552,11 @@ def _plan_deletes(rows: List[SheetRow], live_nodes: Dict[NodeKey, LiveNode], pla
             sheet_row=row, live=live_nodes[key],
         ))
         if key[0] == CATEGORY:
+            # Deleting a category through the API doesn't delete what's inside it: its terms
+            # and sub-categories are moved up a level instead. So everything inside is deleted
+            # explicitly, before the category (see _blocking_failure).
+            # TODO: Revisit when the API's category delete changes. Today the moved-up contents
+            # are also not replicated correctly for glossaries in the global location.
             for descendant in _descendants(key[1], children):
                 existing = deleted.get(descendant)
                 if existing and existing.row_number and not existing.reason:
@@ -608,8 +612,8 @@ def _validate_tree(
     """Check cycles and depth for the terms/categories that the sheet creates or moves, and for
     everything under a moved category.
 
-    Terms and categories that stay where they are are not checked, so a glossary that is
-    already deeper than the full import allows can still be updated (also with a full sheet).
+    Terms and categories that stay where they are are not checked, so a glossary that already
+    breaks these rules can still be updated (also with a full sheet).
     """
     category_parents = {key[1]: parent for key, parent in parents.items() if key[0] == CATEGORY}
     placed_rows = [
@@ -636,12 +640,16 @@ def _validate_tree(
                 reported_cycles.add(cycle_id)
                 plan.errors.append(f"{where}the category parents form a cycle ({' -> '.join(chain)}).")
             continue
-        depth = 1 + len(chain) + 1  # glossary + ancestor categories + the node itself
-        if depth > GLOSSARY_MAX_DEPTH:
+        # Same rule as the Dataplex API: categories are nested at most SERVER_MAX_CATEGORY_DEPTH
+        # deep, and a term can be in any category.
+        levels = len(chain) + 1  # levels below the glossary: ancestor categories + the node itself
+        max_levels = SERVER_MAX_CATEGORY_DEPTH + (1 if key[0] == TERM else 0)
+        if levels > max_levels:
             path = " > ".join(["(glossary)"] + list(reversed(chain)) + [key[1]])
             plan.errors.append(
-                f"{where}{key[0].lower()} '{key[1]}' would be {depth} levels deep ({path}); at most "
-                f"{GLOSSARY_MAX_DEPTH} levels are allowed, counting the glossary."
+                f"{where}{key[0].lower()} '{key[1]}' would be {levels} levels below the glossary ({path}); "
+                f"a category can be at most {SERVER_MAX_CATEGORY_DEPTH} levels and a term at most "
+                f"{SERVER_MAX_CATEGORY_DEPTH + 1} levels below the glossary."
             )
 
 

@@ -282,16 +282,28 @@ class TestBuildPlan:
         plan = plan_for([sheet_row("a", node_type="CATEGORY", parent="b")], nodes)
         assert any("cycle" in error for error in plan.errors)
 
-    def test_depth_limit_counts_the_glossary(self):
+    def test_term_can_be_in_a_third_level_category(self):
         nodes = live_map(live("c1", "CATEGORY"), live("c2", "CATEGORY", parent="c1"), live("c3", "CATEGORY", parent="c2"))
         plan = plan_for([sheet_row("deep", parent="c3")], nodes)
-        assert "would be 5 levels deep" in plan.errors[0]
+        assert plan.errors == []
+
+    def test_categories_are_nested_at_most_three_deep(self):
+        nodes = live_map(live("c1", "CATEGORY"), live("c2", "CATEGORY", parent="c1"), live("c3", "CATEGORY", parent="c2"))
+        plan = plan_for([sheet_row("c4", node_type="CATEGORY", parent="c3")], nodes)
+        assert "category 'c4' would be 4 levels below the glossary" in plan.errors[0]
 
     def test_moving_a_category_checks_everything_under_it(self):
         nodes = live_map(live("c1", "CATEGORY"), live("c2", "CATEGORY", parent="c1"),
+                         live("x", "CATEGORY"), live("y", "CATEGORY", parent="x"), live("t", parent="y"))
+        plan = plan_for([sheet_row("x", node_type="CATEGORY", parent="c2")], nodes)
+        assert any("category 'y' would be 4 levels below the glossary" in error for error in plan.errors)
+        assert any("term 't' would be 5 levels below the glossary" in error for error in plan.errors)
+
+    def test_moving_a_category_with_terms_to_the_third_level_is_allowed(self):
+        nodes = live_map(live("c1", "CATEGORY"), live("c2", "CATEGORY", parent="c1"),
                          live("x", "CATEGORY"), live("t", parent="x"))
         plan = plan_for([sheet_row("x", node_type="CATEGORY", parent="c2")], nodes)
-        assert any("term 't' would be 5 levels deep" in error for error in plan.errors)
+        assert plan.errors == []
 
     def test_untouched_deep_nodes_are_not_reported(self):
         nodes = live_map(live("c1", "CATEGORY"), live("c2", "CATEGORY", parent="c1"),

@@ -31,11 +31,9 @@ import gspread
 from google.auth import default
 
 from utils import api_layer, argument_parser, glossary_update, logging_utils
-from utils.constants import MAX_WORKERS, SPREADSHEET_URL_PATTERN
+from utils.constants import DEFAULT_GLOSSARY_WRITES_PER_MINUTE, MAX_WORKERS, SPREADSHEET_URL_PATTERN
 
 logger = logging_utils.get_logger()
-
-DEFAULT_MAX_WRITES_PER_MINUTE = 250
 
 
 def _load_glossary_import_module():
@@ -91,8 +89,10 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="Show the changes and write the results file, without changing anything")
     parser.add_argument("--yes", action="store_true",
                         help="Apply the changes without asking for confirmation")
-    parser.add_argument("--max-qpm", type=int, default=DEFAULT_MAX_WRITES_PER_MINUTE,
-                        help=f"Maximum glossary/entry write calls per minute (default: {DEFAULT_MAX_WRITES_PER_MINUTE})")
+    parser.add_argument("--max-qpm", type=int, default=DEFAULT_GLOSSARY_WRITES_PER_MINUTE,
+                        help="Maximum term/category creates, updates and deletes per minute (default: "
+                             f"{DEFAULT_GLOSSARY_WRITES_PER_MINUTE}). Dataplex allows 100 per minute per user "
+                             "and 250 per minute per project by default; calls over the quota are retried.")
     parser.add_argument("--skip-conflict-check", action="store_true",
                         help="Don't check that a term/category is unchanged since it was read before changing it")
     parser.add_argument("--output-dir", default=os.getcwd(),

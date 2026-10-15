@@ -22,7 +22,7 @@ def no_api_rate_limit_delays(monkeypatch):
     from utils import api_layer
     for limiter in (
         api_layer._entry_links_rate_limiter, api_layer._search_rate_limiter, api_layer._entry_read_rate_limiter,
-        api_layer._write_rate_limiter,
+        api_layer._write_rate_limiter, api_layer._glossary_read_rate_limiter, api_layer._entry_write_rate_limiter,
     ):
         monkeypatch.setattr(limiter, 'min_interval_seconds', 0)
 
