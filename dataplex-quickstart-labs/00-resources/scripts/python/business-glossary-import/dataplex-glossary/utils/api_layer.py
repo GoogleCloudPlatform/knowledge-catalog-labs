@@ -24,11 +24,14 @@ from .constants import (
     ENTRY_NAME_PATTERN,
     ENTRY_READ_API_CALL_DELAY_SECONDS,
     EXCLUDED_LOCATIONS,
+    GLOSSARY_CATEGORY_TYPE,
+    GLOSSARY_TERM_TYPE,
     PAGE_SIZE,
     PLAIN_BIGQUERY_ENTRY_ID_PATTERN,
     PROJECT_PATTERN,
     SEARCH_API_CALL_DELAY_SECONDS,
     TERM_NAME_PATTERN,
+    WRITE_API_CALL_DELAY_SECONDS,
 )
 from .error import (
     AmbiguousTermError,
@@ -170,6 +173,7 @@ class _RateLimiter:
 _entry_links_rate_limiter = _RateLimiter(API_CALL_DELAY_SECONDS)  # lookupEntryLinks
 _search_rate_limiter = _RateLimiter(SEARCH_API_CALL_DELAY_SECONDS)  # searchEntries
 _entry_read_rate_limiter = _RateLimiter(ENTRY_READ_API_CALL_DELAY_SECONDS)  # lookupEntry
+_write_rate_limiter = _RateLimiter(WRITE_API_CALL_DELAY_SECONDS)  # glossary term/category and entry writes
 
 
 def _execute_rate_limited(rate_limiter: _RateLimiter, request, description: str) -> Any:
@@ -242,6 +246,115 @@ def list_glossary_terms(dataplex_service: build, glossary_name: str) -> List[Dic
     
     logger.debug(f"Response: {len(all_terms)} terms for {glossary_name}")
     return all_terms
+
+
+def list_glossary_categories(dataplex_service: build, glossary_name: str) -> List[Dict]:
+    """Lists categories from a Dataplex glossary with pagination support.
+
+    Returns an empty list when the glossary has no categories.
+    """
+    all_categories = []
+    logger.debug(f"Request: glossaries.categories.list(parent={glossary_name})")
+    categories_api = dataplex_service.projects().locations().glossaries().categories()
+    categories_request = categories_api.list(parent=glossary_name, pageSize=PAGE_SIZE)
+
+    while categories_request:
+        try:
+            page_response = execute_with_retry(
+                categories_request.execute,
+                f"List glossary categories for {glossary_name}"
+            )
+        except Exception as categories_error:
+            raise DataplexAPIError(
+                f"Error while listing glossary categories for {glossary_name}: {categories_error}"
+            )
+
+        all_categories.extend(page_response.get('categories', []))
+        categories_request = categories_api.list_next(categories_request, page_response)
+
+    logger.debug(f"Response: {len(all_categories)} categories for {glossary_name}")
+    return all_categories
+
+
+# -----------------------------------------------------------------------------
+# Glossary term/category and entry writes (used by glossary-update.py)
+# -----------------------------------------------------------------------------
+
+def set_write_rate_limit(max_calls_per_minute: int) -> None:
+    """Limit glossary term/category and entry writes to `max_calls_per_minute` across all threads."""
+    if max_calls_per_minute <= 0:
+        raise ValueError("max_calls_per_minute must be positive")
+    _write_rate_limiter.min_interval_seconds = 60.0 / max_calls_per_minute
+
+
+def _glossary_collection(dataplex_service: build, resource_type: str):
+    """The terms() or categories() collection of the Dataplex API for a term or a category."""
+    glossaries = dataplex_service.projects().locations().glossaries()
+    if resource_type == GLOSSARY_TERM_TYPE:
+        return glossaries.terms()
+    if resource_type == GLOSSARY_CATEGORY_TYPE:
+        return glossaries.categories()
+    raise ValueError(f"Unknown glossary resource type: {resource_type}")
+
+
+def get_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> Dict:
+    """Fetch the current state of a glossary term or category (not cached)."""
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.get(name={resource_name})")
+    request = _glossary_collection(dataplex_service, resource_type).get(name=resource_name)
+    return execute_with_retry(request.execute, f"Get {resource_type.lower()} {resource_name}")
+
+
+def create_glossary_resource(
+    dataplex_service: build, glossary_name: str, resource_type: str, resource_id: str, body: Dict
+) -> Dict:
+    """Create a glossary term or category with the given id under `glossary_name`.
+
+    `body` holds displayName, description, labels and parent (the glossary or a category).
+    """
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.create(id={resource_id}, body={body})")
+    collection = _glossary_collection(dataplex_service, resource_type)
+    if resource_type == GLOSSARY_TERM_TYPE:
+        request = collection.create(parent=glossary_name, termId=resource_id, body=body)
+    else:
+        request = collection.create(parent=glossary_name, categoryId=resource_id, body=body)
+    return _execute_rate_limited(_write_rate_limiter, request, f"Create {resource_type.lower()} {resource_id}")
+
+
+def update_glossary_resource(
+    dataplex_service: build, resource_name: str, resource_type: str, body: Dict, update_mask: List[str]
+) -> Dict:
+    """Update the fields in `update_mask` (display_name, description, labels, parent) of a term or category."""
+    mask = ",".join(update_mask)
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.patch(name={resource_name}, updateMask={mask})")
+    request = _glossary_collection(dataplex_service, resource_type).patch(
+        name=resource_name, updateMask=mask, body=body
+    )
+    return _execute_rate_limited(_write_rate_limiter, request, f"Update {resource_type.lower()} {resource_name}")
+
+
+def delete_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> None:
+    """Delete a glossary term or category."""
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.delete(name={resource_name})")
+    request = _glossary_collection(dataplex_service, resource_type).delete(name=resource_name)
+    _execute_rate_limited(_write_rate_limiter, request, f"Delete {resource_type.lower()} {resource_name}")
+
+
+def update_entry_aspects(
+    dataplex_service: build, entry_name: str, aspects: Dict[str, Dict], entry_type: str = ""
+) -> Dict:
+    """Write the given aspects of an entry, leaving its other aspects unchanged.
+
+    `aspects` maps aspect keys (e.g. 'dataplex-types.global.overview') to {'data': {...}}.
+    """
+    body = {"name": entry_name, "aspects": aspects}
+    if entry_type:
+        body["entryType"] = entry_type
+    aspect_keys = sorted(aspects)
+    logger.debug(f"Request: entries.patch(name={entry_name}, aspectKeys={aspect_keys})")
+    request = dataplex_service.projects().locations().entryGroups().entries().patch(
+        name=entry_name, updateMask="aspects", aspectKeys=aspect_keys, body=body
+    )
+    return _execute_rate_limited(_write_rate_limiter, request, f"Update aspects of {entry_name}")
 
 def parse_entry_name(entry_name: str) -> tuple:
     """Parse a full entry resource name to extract project, location, entry group, and entry ID."""

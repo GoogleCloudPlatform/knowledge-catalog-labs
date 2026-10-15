@@ -261,3 +261,46 @@ DECIMAL_LITERAL_PATTERN = re.compile(r"^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?
 # e.g. 'custom-gov.owner.email' is flattened; {'owner': {'meta': {...}}} yields
 # 'custom-gov.owner.meta' holding a JSON object string.
 MAX_ASPECT_FLATTEN_DEPTH = 2
+
+
+# =============================================================================
+# Glossary Update (import/glossary-update.py) Constants
+# =============================================================================
+# The update script reads the same sheet as the full import (glossary-import.py):
+# these 14 columns, plus an optional Operation column.
+GLOSSARY_SHEET_HEADERS = [
+    "id", "parent", "display_name", "description", "overview", "type",
+    "contact1_email", "contact1_name", "contact2_email", "contact2_name",
+    "label1_key", "label1_value", "label2_key", "label2_value",
+]
+
+# Optional column. Its header is matched case-insensitively ('Operation').
+# Blank: create the row's term/category, or update it when it changed.
+# 'delete': delete the term/category (a category is deleted with everything in it).
+OPERATION_COLUMN = "operation"
+OPERATION_DELETE = "delete"
+
+GLOSSARY_TERM_TYPE = "TERM"
+GLOSSARY_CATEGORY_TYPE = "CATEGORY"
+
+# Same limits as the full import: the glossary, its categories and the node itself form a
+# path of at most 4 levels, and a glossary holds at most 5,000 terms and 200 categories.
+GLOSSARY_MAX_DEPTH = 4
+GLOSSARY_MAX_TERMS = 5000
+GLOSSARY_MAX_CATEGORIES = 200
+# The Dataplex API rejects a category move or creation that makes a category chain deeper
+# than this (CreateGlossaryCategory / UpdateGlossaryCategory). Used to order category moves.
+SERVER_MAX_CATEGORY_DEPTH = 3
+
+# Aspect keys written by the update script (the full import uses the same keys).
+OVERVIEW_ASPECT_KEY = "dataplex-types.global.overview"
+CONTACTS_ASPECT_KEY = "dataplex-types.global.contacts"
+CONTACT_ROLE_STEWARD = "steward"
+
+# Minimum delay between consecutive glossary/entry write calls across all threads
+# (at most 250 per minute by default; see --max-qpm in glossary-update.py).
+WRITE_API_CALL_DELAY_SECONDS = 0.24
+
+# After creating a term or category, Dataplex creates its catalog entry asynchronously.
+# Its aspects (overview, contacts, custom aspects) can only be written once the entry exists.
+ENTRY_WAIT_TIMEOUT_SECONDS = 60

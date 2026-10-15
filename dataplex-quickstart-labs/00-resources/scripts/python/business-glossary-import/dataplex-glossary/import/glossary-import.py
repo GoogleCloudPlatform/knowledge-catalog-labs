@@ -17,7 +17,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from utils import api_layer, business_glossary_utils, sheet_utils
-from utils.constants import ASPECT_SHEET_HEADERS, ASPECTS_SHEET_NAME_ENV_VAR
+from utils.constants import (
+    ASPECT_SHEET_HEADERS,
+    ASPECTS_SHEET_NAME_ENV_VAR,
+    OPERATION_COLUMN,
+    OPERATION_DELETE,
+)
 from utils.error import AspectSheetHeaderError, AspectValidationError, InvalidAspectIdentifierError
 
 # Regex pattern for the glossary URL, allowing any valid URL
@@ -817,10 +822,24 @@ class SheetProcessor:
         # Trim whitespace
         headers = [header.strip() for header in headers]
 
-        if set(headers) != ALLOWED_HEADERS:
-            print(f"Invalid sheet. The first row of the sheet should be headers conatin exactly : {ALLOWED_HEADERS}. Actual headers: {headers}")
+        # The optional 'Operation' column is used by glossary-update.py. The full import
+        # accepts it, so the same sheet works for both scripts, but it can't delete single
+        # rows: it replaces the whole glossary with the sheet.
+        operation_header = next((header for header in headers if header.lower() == OPERATION_COLUMN), None)
+        column_headers = [header for header in headers if header != operation_header]
+
+        if set(column_headers) != ALLOWED_HEADERS:
+            print(f"Invalid sheet. The first row of the sheet should be headers conatin exactly : {ALLOWED_HEADERS}, and optionally '{OPERATION_COLUMN.capitalize()}'. Actual headers: {headers}")
             is_dump_valid = False
             return is_dump_valid, dump_entries
+
+        if operation_header:
+            operation_errors = _check_operation_column(data[1:], headers.index(operation_header))
+            if operation_errors:
+                for operation_error in operation_errors:
+                    print(operation_error)
+                is_dump_valid = False
+                return is_dump_valid, dump_entries
 
         # First, populate category_names
         for row_num, row in enumerate(data[1:], start=2):
@@ -905,6 +924,38 @@ class SheetProcessor:
                 dump_entries.append(self._convert_to_import_item(row_data, ancestors_map[entry_name]))
 
         return is_dump_valid, dump_entries
+
+
+def _check_operation_column(rows, operation_index):
+    """Errors for the 'Operation' column of the full import: it can't delete single rows.
+
+    Args:
+        rows: The sheet rows, header excluded.
+        operation_index: The index of the 'Operation' column.
+
+    Returns:
+        A list of error messages, empty when every Operation cell is blank.
+    """
+    delete_rows = []
+    errors = []
+    for row_num, row in enumerate(rows, start=2):
+        operation = row[operation_index].strip().lower() if operation_index < len(row) else ""
+        if operation == OPERATION_DELETE:
+            delete_rows.append(row_num)
+        elif operation:
+            errors.append(
+                f"Invalid '{OPERATION_COLUMN.capitalize()}' value '{operation}' in row {row_num}. "
+                f"Leave it empty, or use '{OPERATION_DELETE}' with glossary-update.py."
+            )
+    if delete_rows:
+        errors.append(
+            f"Row(s) {', '.join(str(row_num) for row_num in delete_rows)} are marked "
+            f"'{OPERATION_DELETE}' in the '{OPERATION_COLUMN.capitalize()}' column. The full import "
+            f"replaces the whole glossary with the sheet and does not delete single rows. To delete "
+            f"specific terms or categories, use glossary-update.py, or remove the rows from the sheet "
+            f"(the full import deletes everything that isn't in the sheet)."
+        )
+    return errors
 
 
 def write_json_to_file(output_file_path, data):

@@ -53,6 +53,8 @@ Share the Google Sheet with the service account (`SA_EMAIL`) as a **Viewer** so 
         (`Sheet2` by default) with the header row `id, Aspect name, Aspect value`.
         See [Sheets file schema (Aspects)](#sheets-file-schema-aspects--second-sheet)
         below. The second sheet is optional.
+*   **Glossary Update**: The same sheet as the Glossary Import, with an optional
+    `Operation` column. See [Glossary Update](#2-glossary-update).
 *   **EntryLinks Import**: The sheet should contain the following header row (the format written by the EntryLinks export):
     `Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
     See [Sheets file schema (EntryLinks)](#sheets-file-schema-entrylinks) for what each column contains.
@@ -124,6 +126,12 @@ Where:
 *   `label1_value` (optional): Label1's value.
 *   `label2_key` (optional): Label2's key.
 *   `label2_value` (optional): Label2's value.
+
+The sheet may also have an `Operation` column (used by the
+[Glossary Update](#2-glossary-update)). The Glossary Import accepts it when it
+is empty, but refuses rows marked `delete`: the import replaces the whole
+glossary with the sheet, so it deletes everything that isn't in the sheet and
+can't delete single rows.
 
 ### Sheets file schema (Aspects — second sheet)
 
@@ -284,7 +292,123 @@ export GLOSSARY_ASPECTS_SHEET_NAME="Aspects"
 
 ---
 
-## 2. EntryLinks Import
+## 2. Glossary Update
+
+Applies only the changes in a glossary sheet to an existing Dataplex business
+glossary. Use it to add, change or delete a few terms and categories without
+re-importing the whole glossary.
+
+The script compares each row of the sheet with the glossary:
+
+*   A term or category that doesn't exist yet is **created**.
+*   One that differs from the sheet is **updated** (display name, description,
+    labels, parent, overview, contacts, and the custom aspects in the aspects
+    sheet).
+*   One that matches the sheet is left **unchanged**.
+*   A row whose `Operation` is `delete` is **deleted**.
+
+Terms and categories that aren't in the sheet are never touched. So the sheet
+can be a full export of the glossary in which a few rows were changed, or only
+the rows to change.
+
+Unlike the [Glossary Import](#1-glossary-import), which replaces the whole
+glossary with a metadata import job, the update changes one term or category at
+a time through the glossary and entry APIs. It doesn't need a Cloud Storage
+bucket, and the terms and categories it doesn't change keep their entry links,
+aspects and history.
+
+### Usage
+
+```bash
+python3 glossary-update.py \
+  --spreadsheet-url <SPREADSHEET_URL> \
+  --glossary-url <GLOSSARY_URL> \
+  [--dry-run] [--yes]
+```
+
+Start with `--dry-run` to see what would change. Without `--yes`, the script
+shows the changes and asks for confirmation before applying them; when the
+sheet deletes anything, you must type `yes`.
+
+### Arguments
+
+| Argument | Required | Description |
+|---|---|---|
+| `--spreadsheet-url` | Yes | Google Sheets URL of the glossary sheet. The tab in the URL (`#gid=...`) is used, otherwise the first tab. |
+| `--glossary-url` | Yes | The glossary: any URL or text that contains `projects/<project>/locations/<location>/glossaries/<glossary>` |
+| `--dry-run` | No | Show the changes and write the results file, without changing anything |
+| `--yes` | No | Apply the changes without asking for confirmation |
+| `--max-qpm` | No | Maximum glossary/entry write calls per minute (default: 250) |
+| `--skip-conflict-check` | No | Don't check that a term or category is unchanged since the script read it before changing it |
+| `--output-dir` | No | Directory for the results file (default: the current directory) |
+
+### Sheets file schema
+
+The sheet has the same columns as the [Glossary Import sheet](#sheets-file-schema-glossary),
+plus an optional `Operation` column (the header is not case-sensitive):
+
+| Operation | What happens |
+|---|---|
+| *(empty)* | The term or category is created if it doesn't exist, updated if it differs from the sheet, and left alone if it matches. |
+| `delete` | The term or category is deleted. Only the `id` is needed, plus `type` when a term and a category share that id. **A category is deleted together with everything in it** (its sub-categories and terms). |
+
+Rows are identified by their `id` and `type`. The `id` can't be changed: a row
+with a new `id` creates a new term or category.
+
+A blank cell clears the value, as in the Glossary Import (for example, a blank
+`overview` removes the overview). Custom aspects come from the aspects sheet, as
+in the Glossary Import; aspects and aspect fields that aren't in the aspects
+sheet are left as they are.
+
+The same validations as the Glossary Import apply to each row. The parent of a
+row must be a category that is in the sheet or already in the glossary, and the
+glossary's limits (5,000 terms, 200 categories, at most 4 levels counting the
+glossary) are checked for the result.
+
+### How changes are applied
+
+1.  Categories are created and moved, parents first. When two categories swap
+    places, one of them is moved to the top of the glossary first.
+2.  Terms are created and updated.
+3.  Overview, contacts and custom aspects are written. For a new term or
+    category, the script waits until Dataplex has created its catalog entry
+    (up to 60 seconds).
+4.  Terms are deleted, then categories (deepest first). A category is not
+    deleted when something inside it couldn't be deleted.
+
+Before changing or deleting an existing term or category, the script checks that
+it hasn't changed since the script read it. If it has (for example, someone
+edited it in the Cloud Console meanwhile), it's reported as a `CONFLICT` and left
+alone. A change that fails doesn't stop the others.
+
+The results are printed and written to
+`glossary-update-<glossary>-<timestamp>.csv`, one line per term or category with
+its action (`CREATE`, `UPDATE`, `UNCHANGED`, `DELETE`, `SKIP`) and status
+(`DONE`, `UNCHANGED`, `SKIPPED`, `CONFLICT`, `FAILED`). After fixing a problem,
+run the update again with the same sheet: what was already applied is now
+unchanged, so only the rest is applied.
+
+### Time
+
+The script reads the overview, contacts and aspects of every existing term or
+category that is in the sheet, so a full sheet takes about as long as an export
+even when only a few rows changed. Writes are limited to 250 per minute by
+default (`--max-qpm`); each created or changed term needs one or two writes.
+
+### Required permissions (Glossary Update)
+
+The account the script runs as needs:
+
+| Used for | Permissions | Predefined role that includes them |
+|---|---|---|
+| Reading the terms and categories, and their entries | `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get`, `dataplex.glossaryCategories.list`, `dataplex.glossaryCategories.get`, `dataplex.entries.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Creating, updating and deleting terms and categories | `dataplex.glossaryTerms.create`, `dataplex.glossaryTerms.update`, `dataplex.glossaryTerms.delete`, `dataplex.glossaryCategories.create`, `dataplex.glossaryCategories.update`, `dataplex.glossaryCategories.delete` | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
+| Writing overview, contacts and custom aspects (`entries.patch`) | `dataplex.entries.update`, and `dataplex.aspectTypes.use` on the custom aspect types | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
+| Reading the sheet | Viewer access to the spreadsheet | |
+
+---
+
+## 3. EntryLinks Import
 
 Imports EntryLinks into Dataplex from Google Sheets. The script reads entry link definitions from the spreadsheet, validates that referenced entries exist in Dataplex, groups them by entry group and link type, creates import JSON files, uploads them to GCS buckets, and triggers Dataplex CreateMetadataJob import jobs.
 

@@ -673,7 +673,7 @@ def _write_to_sheet(
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
             range=target_range,
-            valueInputOption='USER_ENTERED',
+            valueInputOption='RAW',
             body={'values': data}
         ).execute()
         logging.info(f"Data written to spreadsheet: {spreadsheet_id}")
