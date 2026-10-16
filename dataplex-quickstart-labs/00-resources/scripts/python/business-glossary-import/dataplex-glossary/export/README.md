@@ -113,6 +113,14 @@ Exports categories and terms from a Dataplex business glossary into Google Sheet
 python3 glossary-export.py
 ```
 
+The script prompts for the Google Sheet URL and the glossary URL
+(`.../dp-glossaries/projects/<project>/locations/<location>/glossaries/<glossary>`).
+`<project>` can be the project ID or the project number. Dataplex stores glossary
+entries under the project number, so the script resolves it with
+`resourcemanager.projects.get` (included in the Browser role, `roles/browser`).
+If it cannot, it logs a warning; in that case, pass the glossary URL with the
+project number.
+
 ### Sheets file schema (Glossary)
 
 The first line of the sheet contains the following header:
@@ -135,6 +143,118 @@ Where:
 *   `label1_value` (optional): Label1's value.
 *   `label2_key` (optional): Label2's key.
 *   `label2_value` (optional): Label2's value.
+
+### Sheets file schema (Aspects — second sheet)
+
+Custom Dataplex **Aspects** are exported to a **second worksheet** (`Sheet2` by
+default) using a normalized 3-column schema. Sheet 1 above is **unchanged**.
+
+`id, Aspect name, Aspect value`
+
+Where:
+
+*   `id` (required): Foreign key to the `id` column of Sheet 1. One term or
+    category may own many aspect rows.
+*   `Aspect name` (required): The aspect field identifier. Three forms are
+    accepted on import. Export writes the short form for aspect types in the
+    glossary's own project and location, and the qualified form for any other
+    aspect type (for example a `global` aspect type used on a regional
+    glossary, or one from a shared project), so that re-importing resolves to
+    the same aspect type. It falls back to the resource-path form when the
+    qualified form would be ambiguous (a project id containing `.` or `:`, or a
+    location the importer does not recognize):
+    *   Short — `<aspectTypeId>.<fieldName>`, e.g. `custom-gov.tier`
+    *   Qualified — `<project>.<location>.<aspectTypeId>.<fieldName>`, e.g.
+        `my-project.us-central1.custom-gov.tier`
+    *   Full resource path —
+        `projects/{project}/locations/{location}/aspectTypes/{aspectType}/{field}`
+
+    When the project/location are omitted they default to the **target
+    glossary's** project and location.
+
+    A map field whose keys contain `.` is written as a single JSON object cell
+    rather than as dotted sub-field rows, because dotted rows would rebuild a
+    different structure on import.
+*   `Aspect value` (required): The scalar or serialized value (see the datatype
+    table below).
+
+#### Worked example
+
+Sheet 1:
+
+| id | parent | display_name | description | overview | type | ... |
+|---|---|---|---|---|---|---|
+| `term-customer-id` | `cat-core` | Customer ID | Unique customer key | `<p>…</p>` | TERM | … |
+
+Sheet 2:
+
+| id | Aspect name | Aspect value |
+|---|---|---|
+| `term-customer-id` | `custom-gov.tier` | `HIGH` |
+| `term-customer-id` | `custom-gov.is_pii` | `true` |
+| `term-customer-id` | `custom-gov.retention_days` | `365` |
+| `term-customer-id` | `custom-gov.tags` | `["finance","core"]` |
+| `term-customer-id` | `custom-gov.owner.email` | `alice@example.com` |
+
+All five rows are aggregated into a **single** `custom-gov` aspect on the
+`term-customer-id` entry.
+
+#### Datatypes
+
+Types follow `AspectType.MetadataTemplate` in
+`google/cloud/dataplex/v1/catalog.proto`.
+
+| Type | Cell representation (export) | Parsed as (import) |
+|---|---|---|
+| `string` | verbatim | verbatim |
+| `enum` | verbatim | verbatim |
+| `int` | numeric literal, e.g. `365` | `int` |
+| `double` | numeric literal, e.g. `3.14` | `float` |
+| `bool` | `true` / `false` | `true`/`false`/`yes`/`no` (case-insensitive); `1`/`0` only when the AspectType declares the field `bool` |
+| `datetime` | RFC 3339 as returned, e.g. `2024-01-15T10:30:00Z` | verbatim string |
+| `array` | compact JSON array, e.g. `["finance","core"]` | JSON array; a comma-separated list is also accepted **only** when the AspectType declares the field `array` |
+| `record` / `map` | dotted sub-field rows (see below) | rebuilt into a nested object |
+
+**Record/map flattening boundary.** One level of nesting is flattened into
+dotted sub-field rows (`custom-gov.owner.email`). Anything **deeper** is written
+as a compact JSON object string in a single cell — e.g. a value of
+`{"owner": {"meta": {"x": 1}}}` exports as the row
+`custom-gov.owner.meta` = `{"x":1}`. Both forms round-trip through import.
+
+When the AspectType can be read (`dataplex.projects.locations.aspectTypes.get`),
+its `MetadataTemplate` drives the coercion. If it cannot be read (permission
+denied or missing), a warning is logged and value types are inferred
+heuristically.
+
+#### System aspects are never exported to Sheet 2
+
+`overview`, `contacts`, `glossary-term-aspect`, `glossary-category-aspect` and
+`glossary-aspect` are already represented by Sheet 1 columns (or are purely
+structural), so they are filtered out of Sheet 2. The filter matches the aspect
+type id in any project, so both `655216118709.global.overview` and
+`dataplex-types.global.overview` are recognized. Dataplex Business Glossary
+treats these ids as built-in in every project, so an aspect type of your own
+with one of these ids cannot round-trip through the glossary import; export
+logs a warning and skips it.
+
+#### Backward compatibility
+
+If the glossary has no custom aspects and the spreadsheet has no aspects tab,
+**no second sheet is created and nothing is written**: a single informational
+log line is emitted and the export is what it was before. If the aspects tab
+already exists from an earlier export, it is reset to just the header row.
+Glossary import replaces each term's and category's aspects with the
+spreadsheet contents, so leftover rows would otherwise bring back aspects that
+have since been removed. Sheet 1's 14-column schema is unchanged.
+
+#### Overriding the sheet name
+
+The aspects worksheet defaults to `Sheet2`. To use a different tab, set:
+
+```bash
+export GLOSSARY_ASPECTS_SHEET_NAME="Aspects"
+```
+
 
 ---
 
