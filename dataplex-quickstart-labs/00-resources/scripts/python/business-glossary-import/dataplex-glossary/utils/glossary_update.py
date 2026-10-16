@@ -129,7 +129,8 @@ def resolve_project_number(dataplex_service, glossary: GlossaryRef) -> str:
     """The number of the glossary's project, needed to name the catalog entries.
 
     Taken from the glossary URL when it already has the number, otherwise from the glossary's
-    resource name returned by Dataplex (which uses the number), otherwise from Resource Manager.
+    resource name returned by Dataplex when it has the number, otherwise from Resource Manager
+    (which needs resourcemanager.projects.get on the project).
 
     Raises:
         DataplexAPIError: If the glossary can't be read.

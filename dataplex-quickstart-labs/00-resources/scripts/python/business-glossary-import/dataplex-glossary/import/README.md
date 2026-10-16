@@ -424,6 +424,7 @@ The account the script runs as needs:
 | Reading the glossary, its terms and categories, and their entries | `dataplex.glossaries.get`, `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get`, `dataplex.glossaryCategories.list`, `dataplex.glossaryCategories.get`, `dataplex.entries.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
 | Creating, updating and deleting terms and categories | `dataplex.glossaryTerms.create`, `dataplex.glossaryTerms.update`, `dataplex.glossaryTerms.delete`, `dataplex.glossaryCategories.create`, `dataplex.glossaryCategories.update`, `dataplex.glossaryCategories.delete` | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
 | Writing overview, contacts and custom aspects (`entries.patch`) | `dataplex.entries.update`, `dataplex.entryGroups.useOverviewAspect` and `dataplex.entryGroups.useContactsAspect` on the glossary project's `@dataplex` entry group, and `dataplex.aspectTypes.use` on the custom aspect types | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
+| Finding the project number, when `--glossary-url` has the project id | `resourcemanager.projects.get` (or put the project number in `--glossary-url`) | Browser (`roles/browser`) |
 | Reading the sheet | Viewer access to the spreadsheet | |
 
 ---
