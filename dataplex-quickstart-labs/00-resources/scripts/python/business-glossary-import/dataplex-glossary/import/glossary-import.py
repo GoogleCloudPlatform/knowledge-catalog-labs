@@ -4,13 +4,21 @@ from google.auth import default
 from google.cloud import storage
 import os
 import re
+import sys
 import datetime
-from typing import List
+from typing import Any, Dict, List
 import argparse
 import time
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 import google.auth
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from utils import api_layer, business_glossary_utils, sheet_utils
+from utils.constants import ASPECT_SHEET_HEADERS, ASPECTS_SHEET_NAME_ENV_VAR, OPERATION_COLUMN, OPERATION_DELETE
+from utils.error import AspectSheetHeaderError, AspectValidationError, InvalidAspectIdentifierError
 
 # Regex pattern for the glossary URL, allowing any valid URL
 GLOSSARY_URL_PATTERN = re.compile(r".*dp-glossaries/projects/(?P<project_id>[^/]+)/locations/(?P<location_id>[^/]+)/glossaries/(?P<glossary_id>[^/?#]+).*")
@@ -149,6 +157,9 @@ class SheetProcessor:
         self.glossary_id = None
         self.project_location_base = None
         self.category_names = {}
+        # term/category id -> { aspect type resource -> aspect data dict }
+        self.aspects_by_id = {}
+        self._dataplex_service = None
         self._extract_glossary_ids()
         
     def _extract_glossary_ids(self):
@@ -388,6 +399,305 @@ class SheetProcessor:
         return ancestors_map
 
 
+    # ------------------------------------------------------------------
+    # Aspects sheet (Sheet 2)
+    # ------------------------------------------------------------------
+
+    def _get_dataplex_service(self):
+        """Lazily build a Dataplex service used to read AspectType schemas.
+
+        Returns:
+            A Dataplex API service object, or None when one cannot be built
+            (in which case value coercion falls back to heuristics).
+        """
+        if self._dataplex_service is None:
+            try:
+                self._dataplex_service = build('dataplex', 'v1', credentials=self.creds)
+            except Exception as service_error:
+                print(
+                    f"Warning: could not build a Dataplex client to read AspectType "
+                    f"schemas ({service_error}). Falling back to heuristic value coercion."
+                )
+                self._dataplex_service = False
+        return self._dataplex_service or None
+
+    def _get_aspect_field_types(self, aspect_type_resource):
+        """Return {field path: declared type} for an AspectType, or {} on failure.
+
+        Args:
+            aspect_type_resource: Full AspectType resource name.
+
+        Returns:
+            Mapping of dotted field path to MetadataTemplate type. Empty when
+            the AspectType cannot be read, signalling heuristic coercion.
+        """
+        dataplex_service = self._get_dataplex_service()
+        if not dataplex_service:
+            return {}
+        try:
+            return api_layer.get_aspect_field_types(
+                dataplex_service, aspect_type_resource, self.project_id
+            )
+        except Exception as schema_error:
+            print(
+                f"Warning: could not read AspectType {aspect_type_resource} "
+                f"({schema_error}). Falling back to heuristic value coercion."
+            )
+            return {}
+
+    def _validate_aspect_row(self, aspect_row, known_ids, seen_pairs):
+        """Validates a single aspect row from Sheet 2.
+
+        Args:
+            aspect_row: The AspectRow to validate.
+            known_ids: Set of ids declared in Sheet 1.
+            seen_pairs: Set of already-seen (id, aspect type resource, field
+                name) keys, mutated in place so duplicates are reported on
+                their second occurrence. The key uses the parsed identifier,
+                so equivalent spellings ('custom-gov.tier' and its qualified or
+                resource-path form) are caught, while field names stay
+                case-sensitive like the MetadataTemplate.
+
+        Returns:
+            The ParsedAspectIdentifier for the row.
+
+        Raises:
+            AspectValidationError: If the id is missing/unknown, the aspect
+                name is missing, or the (id, aspect name) pair is duplicated.
+            InvalidAspectIdentifierError: If the aspect name is malformed.
+        """
+        row_num = aspect_row.row_number
+
+        if not aspect_row.term_id:
+            raise AspectValidationError(
+                f"Missing '{ASPECT_SHEET_HEADERS[0]}' value in aspects sheet row {row_num}."
+            )
+        if not aspect_row.aspect_name:
+            raise AspectValidationError(
+                f"Missing '{ASPECT_SHEET_HEADERS[1]}' value in aspects sheet row {row_num}."
+            )
+        if aspect_row.term_id not in known_ids:
+            raise AspectValidationError(
+                f"Unknown '{ASPECT_SHEET_HEADERS[0]}' '{aspect_row.term_id}' in aspects sheet "
+                f"row {row_num}. Every aspect row must reference an id present in the "
+                f"glossary sheet."
+            )
+
+        try:
+            parsed = business_glossary_utils.parse_aspect_identifier(
+                aspect_row.aspect_name,
+                default_project=self.project_id,
+                default_location=self.location_id,
+            )
+        except InvalidAspectIdentifierError as parse_error:
+            raise InvalidAspectIdentifierError(
+                f"Invalid '{ASPECT_SHEET_HEADERS[1]}' in aspects sheet row {row_num}: {parse_error}"
+            )
+
+        if business_glossary_utils.is_system_aspect(parsed.aspect_type_id):
+            raise AspectValidationError(
+                f"System aspect '{aspect_row.aspect_name}' in aspects sheet row {row_num} is "
+                f"not allowed. Aspect type id '{parsed.aspect_type_id}' is reserved by Dataplex "
+                f"Business Glossary (overview and contacts are set from the glossary sheet "
+                f"columns; glossary-* aspects are structural) in any project or location."
+            )
+
+        pair_key = (
+            aspect_row.term_id,
+            parsed.aspect_type_resource.lower(),
+            parsed.field_name,
+        )
+        if pair_key in seen_pairs:
+            raise AspectValidationError(
+                f"Duplicate ('{ASPECT_SHEET_HEADERS[0]}', '{ASPECT_SHEET_HEADERS[1]}') pair "
+                f"('{aspect_row.term_id}', '{aspect_row.aspect_name}') in aspects sheet "
+                f"row {row_num}."
+            )
+        seen_pairs.add(pair_key)
+
+        return parsed
+
+    @staticmethod
+    def _warn_no_custom_aspects(sheet_name, reason):
+        """Prints the warning shown when the import will carry no custom aspects.
+
+        Dataplex glossary import recreates every term and category that is
+        already in the glossary from the import file alone, so any custom
+        aspect currently attached to them is removed when the file carries
+        none. The user must hear about that before the job runs.
+        """
+        print(
+            f"WARNING: {reason}; importing without custom aspects. Glossary import replaces "
+            f"the aspects of every imported term and category with the contents of the "
+            f"spreadsheet, so any custom aspects currently attached to them in Dataplex will "
+            f"be REMOVED. To keep them, export the glossary first so that '{sheet_name}' is "
+            f"populated, then edit and re-import that spreadsheet."
+        )
+
+    def read_aspects(self, spreadsheet=None, known_ids=None):
+        """Reads and resolves custom aspects from the aspects sheet (Sheet 2).
+
+        All rows sharing an (id, aspect type) are aggregated into a single
+        aspect ``data`` dict. Dotted field names rebuild nested records, so
+        'custom-gov.owner.email' becomes ``{'owner': {'email': ...}}``.
+
+        A missing, blank or header-only aspects sheet means "no custom
+        aspects": a warning is printed (existing custom aspects on the imported
+        entries will be removed) and an empty mapping is returned, so existing
+        single-sheet spreadsheets still import. Anything else that prevents the
+        sheet from being read reliably (the spreadsheet or worksheet cannot be
+        opened, the values cannot be read, the header is wrong) fails the
+        import instead, because carrying on would silently remove aspects.
+
+        Args:
+            spreadsheet: An open gspread Spreadsheet. Opened from sheet_url
+                when not supplied.
+            known_ids: Set of ids declared in Sheet 1, used to reject orphan
+                aspect rows. Validation of unknown ids is skipped when None.
+
+        Returns:
+            A tuple (is_valid, aspects_by_id) where aspects_by_id maps
+            term/category id -> aspect type resource -> aspect data dict.
+        """
+        sheet_name = sheet_utils.resolve_aspects_sheet_name()
+
+        if spreadsheet is None:
+            try:
+                spreadsheet = gspread.authorize(self.creds).open_by_url(self.sheet_url)
+            except Exception as open_error:
+                print(
+                    f"Could not open the spreadsheet to read the aspects sheet "
+                    f"'{sheet_name}': {open_error}"
+                )
+                return False, {}
+
+        try:
+            worksheet = spreadsheet.worksheet(sheet_name)
+        except gspread.exceptions.WorksheetNotFound:
+            self._warn_no_custom_aspects(sheet_name, f"No '{sheet_name}' worksheet found")
+            return True, {}
+        except Exception as worksheet_error:
+            print(f"Could not open the aspects sheet '{sheet_name}': {worksheet_error}")
+            return False, {}
+
+        try:
+            raw_values = worksheet.get_all_values()
+        except Exception as read_error:
+            print(f"Could not read the aspects sheet '{sheet_name}': {read_error}")
+            return False, {}
+
+        try:
+            aspect_rows = sheet_utils.rows_to_aspect_rows(raw_values)
+        except AspectSheetHeaderError as header_error:
+            print(
+                f"Invalid aspects sheet '{sheet_name}': {header_error} Fix the header row. If "
+                f"this tab is not meant to hold aspects, rename it or set "
+                f"{ASPECTS_SHEET_NAME_ENV_VAR} to the tab that does."
+            )
+            return False, {}
+
+        if not aspect_rows:
+            self._warn_no_custom_aspects(sheet_name, f"The aspects sheet '{sheet_name}' is empty")
+            return True, {}
+
+        is_valid = True
+        seen_pairs = set()
+        assigned_paths = {}
+        field_types_cache = {}
+        aspects_by_id = {}
+
+        for aspect_row in aspect_rows:
+            try:
+                parsed = self._validate_aspect_row(
+                    aspect_row, known_ids if known_ids is not None else {aspect_row.term_id}, seen_pairs
+                )
+            except (AspectValidationError, InvalidAspectIdentifierError) as validation_error:
+                is_valid = False
+                print(f"Invalid aspect data: {validation_error}")
+                continue
+
+            aspect_type_resource = parsed.aspect_type_resource
+
+            # Reject overlapping fields ('owner' and 'owner.email') whatever
+            # the row order, so no row can silently overwrite another.
+            paths_for_aspect = assigned_paths.setdefault(
+                (aspect_row.term_id, aspect_type_resource.lower()), {}
+            )
+            new_path = tuple(parsed.field_path)
+            conflicting_path = business_glossary_utils.find_conflicting_field_path(
+                paths_for_aspect, new_path
+            )
+            if conflicting_path is not None:
+                is_valid = False
+                print(
+                    f"Invalid aspect data in aspects sheet row {aspect_row.row_number}: field "
+                    f"'{'.'.join(new_path)}' overlaps field '{'.'.join(conflicting_path)}' set in "
+                    f"row {paths_for_aspect[conflicting_path]} for the same id and aspect type. "
+                    f"Use either the whole value or its sub-fields, not both."
+                )
+                continue
+            paths_for_aspect[new_path] = aspect_row.row_number
+
+            if aspect_type_resource not in field_types_cache:
+                field_types_cache[aspect_type_resource] = self._get_aspect_field_types(
+                    aspect_type_resource
+                )
+            field_types = field_types_cache[aspect_type_resource]
+
+            coerced_value = business_glossary_utils.coerce_aspect_value(
+                aspect_row.aspect_value, field_types.get(parsed.field_name)
+            )
+
+            aspect_data = aspects_by_id.setdefault(aspect_row.term_id, {}).setdefault(
+                aspect_type_resource, {}
+            )
+            try:
+                business_glossary_utils.set_nested_aspect_field(
+                    aspect_data, parsed.field_path, coerced_value
+                )
+            except InvalidAspectIdentifierError as nesting_error:
+                is_valid = False
+                print(
+                    f"Invalid aspect data in aspects sheet row {aspect_row.row_number}: "
+                    f"{nesting_error}"
+                )
+
+        aspect_count = sum(len(by_type) for by_type in aspects_by_id.values())
+        print(
+            f"Resolved {aspect_count} custom aspect(s) across {len(aspects_by_id)} "
+            f"term(s)/category(ies) from '{sheet_name}'."
+        )
+        return is_valid, aspects_by_id
+
+    def get_aspect_type_resources(self):
+        """Returns the sorted list of unique custom AspectType resource names from Sheet 2."""
+        return sorted({
+            aspect_type_resource
+            for by_type in self.aspects_by_id.values()
+            for aspect_type_resource in by_type
+        })
+
+    def _build_custom_aspects(self, row_id):
+        """Builds the custom aspects payload fragment for one term/category.
+
+        Args:
+            row_id: The Sheet 1 id of the term or category.
+
+        Returns:
+            Mapping of aspects-map key -> {'aspectType': ..., 'data': ...},
+            empty when the row has no custom aspects.
+        """
+        custom_aspects = {}
+        for aspect_type_resource, aspect_data in self.aspects_by_id.get(row_id, {}).items():
+            aspect_key = business_glossary_utils.aspect_key_from_resource(aspect_type_resource)
+            custom_aspects[aspect_key] = {
+                "aspectType": aspect_type_resource,
+                "data": aspect_data,
+            }
+        return custom_aspects
+
+
+
     def _convert_to_import_item(self, row_data, ancestors):
         entry_type = ""
         resource = ""
@@ -404,10 +714,17 @@ class SheetProcessor:
         if row_data[LABEL2_KEY_COLUMN_NAME] and row_data[LABEL2_VALUE_COLUMN_NAME]:
             labels[row_data[LABEL2_KEY_COLUMN_NAME]] = row_data[LABEL2_VALUE_COLUMN_NAME]
         
+        # Custom aspects resolved from the aspects sheet (Sheet 2). These are
+        # merged FIRST so the three system aspects below always win, and a
+        # malformed custom row can never clobber overview/contacts/structural
+        # aspects.
+        custom_aspects = self._build_custom_aspects(row_data[ID_COLUMN])
+
         if row_data["type"] == TERM_TYPE:
             entry_type = "projects/dataplex-types/locations/global/entryTypes/glossary-term"
             resource = f"{self.project_location_base}/glossaries/{self.glossary_id}/terms/{row_data[ID_COLUMN]}"
             aspects = {
+                **custom_aspects,
                 "dataplex-types.global.glossary-term-aspect": {"data": {}}, 
                 "dataplex-types.global.overview": {"data": {"content": row_data[OVERVIEW_COLUMN_NAME]}},
                 "dataplex-types.global.contacts": {"data": {"identities": identities}}
@@ -416,6 +733,7 @@ class SheetProcessor:
             entry_type = "projects/dataplex-types/locations/global/entryTypes/glossary-category"
             resource = f"{self.project_location_base}/glossaries/{self.glossary_id}/categories/{row_data[ID_COLUMN]}"
             aspects = {
+                **custom_aspects,
                 "dataplex-types.global.glossary-category-aspect": {"data": {}}, 
                 "dataplex-types.global.overview": {"data": {"content": row_data[OVERVIEW_COLUMN_NAME]}},
                 "dataplex-types.global.contacts": {"data": {"identities": identities}}
@@ -446,7 +764,8 @@ class SheetProcessor:
 
     def read_and_validate_data(self):
         gc = gspread.authorize(self.creds)
-        sheet = gc.open_by_url(self.sheet_url).sheet1
+        spreadsheet = gc.open_by_url(self.sheet_url)
+        sheet = spreadsheet.sheet1
         data = sheet.get_all_values()
         if not data:
             print("No data found in the sheet.")
@@ -461,10 +780,24 @@ class SheetProcessor:
         # Trim whitespace
         headers = [header.strip() for header in headers]
 
-        if set(headers) != ALLOWED_HEADERS:
-            print(f"Invalid sheet. The first row of the sheet should be headers conatin exactly : {ALLOWED_HEADERS}. Actual headers: {headers}")
+        # The optional 'Operation' column is used by glossary-update.py. The full import
+        # accepts it, so the same sheet works for both scripts, but it can't delete single
+        # rows: it replaces the whole glossary with the sheet.
+        operation_header = next((header for header in headers if header.lower() == OPERATION_COLUMN), None)
+        column_headers = [header for header in headers if header != operation_header]
+
+        if set(column_headers) != ALLOWED_HEADERS:
+            print(f"Invalid sheet. The first row of the sheet should be headers conatin exactly : {ALLOWED_HEADERS}, and optionally '{OPERATION_COLUMN.capitalize()}'. Actual headers: {headers}")
             is_dump_valid = False
             return is_dump_valid, dump_entries
+
+        if operation_header:
+            operation_errors = _check_operation_column(data[1:], headers.index(operation_header))
+            if operation_errors:
+                for operation_error in operation_errors:
+                    print(operation_error)
+                is_dump_valid = False
+                return is_dump_valid, dump_entries
 
         # First, populate category_names
         for row_num, row in enumerate(data[1:], start=2):
@@ -515,7 +848,18 @@ class SheetProcessor:
         if not is_dump_valid:
             print("Dump is not valid. Please fix the errors and try again.")
             return is_dump_valid, dump_entries
-        
+
+        # Read the aspects sheet (Sheet 2). Absent/empty means "no custom
+        # aspects" (with a warning, since existing custom aspects on the
+        # imported entries will be removed); an unreadable sheet or malformed
+        # rows invalidate the dump just like Sheet 1 validation errors do.
+        known_ids = {row_data[ID_COLUMN] for row_data in valid_rows if row_data.get(ID_COLUMN)}
+        aspects_valid, self.aspects_by_id = self.read_aspects(spreadsheet, known_ids)
+        if not aspects_valid:
+            is_dump_valid = False
+            print("Aspects sheet is not valid. Please fix the errors and try again.")
+            return is_dump_valid, dump_entries
+
         ancestors_map = self._generate_ancestors(valid_rows)
         
         if not ancestors_map:
@@ -528,6 +872,38 @@ class SheetProcessor:
                 dump_entries.append(self._convert_to_import_item(row_data, ancestors_map[entry_name]))
 
         return is_dump_valid, dump_entries
+
+
+def _check_operation_column(rows, operation_index):
+    """Errors for the 'Operation' column of the full import: it can't delete single rows.
+
+    Args:
+        rows: The sheet rows, header excluded.
+        operation_index: The index of the 'Operation' column.
+
+    Returns:
+        A list of error messages, empty when every Operation cell is blank.
+    """
+    delete_rows = []
+    errors = []
+    for row_num, row in enumerate(rows, start=2):
+        operation = row[operation_index].strip().lower() if operation_index < len(row) else ""
+        if operation == OPERATION_DELETE:
+            delete_rows.append(row_num)
+        elif operation:
+            errors.append(
+                f"Invalid '{OPERATION_COLUMN.capitalize()}' value '{operation}' in row {row_num}. "
+                f"Leave it empty, or use '{OPERATION_DELETE}' with glossary-update.py."
+            )
+    if delete_rows:
+        errors.append(
+            f"Row(s) {', '.join(str(row_num) for row_num in delete_rows)} are marked "
+            f"'{OPERATION_DELETE}' in the '{OPERATION_COLUMN.capitalize()}' column. The full import "
+            f"replaces the whole glossary with the sheet and does not delete single rows. To delete "
+            f"specific terms or categories, use glossary-update.py, or remove the rows from the sheet "
+            f"(the full import deletes everything that isn't in the sheet)."
+        )
+    return errors
 
 
 def write_json_to_file(output_file_path, data):
@@ -576,7 +952,9 @@ def upload_to_gcs(creds, bucket_id, file_path):
 
 
 
-def process_sheet_to_json_and_upload(sheet_url, glossary_url, output_file_path, bucket_id):
+def process_sheet_to_json_and_upload(
+    sheet_url, glossary_url, output_file_path, bucket_id, aspect_types_out=None
+):
     """
     Orchestrates reading, validation, processing, and uploading data.
     """
@@ -593,6 +971,10 @@ def process_sheet_to_json_and_upload(sheet_url, glossary_url, output_file_path, 
 
         if not is_dump_valid:
             return False
+
+        if aspect_types_out is not None:
+            aspect_types_out.clear()
+            aspect_types_out.extend(sheet_processor.get_aspect_type_resources())
 
         write_json_to_file(output_file_path, dump_entries)
 
@@ -614,12 +996,18 @@ def create_dataplex_metadata_job(
     location_id,
     job_id,
     bucket_id,
-    glossary_name
+    glossary_name,
+    aspect_types=None
 ):
     try:
         credentials, _ = google.auth.default()
         service = build('dataplex', 'v1', credentials=credentials)
         parent = f"projects/{project_id}/locations/{location_id}"
+        scope = {
+            "glossaries": f"{glossary_name}"
+        }
+        if aspect_types:
+            scope["aspect_types"] = list(aspect_types)
         metadata_job_body = {
             "type": "IMPORT",
             "import_spec": {
@@ -627,9 +1015,7 @@ def create_dataplex_metadata_job(
                 "source_storage_uri": f"gs://{bucket_id}/",
                 "entry_sync_mode":"FULL",
                 "aspect_sync_mode":"INCREMENTAL",
-                "scope":{
-                    "glossaries": f"{glossary_name}"
-                }
+                "scope": scope
             }
         }
 
@@ -698,11 +1084,16 @@ if __name__ == "__main__":
     glossary_name = f"projects/{project_id}/locations/{location_id}/glossaries/{glossary_id}"
     output_file = f"{glossary_id}-{TIMESTAMP}-exported.json"
     
-    is_successful = process_sheet_to_json_and_upload(sheet_url, glossary_url, output_file, bucket_id)
+    aspect_types = []
+    is_successful = process_sheet_to_json_and_upload(
+        sheet_url, glossary_url, output_file, bucket_id, aspect_types_out=aspect_types
+    )
 
     if is_successful and bucket_id:
         job_id = f"{glossary_id}-{TIMESTAMP}"
-        operation = create_dataplex_metadata_job(project_id, location_id, job_id, bucket_id, glossary_name)
+        operation = create_dataplex_metadata_job(
+            project_id, location_id, job_id, bucket_id, glossary_name, aspect_types=aspect_types
+        )
         if operation:
             print("\nCreate Metadata Job Operation initiated:")
             print(json.dumps(operation, indent=2))

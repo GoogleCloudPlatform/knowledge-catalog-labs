@@ -25,6 +25,13 @@ The test suite covers the following modules:
    - `group_entrylinks()` - Main grouping function
    - `main()` - Main import workflow
 
+- **test_glossary_update.py** - Tests for glossary-update.py and utils/glossary_update.py
+   - `parse_sheet()` - Glossary sheet with the optional Operation column, validated like the full import
+   - `build_plan()` - Create / update / unchanged / delete (whole categories) and tree validation
+   - `schedule_category_operations()` - Valid order for category creations and moves
+   - `apply_plan()` - Order of the API calls, aspects, conflicts and failures
+   - The Operation column in glossary-import.py and the RAW values written by glossary-export.py
+
 ### API and Service Layers
 3. **test_api_layer.py** - Tests for api_layer.py
    - `authenticate_dataplex()` - Dataplex API authentication

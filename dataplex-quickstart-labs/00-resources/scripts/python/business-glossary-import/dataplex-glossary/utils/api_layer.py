@@ -1,5 +1,6 @@
 """API Layer for Dataplex Glossary Operations."""
 
+import json
 import os
 import sys
 import threading
@@ -23,7 +24,12 @@ from .constants import (
     DATAPLEX_BASE_URL,
     ENTRY_NAME_PATTERN,
     ENTRY_READ_API_CALL_DELAY_SECONDS,
+    ENTRY_WRITE_API_CALL_DELAY_SECONDS,
     EXCLUDED_LOCATIONS,
+    GLOSSARY_CATEGORY_TYPE,
+    GLOSSARY_READ_API_CALL_DELAY_SECONDS,
+    GLOSSARY_TERM_TYPE,
+    GLOSSARY_WRITE_API_CALL_DELAY_SECONDS,
     PAGE_SIZE,
     PLAIN_BIGQUERY_ENTRY_ID_PATTERN,
     PROJECT_PATTERN,
@@ -62,6 +68,8 @@ _project_number_to_id_cache: Dict[str, str] = {}
 _known_entry_names: set = set()
 # (project ID, dataset ID) -> location of the BigQuery dataset's entries, learned from resolved entries.
 _bigquery_dataset_locations: Dict[tuple, str] = {}
+_aspect_type_cache: Dict[str, Optional[Dict]] = {}
+
 
 _MISSING = object()
 _key_locks: Dict[tuple, threading.RLock] = {}
@@ -82,7 +90,7 @@ def clear_caches():
         _locations_cache, _glossary_cache, _term_cache, _project_glossaries_cache,
         _glossary_terms_cache, _fqn_to_entry_cache, _entry_to_fqn_cache,
         _project_id_to_number_cache, _project_number_to_id_cache, _known_entry_names,
-        _bigquery_dataset_locations,
+        _bigquery_dataset_locations, _aspect_type_cache,
     ):
         cache.clear()
     with _key_locks_guard:
@@ -168,14 +176,52 @@ class _RateLimiter:
 _entry_links_rate_limiter = _RateLimiter(API_CALL_DELAY_SECONDS)  # lookupEntryLinks
 _search_rate_limiter = _RateLimiter(SEARCH_API_CALL_DELAY_SECONDS)  # searchEntries
 _entry_read_rate_limiter = _RateLimiter(ENTRY_READ_API_CALL_DELAY_SECONDS)  # lookupEntry
+_write_rate_limiter = _RateLimiter(GLOSSARY_WRITE_API_CALL_DELAY_SECONDS)  # term/category create/patch/delete
+_glossary_read_rate_limiter = _RateLimiter(GLOSSARY_READ_API_CALL_DELAY_SECONDS)  # term/category get
+_entry_write_rate_limiter = _RateLimiter(ENTRY_WRITE_API_CALL_DELAY_SECONDS)  # entries.patch
 
 
-def _execute_rate_limited(rate_limiter: _RateLimiter, request, description: str) -> Any:
+def _execute_rate_limited(
+    rate_limiter: _RateLimiter,
+    request,
+    description: str,
+    is_retryable: Callable[[Exception], bool] = is_retryable_google_api_error,
+) -> Any:
     """Execute a Google API client request with retries, waiting for `rate_limiter` before every attempt."""
     def attempt():
         rate_limiter.wait()
         return request.execute()
-    return execute_with_retry(attempt, description)
+    if is_retryable is is_retryable_google_api_error:
+        return execute_with_retry(attempt, description)
+    return execute_with_retry(attempt, description, is_retryable=is_retryable)
+
+
+def http_error_status_name(error: Exception) -> str:
+    """The canonical status of a Google API error (e.g. 'ALREADY_EXISTS'), or '' if unknown."""
+    content = getattr(error, "content", None)
+    if not content:
+        return ""
+    try:
+        body = json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    error_body = body.get("error") if isinstance(body, dict) else None
+    status = error_body.get("status") if isinstance(error_body, dict) else None
+    return status if isinstance(status, str) else ""
+
+
+def _is_retryable_write_error(error: Exception) -> bool:
+    """Network, 429 and 5xx errors, and ABORTED (HTTP 409 for a concurrent transaction).
+
+    ALREADY_EXISTS is also HTTP 409, but isn't retried: the caller handles it.
+    """
+    if is_retryable_google_api_error(error):
+        return True
+    return (
+        isinstance(error, HttpError)
+        and getattr(error.resp, "status", None) == 409
+        and http_error_status_name(error) == "ABORTED"
+    )
 
 
 def initialize_locations_cache(user_project: str) -> List[str]:
@@ -240,6 +286,123 @@ def list_glossary_terms(dataplex_service: build, glossary_name: str) -> List[Dic
     
     logger.debug(f"Response: {len(all_terms)} terms for {glossary_name}")
     return all_terms
+
+
+def list_glossary_categories(dataplex_service: build, glossary_name: str) -> List[Dict]:
+    """Lists categories from a Dataplex glossary with pagination support.
+
+    Returns an empty list when the glossary has no categories.
+    """
+    all_categories = []
+    logger.debug(f"Request: glossaries.categories.list(parent={glossary_name})")
+    categories_api = dataplex_service.projects().locations().glossaries().categories()
+    categories_request = categories_api.list(parent=glossary_name, pageSize=PAGE_SIZE)
+
+    while categories_request:
+        try:
+            page_response = execute_with_retry(
+                categories_request.execute,
+                f"List glossary categories for {glossary_name}"
+            )
+        except Exception as categories_error:
+            raise DataplexAPIError(
+                f"Error while listing glossary categories for {glossary_name}: {categories_error}"
+            )
+
+        all_categories.extend(page_response.get('categories', []))
+        categories_request = categories_api.list_next(categories_request, page_response)
+
+    logger.debug(f"Response: {len(all_categories)} categories for {glossary_name}")
+    return all_categories
+
+
+# -----------------------------------------------------------------------------
+# Glossary term/category and entry writes (used by glossary-update.py)
+# -----------------------------------------------------------------------------
+
+def set_write_rate_limit(max_calls_per_minute: int) -> None:
+    """Limit term/category creates, updates and deletes to `max_calls_per_minute` across all threads."""
+    if max_calls_per_minute <= 0:
+        raise ValueError("max_calls_per_minute must be positive")
+    _write_rate_limiter.min_interval_seconds = 60.0 / max_calls_per_minute
+
+
+def _glossary_collection(dataplex_service: build, resource_type: str):
+    """The terms() or categories() collection of the Dataplex API for a term or a category."""
+    glossaries = dataplex_service.projects().locations().glossaries()
+    if resource_type == GLOSSARY_TERM_TYPE:
+        return glossaries.terms()
+    if resource_type == GLOSSARY_CATEGORY_TYPE:
+        return glossaries.categories()
+    raise ValueError(f"Unknown glossary resource type: {resource_type}")
+
+
+def get_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> Dict:
+    """Fetch the current state of a glossary term or category (not cached)."""
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.get(name={resource_name})")
+    request = _glossary_collection(dataplex_service, resource_type).get(name=resource_name)
+    return _execute_rate_limited(_glossary_read_rate_limiter, request, f"Get {resource_type.lower()} {resource_name}")
+
+
+def create_glossary_resource(
+    dataplex_service: build, glossary_name: str, resource_type: str, resource_id: str, body: Dict
+) -> Dict:
+    """Create a glossary term or category with the given id under `glossary_name`.
+
+    `body` holds displayName, description, labels and parent (the glossary or a category).
+    """
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.create(id={resource_id}, body={body})")
+    collection = _glossary_collection(dataplex_service, resource_type)
+    if resource_type == GLOSSARY_TERM_TYPE:
+        request = collection.create(parent=glossary_name, termId=resource_id, body=body)
+    else:
+        request = collection.create(parent=glossary_name, categoryId=resource_id, body=body)
+    return _execute_rate_limited(
+        _write_rate_limiter, request, f"Create {resource_type.lower()} {resource_id}", is_retryable=_is_retryable_write_error
+    )
+
+
+def update_glossary_resource(
+    dataplex_service: build, resource_name: str, resource_type: str, body: Dict, update_mask: List[str]
+) -> Dict:
+    """Update the fields in `update_mask` (display_name, description, labels, parent) of a term or category."""
+    mask = ",".join(update_mask)
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.patch(name={resource_name}, updateMask={mask})")
+    request = _glossary_collection(dataplex_service, resource_type).patch(
+        name=resource_name, updateMask=mask, body=body
+    )
+    return _execute_rate_limited(
+        _write_rate_limiter, request, f"Update {resource_type.lower()} {resource_name}", is_retryable=_is_retryable_write_error
+    )
+
+
+def delete_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> None:
+    """Delete a glossary term or category."""
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.delete(name={resource_name})")
+    request = _glossary_collection(dataplex_service, resource_type).delete(name=resource_name)
+    _execute_rate_limited(
+        _write_rate_limiter, request, f"Delete {resource_type.lower()} {resource_name}", is_retryable=_is_retryable_write_error
+    )
+
+
+def update_entry_aspects(
+    dataplex_service: build, entry_name: str, aspects: Dict[str, Dict], entry_type: str = ""
+) -> Dict:
+    """Write the given aspects of an entry, leaving its other aspects unchanged.
+
+    `aspects` maps aspect keys (e.g. 'dataplex-types.global.overview') to {'data': {...}}.
+    """
+    body = {"name": entry_name, "aspects": aspects}
+    if entry_type:
+        body["entryType"] = entry_type
+    aspect_keys = sorted(aspects)
+    logger.debug(f"Request: entries.patch(name={entry_name}, aspectKeys={aspect_keys})")
+    request = dataplex_service.projects().locations().entryGroups().entries().patch(
+        name=entry_name, updateMask="aspects", aspectKeys=aspect_keys, body=body
+    )
+    return _execute_rate_limited(
+        _entry_write_rate_limiter, request, f"Update aspects of {entry_name}", is_retryable=_is_retryable_write_error
+    )
 
 def parse_entry_name(entry_name: str) -> tuple:
     """Parse a full entry resource name to extract project, location, entry group, and entry ID."""
@@ -1078,3 +1241,118 @@ def lookup_entry_by_fqn(dataplex_service: build, fqn: str, user_project: str) ->
 def is_known_entry(entry_name: str) -> bool:
     """Whether the entry was already confirmed to exist while resolving sheet rows."""
     return entry_name in _known_entry_names
+
+
+def get_aspect_type(
+    dataplex_service: build, aspect_type_resource: str, user_project: str = ""
+) -> Optional[Dict]:
+    """Fetch an AspectType resource by name, with in-memory caching.
+
+    Permission and not-found failures are treated as "schema unavailable"
+    rather than fatal: the caller then falls back to heuristic value coercion.
+    Negative results are cached too, so a missing AspectType is only looked up
+    once per run.
+
+    Args:
+        dataplex_service: The Dataplex API service object.
+        aspect_type_resource: Full AspectType resource name, i.e.
+            'projects/{project}/locations/{location}/aspectTypes/{aspect_type}'.
+        user_project: Optional project used for billing/quota attribution.
+
+    Returns:
+        The AspectType resource dict, or None when it cannot be read.
+    """
+    if not aspect_type_resource:
+        return None
+
+    if aspect_type_resource in _aspect_type_cache:
+        return _aspect_type_cache[aspect_type_resource]
+
+    logger.debug(f"Request: aspectTypes.get(name={aspect_type_resource})")
+    try:
+        request = dataplex_service.projects().locations().aspectTypes().get(
+            name=aspect_type_resource
+        )
+        response = execute_with_retry(
+            request.execute, f"Get aspect type {aspect_type_resource}"
+        )
+        _aspect_type_cache[aspect_type_resource] = response
+        return response
+    except HttpError as http_error:
+        status_code = http_error.resp.status if hasattr(http_error, 'resp') else None
+        if status_code in (401, 403, 404):
+            logger.warning(
+                f"Could not read AspectType {aspect_type_resource} (HTTP {status_code}). "
+                f"Falling back to heuristic value coercion."
+            )
+            _aspect_type_cache[aspect_type_resource] = None
+            return None
+        logger.warning(
+            f"Error fetching AspectType {aspect_type_resource}: {http_error}. "
+            f"Falling back to heuristic value coercion."
+        )
+        _aspect_type_cache[aspect_type_resource] = None
+        return None
+    except Exception as aspect_type_error:
+        logger.warning(
+            f"Error fetching AspectType {aspect_type_resource}: {aspect_type_error}. "
+            f"Falling back to heuristic value coercion."
+        )
+        _aspect_type_cache[aspect_type_resource] = None
+        return None
+
+
+def _flatten_metadata_template(
+    template: Dict, prefix: str = "", field_types: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
+    """Flatten an AspectType MetadataTemplate into a {field_path: type} map.
+
+    Record sub-fields are recorded under their dotted path ('owner.email') so
+    they line up with the dotted 'Aspect name' values used in Sheet 2.
+
+    Args:
+        template: A MetadataTemplate node.
+        prefix: Dotted path accumulated so far.
+        field_types: Accumulator dict (created on first call).
+
+    Returns:
+        Mapping of dotted field path to declared MetadataTemplate type.
+    """
+    if field_types is None:
+        field_types = {}
+    if not isinstance(template, dict):
+        return field_types
+
+    for record_field in template.get('recordFields', []) or []:
+        field_name = record_field.get('name')
+        if not field_name:
+            continue
+        field_path = f"{prefix}.{field_name}" if prefix else field_name
+        field_type = (record_field.get('type') or '').lower()
+        if field_type:
+            field_types[field_path] = field_type
+        if record_field.get('recordFields'):
+            _flatten_metadata_template(record_field, field_path, field_types)
+
+    return field_types
+
+
+def get_aspect_field_types(
+    dataplex_service: build, aspect_type_resource: str, user_project: str = ""
+) -> Dict[str, str]:
+    """Return the declared field types for an AspectType.
+
+    Args:
+        dataplex_service: The Dataplex API service object.
+        aspect_type_resource: Full AspectType resource name.
+        user_project: Optional project used for billing/quota attribution.
+
+    Returns:
+        Mapping of dotted field path to MetadataTemplate type (e.g.
+        {'tier': 'string', 'is_pii': 'bool', 'owner.email': 'string'}). Empty
+        when the AspectType cannot be read, which signals heuristic coercion.
+    """
+    aspect_type = get_aspect_type(dataplex_service, aspect_type_resource, user_project)
+    if not aspect_type:
+        return {}
+    return _flatten_metadata_template(aspect_type.get('metadataTemplate', {}) or {})
