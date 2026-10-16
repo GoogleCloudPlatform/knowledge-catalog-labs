@@ -350,7 +350,7 @@ plus an optional `Operation` column (the header is not case-sensitive):
 | Operation | What happens |
 |---|---|
 | *(empty)* | The term or category is created if it doesn't exist, updated if it differs from the sheet, and left alone if it matches. |
-| `delete` | The term or category is deleted. Only the `id` is needed, plus `type` when a term and a category share that id. **A category is deleted together with everything in it** (its sub-categories and terms). |
+| `delete` | The term or category is deleted. Only the `id` is needed, plus `type` when a term and a category share that id. **A category is deleted together with everything in it** (its sub-categories and terms), except what the sheet moves out of it to another parent. |
 
 Rows are identified by their `id` and `type`. The `id` can't be changed: a row
 with a new `id` creates a new term or category.
@@ -370,19 +370,25 @@ checked.
 
 ### How changes are applied
 
-1.  Categories are created and moved, parents first. When two categories swap
-    places, one of them is moved to the top of the glossary first.
-2.  Terms are created and updated.
+1.  Terms are deleted, then the categories whose contents are all deleted
+    (deepest first). Deleting first frees room for the new terms and categories.
+2.  Categories are created and moved, parents first. When two categories swap
+    places, one of them is moved to the top of the glossary first. Then terms
+    are created and updated.
 3.  Overview, contacts and custom aspects are written. For a new term or
     category, the script waits until Dataplex has created its catalog entry
     (up to 60 seconds).
-4.  Terms are deleted, then categories (deepest first). A category is not
-    deleted when something inside it couldn't be deleted.
+4.  The categories that the sheet moves something out of are deleted.
+
+A category is not deleted while something inside it is still there (because
+deleting or moving it out failed): Dataplex would move it up a level instead of
+deleting it.
 
 Before changing or deleting an existing term or category, the script checks that
 it hasn't changed since the script read it. If it has (for example, someone
 edited it in the Cloud Console meanwhile), it's reported as a `CONFLICT` and left
-alone. A change that fails doesn't stop the others.
+alone. The same happens when a term or category to create was created by someone
+else meanwhile. A change that fails doesn't stop the others.
 
 The results are printed and written to
 `glossary-update-<glossary>-<timestamp>.csv`, one line per term or category with
@@ -415,7 +421,7 @@ The account the script runs as needs:
 
 | Used for | Permissions | Predefined role that includes them |
 |---|---|---|
-| Reading the terms and categories, and their entries | `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get`, `dataplex.glossaryCategories.list`, `dataplex.glossaryCategories.get`, `dataplex.entries.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
+| Reading the glossary, its terms and categories, and their entries | `dataplex.glossaries.get`, `dataplex.glossaryTerms.list`, `dataplex.glossaryTerms.get`, `dataplex.glossaryCategories.list`, `dataplex.glossaryCategories.get`, `dataplex.entries.get` | Dataplex Catalog Viewer (`roles/dataplex.catalogViewer`) |
 | Creating, updating and deleting terms and categories | `dataplex.glossaryTerms.create`, `dataplex.glossaryTerms.update`, `dataplex.glossaryTerms.delete`, `dataplex.glossaryCategories.create`, `dataplex.glossaryCategories.update`, `dataplex.glossaryCategories.delete` | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
 | Writing overview, contacts and custom aspects (`entries.patch`) | `dataplex.entries.update`, `dataplex.entryGroups.useOverviewAspect` and `dataplex.entryGroups.useContactsAspect` on the glossary project's `@dataplex` entry group, and `dataplex.aspectTypes.use` on the custom aspect types | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
 | Reading the sheet | Viewer access to the spreadsheet | |

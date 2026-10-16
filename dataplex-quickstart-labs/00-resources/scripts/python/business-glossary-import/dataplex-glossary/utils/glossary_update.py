@@ -22,6 +22,7 @@ glossary or apply a plan through utils.api_layer.
 import copy
 import csv
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -90,6 +91,9 @@ class GlossaryRef:
     project_id: str
     location_id: str
     glossary_id: str
+    # The catalog entries of terms and categories are named with the project number, not the
+    # project id (see resolve_project_number). Empty until resolved.
+    project_number: str = ""
 
     @property
     def project_location(self) -> str:
@@ -108,11 +112,45 @@ class GlossaryRef:
         return self.resource_name(CATEGORY, parent_id) if parent_id else self.glossary_name
 
     def entry_name(self, node_type: str, node_id: str) -> str:
-        """The name of the catalog entry that holds the aspects of a term or category."""
+        """The name of the catalog entry that holds the aspects of a term or category.
+
+        Both the entry's project and the term/category name inside the entry id use the project
+        number: an entry id with the project id doesn't name the entry.
+        """
+        project = self.project_number or self.project_id
+        collection = "terms" if node_type == TERM else "categories"
         return (
-            f"{self.project_location}/entryGroups/{DATAPLEX_SYSTEM_ENTRY_GROUP}/entries/"
-            f"{self.resource_name(node_type, node_id)}"
+            f"projects/{project}/locations/{self.location_id}/entryGroups/{DATAPLEX_SYSTEM_ENTRY_GROUP}/entries/"
+            f"projects/{project}/locations/{self.location_id}/glossaries/{self.glossary_id}/{collection}/{node_id}"
         )
+
+
+def resolve_project_number(dataplex_service, glossary: GlossaryRef) -> str:
+    """The number of the glossary's project, needed to name the catalog entries.
+
+    Taken from the glossary URL when it already has the number, otherwise from the glossary's
+    resource name returned by Dataplex (which uses the number), otherwise from Resource Manager.
+
+    Raises:
+        DataplexAPIError: If the glossary can't be read.
+        ValueError: If the project number can't be found.
+    """
+    if glossary.project_id.isdigit():
+        return glossary.project_id
+    name = api_layer.get_glossary(dataplex_service, glossary.glossary_name).get("name", "")
+    parts = name.split("/")
+    if len(parts) > 1 and parts[0] == "projects" and parts[1].isdigit():
+        return parts[1]
+    try:
+        project_number = api_layer.get_project_number(glossary.project_id, glossary.project_id)
+    except Exception as error:
+        raise ValueError(
+            f"Could not find the project number of '{glossary.project_id}' ({error}). Use the project "
+            f"number in --glossary-url instead (projects/<number>/locations/...)."
+        ) from error
+    if not project_number:
+        raise ValueError(f"Could not find the project number of '{glossary.project_id}'.")
+    return project_number
 
 
 @dataclass
@@ -512,18 +550,28 @@ def build_plan(
     plan.changes.extend(deleted.values())
 
     if not plan.errors:
+        early_deletes, _ = split_category_deletes(plan.by_action(ACTION_DELETE), live_nodes)
         try:
-            schedule_category_operations(plan.changes, live_nodes)
+            schedule_category_operations(plan.changes, live_nodes, {change.node_id for change in early_deletes})
         except ValueError as order_error:
             plan.errors.append(str(order_error))
     return plan
 
 
 def _plan_deletes(rows: List[SheetRow], live_nodes: Dict[NodeKey, LiveNode], plan: UpdatePlan) -> Dict[NodeKey, Change]:
-    """Resolve the delete rows, expanding each category to everything inside it."""
+    """Resolve the delete rows, expanding each category to everything inside it.
+
+    "Inside" is after the sheet's moves: a term or category that the sheet moves out of a
+    deleted category is kept (it's moved before the category is deleted, see apply_plan).
+    Rows of the sheet are never deleted implicitly: one that ends up inside a deleted category
+    is reported by _validate_parents.
+    """
+    upsert_rows = {row.key: row for row in rows if not row.is_delete}
+    final_parents = {key: node.parent for key, node in live_nodes.items()}
+    final_parents.update({key: row.parent for key, row in upsert_rows.items()})
     children: Dict[str, List[NodeKey]] = {}
-    for key, node in live_nodes.items():
-        children.setdefault(node.parent, []).append(key)
+    for key, parent in final_parents.items():
+        children.setdefault(parent, []).append(key)
 
     deleted: Dict[NodeKey, Change] = {}
     for row in rows:
@@ -554,10 +602,12 @@ def _plan_deletes(rows: List[SheetRow], live_nodes: Dict[NodeKey, LiveNode], pla
         if key[0] == CATEGORY:
             # Deleting a category through the API doesn't delete what's inside it: its terms
             # and sub-categories are moved up a level instead. So everything inside is deleted
-            # explicitly, before the category (see _blocking_failure).
+            # explicitly, before the category (see _blocking_item).
             # TODO: Revisit when the API's category delete changes. Today the moved-up contents
             # are also not replicated correctly for glossaries in the global location.
             for descendant in _descendants(key[1], children):
+                if descendant in upsert_rows or descendant not in live_nodes:
+                    continue  # a row of the sheet; reported by _validate_parents
                 existing = deleted.get(descendant)
                 if existing and existing.row_number and not existing.reason:
                     continue  # also marked 'delete' on its own row
@@ -814,15 +864,24 @@ class CategoryStep:
     final: bool = True
 
 
-def schedule_category_operations(changes: List[Change], live_nodes: Dict[NodeKey, LiveNode]) -> List[CategoryStep]:
+def schedule_category_operations(
+    changes: List[Change], live_nodes: Dict[NodeKey, LiveNode], removed_categories: Iterable[str] = ()
+) -> List[CategoryStep]:
     """Order category creations and moves so that each step is valid on its own.
 
     The API rejects a step that would create a cycle or a category chain deeper than
     SERVER_MAX_CATEGORY_DEPTH, even when the final tree is valid (e.g. two categories swapping
     places). Steps are applied as soon as they are valid; when no step is, one moving category
     first goes to the glossary root (always valid) and is moved to its final parent later.
+
+    `removed_categories` are deleted before the creations and moves (see
+    split_category_deletes), so they don't count.
     """
-    category_parents = {node.node_id: node.parent for key, node in live_nodes.items() if key[0] == CATEGORY}
+    removed = set(removed_categories)
+    category_parents = {
+        node.node_id: node.parent for key, node in live_nodes.items()
+        if key[0] == CATEGORY and node.node_id not in removed
+    }
     pending = [
         change for change in changes
         if change.node_type == CATEGORY and (
@@ -898,11 +957,21 @@ def apply_plan(
 ) -> List[ChangeResult]:
     """Apply a plan that has no errors.
 
-    Order: categories are created and moved (parents first), then terms are created and
-    updated, then overview/contacts/custom aspects are written, then terms are deleted, then
-    categories are deleted (deepest first). A change that fails, or whose term/category was
-    changed by someone else since it was read (with check_conflicts), is reported and skipped;
-    the other changes are still applied. Running the same sheet again only applies what's left.
+    Order:
+      1. Terms are deleted, then the categories whose contents are all deleted (deepest
+         first). Deleting first frees room under the glossary's limits and depth for the
+         creations and moves.
+      2. Categories are created and moved, parents first (sequential), then the other
+         category updates and the term creations and updates are applied (parallel).
+      3. Overview, contacts and custom aspects are written.
+      4. The categories that something was moved out of are deleted (deepest first), now
+         that only deleted items were inside them.
+    A category is not deleted while something inside it is still there (a delete or a move
+    out of it failed), because the API would move it up a level instead of deleting it.
+
+    A change that fails, or whose term/category was changed by someone else since it was read
+    (with check_conflicts), is reported and skipped; the other changes are still applied.
+    Running the same sheet again only applies what's left.
     """
     if plan.errors:
         raise ValueError("The plan has errors; fix them before applying it.")
@@ -916,11 +985,32 @@ def apply_plan(
         elif change.action == ACTION_SKIP:
             results[id(change)] = ChangeResult(change, STATUS_SKIPPED, change.reason)
 
-    resource_changes = plan.by_action(ACTION_CREATE) + plan.by_action(ACTION_UPDATE)
-    category_steps = schedule_category_operations(resource_changes, live_nodes)
-    scheduled = {id(step.change) for step in category_steps}
+    deletes = plan.by_action(ACTION_DELETE)
+    early_category_deletes, late_category_deletes = split_category_deletes(deletes, live_nodes)
+    live_children = _children_by_parent(live_nodes)
+    delete_results: Dict[NodeKey, ChangeResult] = {}
 
-    # 1. Categories: creations and moves in a valid order (sequential), then other category updates.
+    def delete_categories(category_deletes: List[Change]) -> None:
+        for change in category_deletes:
+            outcome = (
+                _blocking_item(change, live_children, delete_results, applier.moved)
+                or applier.delete(change)
+            )
+            results[id(change)] = delete_results[change.key] = outcome
+
+    # 1. Deletes: terms (parallel), then the categories with nothing to keep inside (sequential).
+    term_deletes = [change for change in deletes if change.node_type == TERM]
+    for change, outcome in _run_parallel(term_deletes, applier.delete, max_workers):
+        results[id(change)] = delete_results[change.key] = outcome
+    delete_categories(early_category_deletes)
+
+    # 2. Categories: creations and moves in a valid order (sequential), then the other category
+    #    updates and the terms (parallel).
+    resource_changes = plan.by_action(ACTION_CREATE) + plan.by_action(ACTION_UPDATE)
+    category_steps = schedule_category_operations(
+        resource_changes, live_nodes, {change.node_id for change in early_category_deletes}
+    )
+    scheduled = {id(step.change) for step in category_steps}
     for step in category_steps:
         if id(step.change) in results:
             continue
@@ -931,7 +1021,6 @@ def apply_plan(
         change for change in resource_changes
         if change.node_type == CATEGORY and id(change) not in scheduled and change.fields
     ]
-    # 2. Terms: creations and updates (parallel).
     term_changes = [change for change in resource_changes if change.node_type == TERM and change.fields]
     parallel = [change for change in other_category_updates + term_changes if id(change) not in results]
     for change, outcome in _run_parallel(parallel, applier.write_resource, max_workers):
@@ -947,24 +1036,40 @@ def apply_plan(
     for change in resource_changes:
         results.setdefault(id(change), ChangeResult(change, STATUS_DONE))
 
-    # 4. Deletes: terms (parallel), then categories, deepest first (sequential).
-    deletes = plan.by_action(ACTION_DELETE)
-    delete_results: Dict[NodeKey, ChangeResult] = {}
-    term_deletes = [change for change in deletes if change.node_type == TERM]
-    for change, outcome in _run_parallel(term_deletes, applier.delete, max_workers):
-        results[id(change)] = delete_results[change.key] = outcome
-    category_deletes = sorted(
-        (change for change in deletes if change.node_type == CATEGORY),
-        key=lambda change: -_live_depth(change.node_id, live_nodes),
-    )
-    live_children: Dict[str, List[NodeKey]] = {}
-    for key, node in live_nodes.items():
-        live_children.setdefault(node.parent, []).append(key)
-    for change in category_deletes:
-        outcome = _blocking_failure(change, live_children, delete_results) or applier.delete(change)
-        results[id(change)] = delete_results[change.key] = outcome
+    # 4. The categories that something was moved out of (sequential).
+    delete_categories(late_category_deletes)
 
     return [results[id(change)] for change in plan.changes]
+
+
+def split_category_deletes(
+    deletes: List[Change], live_nodes: Dict[NodeKey, LiveNode]
+) -> Tuple[List[Change], List[Change]]:
+    """Split the category deletes into those that can be applied before the creations and moves
+    (everything inside them is deleted too) and those that must wait until the terms and
+    categories that the sheet moves out of them have been moved. Each list is deepest first.
+    """
+    deleted_keys = {change.key for change in deletes}
+    live_children = _children_by_parent(live_nodes)
+    early: List[Change] = []
+    late: List[Change] = []
+    for change in deletes:
+        if change.node_type != CATEGORY:
+            continue
+        inside = _descendants(change.node_id, live_children)
+        (early if all(key in deleted_keys for key in inside) else late).append(change)
+
+    def deepest_first(change: Change) -> int:
+        return -_live_depth(change.node_id, live_nodes)
+
+    return sorted(early, key=deepest_first), sorted(late, key=deepest_first)
+
+
+def _children_by_parent(live_nodes: Dict[NodeKey, LiveNode]) -> Dict[str, List[NodeKey]]:
+    children: Dict[str, List[NodeKey]] = {}
+    for key, node in live_nodes.items():
+        children.setdefault(node.parent, []).append(key)
+    return children
 
 
 def _run_parallel(changes: List[Change], func: Callable, max_workers: int) -> List[Tuple[Change, Optional[ChangeResult]]]:
@@ -986,22 +1091,33 @@ def _live_depth(category_id: str, live_nodes: Dict[NodeKey, LiveNode]) -> int:
     return depth
 
 
-def _blocking_failure(
-    category_change: Change, live_children: Dict[str, List[NodeKey]], delete_results: Dict[NodeKey, ChangeResult]
+def _blocking_item(
+    category_change: Change,
+    live_children: Dict[str, List[NodeKey]],
+    delete_results: Dict[NodeKey, ChangeResult],
+    moved: Set[NodeKey],
 ) -> Optional[ChangeResult]:
     """Don't delete a category when something inside it is still there.
 
     Deleting a category with children makes the API move the children up a level, so when a
-    delete inside it failed (or was skipped because of a conflict), the category is kept.
+    delete inside it failed (or was skipped because of a conflict), or something that the sheet
+    moves out of it couldn't be moved, the category is kept.
     """
-    for descendant in _descendants(category_change.node_id, live_children):
-        outcome = delete_results.get(descendant)
-        if outcome is None or outcome.status not in (STATUS_DONE, STATUS_SKIPPED):
-            what = f"{descendant[0].lower()} '{descendant[1]}'"
-            return ChangeResult(
-                category_change, STATUS_SKIPPED,
-                f"not deleted because {what} inside it was not deleted",
-            )
+    pending = list(live_children.get(category_change.node_id, []))
+    while pending:
+        key = pending.pop()
+        if key in moved:
+            continue  # moved out of the category (with everything inside it)
+        outcome = delete_results.get(key)
+        if outcome is not None and outcome.status in (STATUS_DONE, STATUS_SKIPPED):
+            if key[0] == CATEGORY:
+                pending.extend(live_children.get(key[1], []))
+            continue
+        what = f"{key[0].lower()} '{key[1]}'"
+        return ChangeResult(
+            category_change, STATUS_SKIPPED,
+            f"not deleted because {what} inside it was not deleted or moved out",
+        )
     return None
 
 
@@ -1014,6 +1130,10 @@ class _PlanApplier:
         self.entry_wait_timeout = entry_wait_timeout
         self.service_factory = service_factory
         self.sleep = sleep
+        # Terms/categories whose parent was changed (to their final parent, or to the glossary
+        # root for a two-step move): they're no longer inside the category they were in.
+        self.moved: Set[NodeKey] = set()
+        self._lock = threading.Lock()
 
     # --- term/category writes -------------------------------------------------
 
@@ -1031,14 +1151,9 @@ class _PlanApplier:
                         service, self.glossary.glossary_name, change.node_type, change.node_id, body
                     )
                 except HttpError as error:
-                    if _status(error) != 409:
+                    if not _is_already_exists(error):
                         raise
-                    # Already exists: an earlier attempt of this call succeeded. Update it instead.
-                    logger.info(f"{change.node_type.lower()} '{change.node_id}' already exists; updating it.")
-                    api_layer.update_glossary_resource(
-                        service, self.glossary.resource_name(change.node_type, change.node_id),
-                        change.node_type, body, [FIELD_DISPLAY_NAME, FIELD_DESCRIPTION, FIELD_LABELS, FIELD_PARENT],
-                    )
+                    return self._already_exists(service, change, body, target_parent)
                 return None
 
             conflict = self._conflict(service, change)
@@ -1051,10 +1166,33 @@ class _PlanApplier:
             )
             if change.live and isinstance(response, dict) and response.get("updateTime"):
                 change.live.update_time = response["updateTime"]  # our own write isn't a conflict
+            if FIELD_PARENT in fields:
+                with self._lock:
+                    self.moved.add(change.key)
             return None
         except Exception as error:
             logger.debug(f"Failed to write {change.node_type} {change.node_id}", exc_info=True)
             return ChangeResult(change, STATUS_FAILED, _error_message(error))
+
+    def _already_exists(self, service, change: Change, body: Dict, parent_id: str) -> Optional[ChangeResult]:
+        """Handle a create that failed because the term/category already exists.
+
+        That happens when an earlier attempt of the same call succeeded but its response was
+        lost (the call is retried), or when someone else created it since this run read the
+        glossary. The first case leaves exactly the sheet's values; anything else is a conflict.
+        """
+        resource_name = self.glossary.resource_name(change.node_type, change.node_id)
+        if not self.check_conflicts:
+            logger.info(f"{change.node_type.lower()} '{change.node_id}' already exists; updating it.")
+            api_layer.update_glossary_resource(
+                service, resource_name, change.node_type, body,
+                [FIELD_DISPLAY_NAME, FIELD_DESCRIPTION, FIELD_LABELS, FIELD_PARENT],
+            )
+            return None
+        current = api_layer.get_glossary_resource(service, resource_name, change.node_type)
+        if _matches_row(current, change.sheet_row, parent_id):
+            return None
+        return ChangeResult(change, STATUS_CONFLICT, _ALREADY_EXISTS_MESSAGE)
 
     def _resource_body(self, row: SheetRow, parent_id: str) -> Dict:
         """The term/category body: its sheet values, under `parent_id` ('' for the glossary)."""
@@ -1153,8 +1291,31 @@ _CONFLICT_MESSAGE = (
 )
 
 
+_ALREADY_EXISTS_MESSAGE = (
+    "already exists in the glossary with other values (created since this run read the "
+    "glossary); not modified. Run the update again to compare with its current state."
+)
+
+
 def _status(error: HttpError) -> Optional[int]:
     return getattr(getattr(error, "resp", None), "status", None)
+
+
+def _is_already_exists(error: HttpError) -> bool:
+    """A 409 that means ALREADY_EXISTS. HTTP 409 also means ABORTED (a concurrent transaction),
+    which the write helpers retry; one that persists is a failure, not an existing resource."""
+    return _status(error) == 409 and api_layer.http_error_status_name(error) != "ABORTED"
+
+
+def _matches_row(resource: Dict, row: SheetRow, parent_id: str) -> bool:
+    """Whether a term/category resource has the sheet row's values (compared as in _plan_upsert)."""
+    display_name = (resource.get("displayName") or "").strip() or row.node_id
+    return (
+        display_name == (row.display_name or row.node_id)
+        and (resource.get("description") or "").strip() == row.description
+        and dict(resource.get("labels") or {}) == row.labels
+        and _parent_id(resource.get("parent", "")) == parent_id
+    )
 
 
 def _error_message(error: Exception) -> str:

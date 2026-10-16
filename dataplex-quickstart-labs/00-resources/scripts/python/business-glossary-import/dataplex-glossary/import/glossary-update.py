@@ -155,6 +155,7 @@ def run(args: argparse.Namespace) -> int:
 
     print("Reading the glossary...")
     dataplex_service = api_layer.get_dataplex_service()
+    glossary.project_number = glossary_update.resolve_project_number(dataplex_service, glossary)
     live_nodes = glossary_update.fetch_live_nodes(dataplex_service, glossary)
     entry_keys = glossary_update.keys_needing_entries(rows, live_nodes)
     if entry_keys:

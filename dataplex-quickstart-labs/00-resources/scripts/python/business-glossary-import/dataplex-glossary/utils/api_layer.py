@@ -1,5 +1,6 @@
 """API Layer for Dataplex Glossary Operations."""
 
+import json
 import os
 import sys
 import threading
@@ -180,12 +181,47 @@ _glossary_read_rate_limiter = _RateLimiter(GLOSSARY_READ_API_CALL_DELAY_SECONDS)
 _entry_write_rate_limiter = _RateLimiter(ENTRY_WRITE_API_CALL_DELAY_SECONDS)  # entries.patch
 
 
-def _execute_rate_limited(rate_limiter: _RateLimiter, request, description: str) -> Any:
+def _execute_rate_limited(
+    rate_limiter: _RateLimiter,
+    request,
+    description: str,
+    is_retryable: Callable[[Exception], bool] = is_retryable_google_api_error,
+) -> Any:
     """Execute a Google API client request with retries, waiting for `rate_limiter` before every attempt."""
     def attempt():
         rate_limiter.wait()
         return request.execute()
-    return execute_with_retry(attempt, description)
+    if is_retryable is is_retryable_google_api_error:
+        return execute_with_retry(attempt, description)
+    return execute_with_retry(attempt, description, is_retryable=is_retryable)
+
+
+def http_error_status_name(error: Exception) -> str:
+    """The canonical status of a Google API error (e.g. 'ALREADY_EXISTS'), or '' if unknown."""
+    content = getattr(error, "content", None)
+    if not content:
+        return ""
+    try:
+        body = json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    error_body = body.get("error") if isinstance(body, dict) else None
+    status = error_body.get("status") if isinstance(error_body, dict) else None
+    return status if isinstance(status, str) else ""
+
+
+def _is_retryable_write_error(error: Exception) -> bool:
+    """Network, 429 and 5xx errors, and ABORTED (HTTP 409 for a concurrent transaction).
+
+    ALREADY_EXISTS is also HTTP 409, but isn't retried: the caller handles it.
+    """
+    if is_retryable_google_api_error(error):
+        return True
+    return (
+        isinstance(error, HttpError)
+        and getattr(error.resp, "status", None) == 409
+        and http_error_status_name(error) == "ABORTED"
+    )
 
 
 def initialize_locations_cache(user_project: str) -> List[str]:
@@ -321,7 +357,9 @@ def create_glossary_resource(
         request = collection.create(parent=glossary_name, termId=resource_id, body=body)
     else:
         request = collection.create(parent=glossary_name, categoryId=resource_id, body=body)
-    return _execute_rate_limited(_write_rate_limiter, request, f"Create {resource_type.lower()} {resource_id}")
+    return _execute_rate_limited(
+        _write_rate_limiter, request, f"Create {resource_type.lower()} {resource_id}", is_retryable=_is_retryable_write_error
+    )
 
 
 def update_glossary_resource(
@@ -333,14 +371,18 @@ def update_glossary_resource(
     request = _glossary_collection(dataplex_service, resource_type).patch(
         name=resource_name, updateMask=mask, body=body
     )
-    return _execute_rate_limited(_write_rate_limiter, request, f"Update {resource_type.lower()} {resource_name}")
+    return _execute_rate_limited(
+        _write_rate_limiter, request, f"Update {resource_type.lower()} {resource_name}", is_retryable=_is_retryable_write_error
+    )
 
 
 def delete_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> None:
     """Delete a glossary term or category."""
     logger.debug(f"Request: glossaries.{resource_type.lower()}.delete(name={resource_name})")
     request = _glossary_collection(dataplex_service, resource_type).delete(name=resource_name)
-    _execute_rate_limited(_write_rate_limiter, request, f"Delete {resource_type.lower()} {resource_name}")
+    _execute_rate_limited(
+        _write_rate_limiter, request, f"Delete {resource_type.lower()} {resource_name}", is_retryable=_is_retryable_write_error
+    )
 
 
 def update_entry_aspects(
@@ -358,7 +400,9 @@ def update_entry_aspects(
     request = dataplex_service.projects().locations().entryGroups().entries().patch(
         name=entry_name, updateMask="aspects", aspectKeys=aspect_keys, body=body
     )
-    return _execute_rate_limited(_entry_write_rate_limiter, request, f"Update aspects of {entry_name}")
+    return _execute_rate_limited(
+        _entry_write_rate_limiter, request, f"Update aspects of {entry_name}", is_retryable=_is_retryable_write_error
+    )
 
 def parse_entry_name(entry_name: str) -> tuple:
     """Parse a full entry resource name to extract project, location, entry group, and entry ID."""

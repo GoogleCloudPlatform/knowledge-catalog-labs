@@ -17,6 +17,7 @@ Test coverage:
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -117,11 +118,72 @@ def change_for(plan, node_id, node_type="TERM"):
     return matches[0]
 
 
-def http_error(status):
+def http_error(status, status_name=""):
     resp = MagicMock()
     resp.status = status
     resp.reason = "error"
-    return HttpError(resp, b'{"error": {"message": "error"}}')
+    body = {"error": {"message": "error"}}
+    if status_name:
+        body["error"]["status"] = status_name
+    return HttpError(resp, json.dumps(body).encode())
+
+
+def plan_with_operations(rows, live_nodes):
+    """Plan a sheet that has the Operation column (rows already include its value)."""
+    parsed, errors = gu.parse_sheet([HEADERS + ["Operation"]] + rows, real_validator())
+    assert errors == []
+    entries = {key: entry(*key) for key in gu.keys_needing_entries(parsed, live_nodes)}
+    return gu.build_plan(parsed, live_nodes, {}, entries)
+
+
+def upsert_row(*args, **kwargs):
+    return sheet_row(*args, **kwargs) + [""]
+
+
+def delete_row(node_id, node_type=""):
+    return [node_id] + [""] * 4 + [node_type] + [""] * 8 + ["delete"]
+
+
+# ============================================================================
+# Project number in entry names
+# ============================================================================
+
+class TestProjectNumber:
+
+    def test_entry_name_uses_the_project_number(self):
+        glossary = gu.GlossaryRef("my-project", "global", "g", project_number="123")
+        assert glossary.entry_name("TERM", "t") == (
+            "projects/123/locations/global/entryGroups/@dataplex/entries/"
+            "projects/123/locations/global/glossaries/g/terms/t"
+        )
+        assert glossary.entry_name("CATEGORY", "c").endswith("/projects/123/locations/global/glossaries/g/categories/c")
+        assert glossary.resource_name("TERM", "t") == "projects/my-project/locations/global/glossaries/g/terms/t"
+
+    def test_number_in_the_url_is_used_as_is(self, monkeypatch):
+        monkeypatch.setattr(api_layer, "get_glossary", lambda *args: pytest.fail("no API call expected"))
+        assert gu.resolve_project_number(MagicMock(), gu.GlossaryRef("123", "global", "g")) == "123"
+
+    def test_number_comes_from_the_glossary_name(self, monkeypatch):
+        monkeypatch.setattr(api_layer, "get_glossary",
+                            lambda service, name: {"name": "projects/456/locations/global/glossaries/g"})
+        monkeypatch.setattr(api_layer, "get_project_number", lambda *args: pytest.fail("not needed"))
+        assert gu.resolve_project_number(MagicMock(), gu.GlossaryRef("my-project", "global", "g")) == "456"
+
+    def test_falls_back_to_resource_manager(self, monkeypatch):
+        monkeypatch.setattr(api_layer, "get_glossary",
+                            lambda service, name: {"name": "projects/my-project/locations/global/glossaries/g"})
+        monkeypatch.setattr(api_layer, "get_project_number", lambda project, user_project: "789")
+        assert gu.resolve_project_number(MagicMock(), gu.GlossaryRef("my-project", "global", "g")) == "789"
+
+    def test_unknown_number_is_an_error(self, monkeypatch):
+        monkeypatch.setattr(api_layer, "get_glossary",
+                            lambda service, name: {"name": "projects/my-project/locations/global/glossaries/g"})
+
+        def denied(project, user_project):
+            raise RuntimeError("permission denied")
+        monkeypatch.setattr(api_layer, "get_project_number", denied)
+        with pytest.raises(ValueError, match="Use the project number in --glossary-url"):
+            gu.resolve_project_number(MagicMock(), gu.GlossaryRef("my-project", "global", "g"))
 
 
 # ============================================================================
@@ -381,6 +443,47 @@ class TestPlanDeletes:
         assert "parent category 'fin' is deleted by this sheet" in plan.errors[0]
 
 
+class TestDeletesAfterMoves:
+
+    def test_moving_a_term_out_of_a_deleted_category_keeps_it(self):
+        nodes = live_map(live("old", "CATEGORY"), live("new", "CATEGORY"),
+                         live("t", parent="old"), live("t2", parent="old"))
+        plan = plan_with_operations([upsert_row("t", parent="new"), delete_row("old", "CATEGORY")], nodes)
+        assert plan.errors == []
+        assert {(c.action, c.node_id) for c in plan.changes} == {
+            ("UPDATE", "t"), ("DELETE", "old"), ("DELETE", "t2"),
+        }
+
+    def test_moving_a_category_out_keeps_everything_in_it(self):
+        nodes = live_map(live("old", "CATEGORY"), live("keep", "CATEGORY", parent="old"),
+                         live("k1", parent="keep"), live("gone", parent="old"))
+        plan = plan_with_operations([upsert_row("keep", node_type="CATEGORY"), delete_row("old", "CATEGORY")], nodes)
+        assert plan.errors == []
+        assert {c.node_id for c in plan.by_action(gu.ACTION_DELETE)} == {"old", "gone"}
+
+    def test_row_left_inside_a_deleted_category_is_an_error(self):
+        nodes = live_map(live("fin", "CATEGORY"), live("t1", parent="fin"))
+        plan = plan_with_operations([delete_row("fin", "CATEGORY"), upsert_row("t1", parent="fin")], nodes)
+        assert "parent category 'fin' is deleted by this sheet" in plan.errors[0]
+
+    def test_deleted_category_does_not_block_a_move(self):
+        # a > d would be 4 levels deep under c > b, but d is deleted first.
+        nodes = live_map(live("c", "CATEGORY"), live("b", "CATEGORY", parent="c"),
+                         live("a", "CATEGORY"), live("d", "CATEGORY", parent="a"))
+        plan = plan_with_operations([upsert_row("a", node_type="CATEGORY", parent="b"), delete_row("d", "CATEGORY")],
+                                    nodes)
+        assert plan.errors == []
+
+    def test_split_category_deletes(self):
+        nodes = live_map(live("old", "CATEGORY"), live("sub", "CATEGORY", parent="old"), live("t", parent="old"),
+                         live("other", "CATEGORY"))
+        plan = plan_with_operations([upsert_row("t"), delete_row("old", "CATEGORY"), delete_row("other", "CATEGORY")],
+                                    nodes)
+        early, late = gu.split_category_deletes(plan.by_action(gu.ACTION_DELETE), nodes)
+        assert [c.node_id for c in early] == ["sub", "other"]
+        assert [c.node_id for c in late] == ["old"]
+
+
 # ============================================================================
 # schedule_category_operations
 # ============================================================================
@@ -440,6 +543,7 @@ class FakeApi:
         self.entries_after_polls = 0
         self.fail = {}
         self.current_update_time = {}
+        self.resources = {}  # node id -> resource returned by get (besides updateTime)
         monkeypatch.setattr(api_layer, "create_glossary_resource", self.create)
         monkeypatch.setattr(api_layer, "update_glossary_resource", self.update)
         monkeypatch.setattr(api_layer, "delete_glossary_resource", self.delete)
@@ -472,7 +576,8 @@ class FakeApi:
         self.calls.append(("aspects", entry_name.rsplit("/", 1)[-1], tuple(sorted(aspects))))
 
     def get(self, service, name, node_type):
-        return {"updateTime": self.current_update_time.get(name.rsplit("/", 1)[-1], "t1")}
+        node_id = name.rsplit("/", 1)[-1]
+        return {**self.resources.get(node_id, {}), "updateTime": self.current_update_time.get(node_id, "t1")}
 
     def lookup(self, service, entry_name, project_location):
         self.polls += 1
@@ -505,16 +610,16 @@ class TestApplyPlan:
         results = apply(plan, nodes)
 
         assert [call[:3] for call in api.calls] == [
+            ("delete", "TERM", "old-term"),
+            ("delete", "CATEGORY", "old"),
             ("create", "CATEGORY", "emea"),
             ("create", "TERM", "margin"),
             ("update", "TERM", "revenue"),
             ("aspects", "margin", ("dataplex-types.global.overview",)),
-            ("delete", "TERM", "old-term"),
-            ("delete", "CATEGORY", "old"),
         ]
-        assert api.calls[0][3] == f"{GLOSSARY_NAME}/categories/fin"
-        assert api.calls[1][3] == f"{GLOSSARY_NAME}/categories/emea"
-        assert api.calls[2][3:] == (("description",), f"{GLOSSARY_NAME}/categories/fin")
+        assert api.calls[2][3] == f"{GLOSSARY_NAME}/categories/fin"
+        assert api.calls[3][3] == f"{GLOSSARY_NAME}/categories/emea"
+        assert api.calls[4][3:] == (("description",), f"{GLOSSARY_NAME}/categories/fin")
         assert {result.status for result in results} == {gu.STATUS_DONE}
 
     def test_waits_for_the_entry_of_a_new_term(self, monkeypatch):
@@ -562,12 +667,38 @@ class TestApplyPlan:
         assert [(r.change.node_id, r.status) for r in results] == [("a", "FAILED"), ("b", "DONE")]
         assert results[0].message.startswith("HTTP 400")
 
-    def test_create_that_already_exists_updates_instead(self, monkeypatch):
+    def test_create_that_already_exists_with_the_sheet_values_is_done(self, monkeypatch):
+        # An earlier attempt of the create succeeded, but its response was lost.
         api = FakeApi(monkeypatch)
-        api.fail[("create", "a")] = http_error(409)
+        api.fail[("create", "a")] = http_error(409, "ALREADY_EXISTS")
+        api.resources["a"] = {"displayName": "A", "description": "", "parent": GLOSSARY_NAME}
         results = apply(plan_for([sheet_row("a")], {}), {})
         assert results[0].status == gu.STATUS_DONE
+        assert not any(call[0] == "update" for call in api.calls)
+
+    def test_create_that_already_exists_with_other_values_is_a_conflict(self, monkeypatch):
+        # Someone else created it since the glossary was read.
+        api = FakeApi(monkeypatch)
+        api.fail[("create", "a")] = http_error(409, "ALREADY_EXISTS")
+        api.resources["a"] = {"displayName": "Someone else's", "parent": GLOSSARY_NAME}
+        results = apply(plan_for([sheet_row("a", overview="o")], {}), {})
+        assert results[0].status == gu.STATUS_CONFLICT
+        assert not any(call[0] in ("update", "aspects") for call in api.calls)
+
+    def test_create_that_already_exists_is_updated_without_the_conflict_check(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        api.fail[("create", "a")] = http_error(409, "ALREADY_EXISTS")
+        results = apply(plan_for([sheet_row("a")], {}), {}, check_conflicts=False)
+        assert results[0].status == gu.STATUS_DONE
         assert api.calls[1][:3] == ("update", "TERM", "a")
+
+    def test_aborted_create_is_a_failure_not_an_existing_term(self, monkeypatch):
+        # HTTP 409 also means ABORTED; the write helpers retry it, so one that gets here failed.
+        api = FakeApi(monkeypatch)
+        api.fail[("create", "a")] = http_error(409, "ABORTED")
+        results = apply(plan_for([sheet_row("a")], {}), {})
+        assert results[0].status == gu.STATUS_FAILED
+        assert [call[0] for call in api.calls] == ["create"]
 
     def test_category_is_kept_when_something_inside_failed(self, monkeypatch):
         api = FakeApi(monkeypatch)
@@ -599,6 +730,43 @@ class TestApplyPlan:
             ("update", "CATEGORY", "b", ("parent",), GLOSSARY_NAME),
             ("update", "CATEGORY", "a", ("description", "parent"), f"{GLOSSARY_NAME}/categories/b"),
         ]
+
+    def test_deletes_free_room_before_the_moves(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        nodes = live_map(live("c", "CATEGORY"), live("b", "CATEGORY", parent="c"),
+                         live("a", "CATEGORY"), live("d", "CATEGORY", parent="a"))
+        plan = plan_with_operations([upsert_row("a", node_type="CATEGORY", parent="b"), delete_row("d", "CATEGORY")],
+                                    nodes)
+        results = apply(plan, nodes)
+        assert [call[:3] for call in api.calls] == [("delete", "CATEGORY", "d"), ("update", "CATEGORY", "a")]
+        assert {result.status for result in results} == {gu.STATUS_DONE}
+
+    def test_terms_are_deleted_before_new_terms_are_created(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        nodes = live_map(live("old"))
+        apply(plan_with_operations([upsert_row("new"), delete_row("old", "TERM")], nodes), nodes)
+        assert [call[:3] for call in api.calls] == [("delete", "TERM", "old"), ("create", "TERM", "new")]
+
+    def test_category_is_deleted_after_moving_something_out_of_it(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        nodes = live_map(live("old", "CATEGORY"), live("new", "CATEGORY"),
+                         live("t", parent="old"), live("t2", parent="old"))
+        plan = plan_with_operations([upsert_row("t", parent="new"), delete_row("old", "CATEGORY")], nodes)
+        results = apply(plan, nodes)
+        assert [call[:3] for call in api.calls] == [
+            ("delete", "TERM", "t2"), ("update", "TERM", "t"), ("delete", "CATEGORY", "old"),
+        ]
+        assert {result.status for result in results} == {gu.STATUS_DONE}
+
+    def test_category_is_kept_when_moving_something_out_of_it_failed(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        api.fail[("update", "t")] = http_error(400)
+        nodes = live_map(live("old", "CATEGORY"), live("new", "CATEGORY"), live("t", parent="old"))
+        plan = plan_with_operations([upsert_row("t", parent="new"), delete_row("old", "CATEGORY")], nodes)
+        statuses = {r.change.node_id: (r.status, r.message) for r in apply(plan, nodes)}
+        assert statuses["t"][0] == gu.STATUS_FAILED
+        assert statuses["old"] == (gu.STATUS_SKIPPED, "not deleted because term 't' inside it was not deleted or moved out")
+        assert ("delete", "CATEGORY", "old") not in api.calls
 
     def test_plan_with_errors_is_refused(self):
         plan = gu.UpdatePlan(errors=["boom"])
@@ -647,6 +815,25 @@ class TestApiLayerWrites:
         categories.list.return_value = first
         categories.list_next.side_effect = [second, None]
         assert api_layer.list_glossary_categories(service, GLOSSARY_NAME) == [{"name": "c1"}]
+
+    def test_http_error_status_name(self):
+        assert api_layer.http_error_status_name(http_error(409, "ABORTED")) == "ABORTED"
+        assert api_layer.http_error_status_name(http_error(409)) == ""
+        assert api_layer.http_error_status_name(ValueError("not an HTTP error")) == ""
+
+    @pytest.mark.parametrize("status_name, attempts", [("ABORTED", 2), ("ALREADY_EXISTS", 1)])
+    def test_aborted_writes_are_retried_but_already_exists_is_not(self, monkeypatch, status_name, attempts):
+        from utils import retry_utils
+        monkeypatch.setattr(retry_utils.time, "sleep", lambda seconds: None)
+        service = MagicMock()
+        terms = service.projects.return_value.locations.return_value.glossaries.return_value.terms.return_value
+        terms.create.return_value.execute.side_effect = [http_error(409, status_name), {"name": "t1"}]
+        if attempts == 1:
+            with pytest.raises(HttpError):
+                api_layer.create_glossary_resource(service, GLOSSARY_NAME, "TERM", "t1", {})
+        else:
+            assert api_layer.create_glossary_resource(service, GLOSSARY_NAME, "TERM", "t1", {}) == {"name": "t1"}
+        assert terms.create.return_value.execute.call_count == attempts
 
     def test_set_write_rate_limit(self, monkeypatch):
         monkeypatch.setattr(api_layer._write_rate_limiter, "min_interval_seconds", 1)
@@ -720,6 +907,8 @@ class TestGlossaryUpdateScript:
         monkeypatch.setattr(glossary_update_script.UpdateSheetProcessor, "read_aspects",
                             lambda self, spreadsheet, known_ids: (True, {}))
         monkeypatch.setattr(api_layer, "get_dataplex_service", lambda: MagicMock())
+        monkeypatch.setattr(api_layer, "get_glossary",
+                            lambda service, name: {"name": "projects/123456/locations/global/glossaries/my-glossary"})
         monkeypatch.setattr(gu, "fetch_live_nodes", lambda service, glossary: live_nodes)
         monkeypatch.setattr(gu, "fetch_entries", lambda glossary, keys, max_workers=5: {k: entry(*k) for k in keys})
         monkeypatch.setattr("builtins.input", lambda prompt: answer)
@@ -741,6 +930,20 @@ class TestGlossaryUpdateScript:
         lines = results_file.read_text().splitlines()
         assert lines[1].startswith("2,TERM,revenue,UPDATE,PLANNED,description")
         assert lines[2].startswith("3,TERM,cost,UNCHANGED,UNCHANGED")
+
+    def test_entries_are_named_with_the_project_number(self, monkeypatch, tmp_path):
+        self._setup(monkeypatch, [HEADERS, sheet_row("revenue")], live_map(live("revenue")))
+        seen = []
+
+        def fetch_entries(glossary, keys, max_workers=5):
+            seen.append(glossary.entry_name("TERM", "revenue"))
+            return {k: entry(*k) for k in keys}
+        monkeypatch.setattr(gu, "fetch_entries", fetch_entries)
+        glossary_update_script.run(self._args(tmp_path, "--dry-run"))
+        assert seen == [
+            "projects/123456/locations/global/entryGroups/@dataplex/entries/"
+            "projects/123456/locations/global/glossaries/my-glossary/terms/revenue"
+        ]
 
     def test_applies_after_confirmation(self, monkeypatch, tmp_path):
         api = self._setup(monkeypatch, [HEADERS, sheet_row("revenue", description="new")], live_map(live("revenue")))
