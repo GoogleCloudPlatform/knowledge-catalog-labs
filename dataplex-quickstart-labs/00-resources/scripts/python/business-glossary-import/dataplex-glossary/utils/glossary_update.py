@@ -1303,9 +1303,19 @@ def _status(error: HttpError) -> Optional[int]:
 
 
 def _is_already_exists(error: HttpError) -> bool:
-    """A 409 that means ALREADY_EXISTS. HTTP 409 also means ABORTED (a concurrent transaction),
-    which the write helpers retry; one that persists is a failure, not an existing resource."""
-    return _status(error) == 409 and api_layer.http_error_status_name(error) != "ABORTED"
+    """Whether a create failed because the term/category already exists.
+
+    The glossary API answers that with HTTP 400 ("Term with name: ... already exists." /
+    "Category with name: ... already exists."); a 409 ALREADY_EXISTS is accepted too. HTTP 409
+    also means ABORTED (a concurrent transaction), which the write helpers retry; one that
+    persists is a failure, not an existing resource.
+    """
+    status = _status(error)
+    if status == 409:
+        return api_layer.http_error_status_name(error) != "ABORTED"
+    if status == 400:
+        return "already exists" in api_layer.http_error_message(error).lower()
+    return False
 
 
 def _matches_row(resource: Dict, row: SheetRow, parent_id: str) -> bool:

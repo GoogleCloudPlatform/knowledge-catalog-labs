@@ -196,8 +196,8 @@ def _execute_rate_limited(
     return execute_with_retry(attempt, description, is_retryable=is_retryable)
 
 
-def http_error_status_name(error: Exception) -> str:
-    """The canonical status of a Google API error (e.g. 'ALREADY_EXISTS'), or '' if unknown."""
+def _http_error_field(error: Exception, field_name: str) -> str:
+    """A string field ('status', 'message') of a Google API error's JSON body, or ''."""
     content = getattr(error, "content", None)
     if not content:
         return ""
@@ -206,8 +206,18 @@ def http_error_status_name(error: Exception) -> str:
     except (ValueError, UnicodeDecodeError):
         return ""
     error_body = body.get("error") if isinstance(body, dict) else None
-    status = error_body.get("status") if isinstance(error_body, dict) else None
-    return status if isinstance(status, str) else ""
+    value = error_body.get(field_name) if isinstance(error_body, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def http_error_status_name(error: Exception) -> str:
+    """The canonical status of a Google API error (e.g. 'ALREADY_EXISTS'), or '' if unknown."""
+    return _http_error_field(error, "status")
+
+
+def http_error_message(error: Exception) -> str:
+    """The message of a Google API error, or '' if unknown."""
+    return _http_error_field(error, "message")
 
 
 def _is_retryable_write_error(error: Exception) -> bool:

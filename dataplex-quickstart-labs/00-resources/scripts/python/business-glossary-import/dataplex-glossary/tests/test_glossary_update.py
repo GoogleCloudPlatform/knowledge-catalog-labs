@@ -118,11 +118,11 @@ def change_for(plan, node_id, node_type="TERM"):
     return matches[0]
 
 
-def http_error(status, status_name=""):
+def http_error(status, status_name="", message="error"):
     resp = MagicMock()
     resp.status = status
     resp.reason = "error"
-    body = {"error": {"message": "error"}}
+    body = {"error": {"message": message}}
     if status_name:
         body["error"]["status"] = status_name
     return HttpError(resp, json.dumps(body).encode())
@@ -676,6 +676,26 @@ class TestApplyPlan:
         assert results[0].status == gu.STATUS_DONE
         assert not any(call[0] == "update" for call in api.calls)
 
+    @pytest.mark.parametrize("node_type, message", [
+        ("TERM", "Term with name: projects/p/locations/global/glossaries/g/terms/a already exists."),
+        ("CATEGORY", "Category with name: projects/p/locations/global/glossaries/g/categories/a already exists."),
+    ])
+    def test_create_answered_with_400_already_exists_is_handled(self, monkeypatch, node_type, message):
+        # The glossary API reports an existing term/category as HTTP 400 INVALID_ARGUMENT.
+        api = FakeApi(monkeypatch)
+        api.fail[("create", "a")] = http_error(400, "INVALID_ARGUMENT", message)
+        api.resources["a"] = {"displayName": "A", "description": "", "parent": GLOSSARY_NAME}
+        results = apply(plan_for([sheet_row("a", node_type=node_type)], {}), {})
+        assert results[0].status == gu.STATUS_DONE
+        assert not any(call[0] == "update" for call in api.calls)
+
+    def test_other_400_on_create_is_a_failure(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        api.fail[("create", "a")] = http_error(400, "INVALID_ARGUMENT", "Invalid parent.")
+        results = apply(plan_for([sheet_row("a")], {}), {})
+        assert results[0].status == gu.STATUS_FAILED
+        assert [call[0] for call in api.calls] == ["create"]
+
     def test_create_that_already_exists_with_other_values_is_a_conflict(self, monkeypatch):
         # Someone else created it since the glossary was read.
         api = FakeApi(monkeypatch)
@@ -820,6 +840,9 @@ class TestApiLayerWrites:
         assert api_layer.http_error_status_name(http_error(409, "ABORTED")) == "ABORTED"
         assert api_layer.http_error_status_name(http_error(409)) == ""
         assert api_layer.http_error_status_name(ValueError("not an HTTP error")) == ""
+        assert api_layer.http_error_message(http_error(400, message="Term with name: x already exists.")) == (
+            "Term with name: x already exists."
+        )
 
     @pytest.mark.parametrize("status_name, attempts", [("ABORTED", 2), ("ALREADY_EXISTS", 1)])
     def test_aborted_writes_are_retried_but_already_exists_is_not(self, monkeypatch, status_name, attempts):
