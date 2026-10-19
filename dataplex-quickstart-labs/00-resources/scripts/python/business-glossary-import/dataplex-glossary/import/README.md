@@ -355,10 +355,19 @@ plus an optional `Operation` column (the header is not case-sensitive):
 Rows are identified by their `id` and `type`. The `id` can't be changed: a row
 with a new `id` creates a new term or category.
 
+When a category is deleted, the rows of the terms and categories inside it can't
+stay in the sheet without `delete`: the update stops with "parent category ... is
+deleted by this sheet". Remove those rows, mark them `delete` too, or move them
+to another parent. (This matters when you edit a full export.)
+
 A blank cell clears the value, as in the Glossary Import (for example, a blank
-`overview` removes the overview). Custom aspects come from the aspects sheet, as
-in the Glossary Import; aspects and aspect fields that aren't in the aspects
-sheet are left as they are.
+`overview` removes the overview).
+
+Custom aspects come from the aspects sheet, as in the Glossary Import. The update
+can **add** custom aspects and **change** their fields, but never removes them:
+aspects and aspect fields that aren't in the aspects sheet are left as they are.
+To remove a custom aspect, use the Cloud Console or the
+[Glossary Import](#1-glossary-import), which replaces everything.
 
 The same validations as the Glossary Import apply to each row. The parent of a
 row must be a category that is in the sheet or already in the glossary, and the
