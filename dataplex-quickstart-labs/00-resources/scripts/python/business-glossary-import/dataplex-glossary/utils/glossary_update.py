@@ -518,7 +518,7 @@ def build_plan(
     Args:
         rows: The parsed sheet rows.
         live_nodes: The glossary's current terms and categories (fetch_live_nodes).
-        sheet_aspects: Custom aspects from the aspects sheet: id -> aspect type resource -> data.
+        sheet_aspects: Custom aspects from the aspects sheet: term id -> aspect type resource -> data.
         live_entries: The catalog entries of the existing terms/categories in the sheet
             (fetch_entries for keys_needing_entries).
         same_project: Whether two project ids/numbers name the same project, used to match
@@ -739,7 +739,11 @@ def _plan_upsert(
     plan: UpdatePlan,
 ) -> Change:
     live = live_nodes.get(row.key)
-    row_sheet_aspects = sheet_aspects.get(row.node_id, {})
+    # Custom aspects can only be set on terms; a category that shares an id with a term
+    # must not receive the term's custom aspects.
+    row_sheet_aspects = (
+        sheet_aspects.get(row.node_id, {}) if row.node_type == GLOSSARY_TERM_TYPE else {}
+    )
 
     if live is None:
         aspects = {}

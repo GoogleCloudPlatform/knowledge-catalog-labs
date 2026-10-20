@@ -31,7 +31,13 @@ import gspread
 from google.auth import default
 
 from utils import api_layer, argument_parser, glossary_update, logging_utils
-from utils.constants import DEFAULT_GLOSSARY_WRITES_PER_MINUTE, MAX_WORKERS, SPREADSHEET_URL_PATTERN
+from utils.constants import (
+    DEFAULT_GLOSSARY_WRITES_PER_MINUTE,
+    GLOSSARY_CATEGORY_TYPE,
+    GLOSSARY_TERM_TYPE,
+    MAX_WORKERS,
+    SPREADSHEET_URL_PATTERN,
+)
 
 logger = logging_utils.get_logger()
 
@@ -147,8 +153,15 @@ def run(args: argparse.Namespace) -> int:
         _print_problems("The glossary sheet has errors; nothing was changed:", errors)
         return 1
 
-    known_ids = {row.node_id for row in rows if not row.is_delete}
-    aspects_valid, sheet_aspects = processor.read_aspects(spreadsheet, known_ids)
+    term_ids = {
+        row.node_id for row in rows
+        if not row.is_delete and row.node_type == GLOSSARY_TERM_TYPE
+    }
+    category_ids = {
+        row.node_id for row in rows
+        if not row.is_delete and row.node_type == GLOSSARY_CATEGORY_TYPE
+    }
+    aspects_valid, sheet_aspects = processor.read_aspects(spreadsheet, term_ids, category_ids)
     if not aspects_valid:
         print("The aspects sheet has errors; nothing was changed.")
         return 1

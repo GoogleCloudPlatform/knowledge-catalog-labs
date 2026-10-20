@@ -323,6 +323,25 @@ class TestBuildPlan:
                              same_project=lambda a, b: {a, b} == {"123", "my-project"} or a == b)
         assert change_for(plan, "revenue").aspects == {"123.global.gov": {"data": {"tier": "2"}}}
 
+    def test_categories_never_get_custom_aspects_even_when_sharing_an_id_with_a_term(self):
+        sheet_aspects = {"sales": {"projects/123/locations/global/aspectTypes/gov": {"tier": "1"}}}
+        # Both when creating a new term + category with the same id...
+        create_plan = plan_for([sheet_row("sales"), sheet_row("sales", "CATEGORY")], {}, sheet_aspects)
+        by_type = {c.node_type: c.aspects for c in create_plan.changes}
+        assert by_type["TERM"] == {"123.global.gov": {"data": {"tier": "1"}}}
+        assert by_type["CATEGORY"] == {}
+        # ...and when updating an existing term + category with the same id.
+        update_plan = plan_for(
+            [sheet_row("sales"), sheet_row("sales", "CATEGORY")],
+            live_map(live("sales"), live("sales", "CATEGORY")),
+            sheet_aspects,
+        )
+        changes = {c.node_type: c for c in update_plan.changes}
+        assert changes["TERM"].action == gu.ACTION_UPDATE
+        assert changes["TERM"].aspects == {"123.global.gov": {"data": {"tier": "1"}}}
+        assert changes["CATEGORY"].action == gu.ACTION_UNCHANGED
+        assert changes["CATEGORY"].aspects == {}
+
     def test_unreadable_entry_is_an_error(self):
         plan = plan_for([sheet_row("revenue")], live_map(live("revenue")), entries={("TERM", "revenue"): None})
         assert "could not read the catalog entry" in plan.errors[0]
@@ -881,7 +900,7 @@ class TestFullImportOperationColumn:
         processor = glossary_import.SheetProcessor(
             "https://docs.google.com/spreadsheets/d/x", f"https://x/dp-glossaries/{GLOSSARY_NAME}", MagicMock()
         )
-        monkeypatch.setattr(processor, "read_aspects", lambda spreadsheet, known_ids: (True, {}))
+        monkeypatch.setattr(processor, "read_aspects", lambda spreadsheet, term_ids, category_ids=None: (True, {}))
         return processor.read_and_validate_data()
 
     def test_blank_operation_column_is_accepted(self, monkeypatch):
@@ -928,7 +947,7 @@ class TestGlossaryUpdateScript:
         monkeypatch.setattr(glossary_update_script.gspread, "authorize", lambda creds: client)
         monkeypatch.setattr(glossary_update_script, "default", lambda scopes: (MagicMock(), "p"))
         monkeypatch.setattr(glossary_update_script.UpdateSheetProcessor, "read_aspects",
-                            lambda self, spreadsheet, known_ids: (True, {}))
+                            lambda self, spreadsheet, term_ids, category_ids=None: (True, {}))
         monkeypatch.setattr(api_layer, "get_dataplex_service", lambda: MagicMock())
         monkeypatch.setattr(api_layer, "get_glossary",
                             lambda service, name: {"name": "projects/123456/locations/global/glossaries/my-glossary"})
@@ -999,3 +1018,83 @@ class TestGlossaryUpdateScript:
         spreadsheet = MagicMock()
         glossary_update_script.open_glossary_worksheet(spreadsheet, "https://docs.google.com/spreadsheets/d/abc/edit#gid=42")
         spreadsheet.get_worksheet_by_id.assert_called_once_with(42)
+
+    def test_passes_term_and_category_ids_separately_to_read_aspects(self, monkeypatch, tmp_path):
+        values = [
+            HEADERS + ["Operation"],
+            sheet_row("sales") + [""],
+            sheet_row("sales", "CATEGORY") + [""],
+            sheet_row("revenue") + [""],
+            sheet_row("finance", "CATEGORY") + [""],
+            sheet_row("gone") + ["delete"],
+            sheet_row("gone-cat", "CATEGORY") + ["delete"],
+        ]
+        self._setup(monkeypatch, values, live_map(live("gone"), live("gone-cat", "CATEGORY")))
+        seen = []
+
+        def fake_read_aspects(self, spreadsheet, term_ids, category_ids=None):
+            seen.append((term_ids, category_ids))
+            return True, {}
+
+        monkeypatch.setattr(glossary_update_script.UpdateSheetProcessor, "read_aspects", fake_read_aspects)
+        assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
+        assert seen == [({"sales", "revenue"}, {"sales", "finance"})]
+
+    def test_category_only_id_in_aspects_sheet_is_rejected(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS, sheet_row("revenue"), sheet_row("finance", "CATEGORY")]
+        self._setup(monkeypatch, values, {})
+        aspect_ws = MagicMock()
+        aspect_ws.get_all_values.return_value = [
+            ["id", "Aspect name", "Aspect value"],
+            ["finance", "custom-gov.tier", "HIGH"],
+        ]
+        spreadsheet = glossary_update_script.gspread.authorize(None).open_by_url("x")
+        spreadsheet.worksheet.return_value = aspect_ws
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "read_aspects",
+            glossary_update_script.glossary_import.SheetProcessor.read_aspects,
+        )
+        assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 1
+        out = capsys.readouterr().out
+        assert "'finance' in aspects sheet row 2 is a category" in out
+        assert "Custom aspects can only be set on terms" in out
+
+    def test_shared_id_in_aspects_sheet_warns_and_updates_only_the_term(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS, sheet_row("sales"), sheet_row("sales", "CATEGORY")]
+        api = self._setup(monkeypatch, values, live_map(live("sales"), live("sales", "CATEGORY")))
+        aspect_ws = MagicMock()
+        aspect_ws.get_all_values.return_value = [
+            ["id", "Aspect name", "Aspect value"],
+            ["sales", "custom-gov.tier", "HIGH"],
+        ]
+        spreadsheet = glossary_update_script.gspread.authorize(None).open_by_url("x")
+        spreadsheet.worksheet.return_value = aspect_ws
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "read_aspects",
+            glossary_update_script.glossary_import.SheetProcessor.read_aspects,
+        )
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "_get_aspect_field_types",
+            lambda self, resource: {"tier": "string"},
+        )
+        assert glossary_update_script.run(self._args(tmp_path, "--yes")) == 0
+        out = capsys.readouterr().out
+        assert "'sales' in aspects sheet row 2 is both a term and a category" in out
+        assert api.calls == [("aspects", "sales", ("my-project.global.custom-gov",))]
+        results_file = next(tmp_path.glob("glossary-update-my-glossary-*.csv"))
+        lines = results_file.read_text().splitlines()
+        assert lines[1].startswith("2,TERM,sales,UPDATE,DONE")
+        assert lines[2].startswith("3,CATEGORY,sales,UNCHANGED,UNCHANGED")
+
+    def test_missing_or_empty_aspects_sheet_warns_without_failing(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS, sheet_row("revenue")]
+        self._setup(monkeypatch, values, live_map(live("revenue")))
+        spreadsheet = glossary_update_script.gspread.authorize(None).open_by_url("x")
+        spreadsheet.worksheet.side_effect = glossary_update_script.gspread.exceptions.WorksheetNotFound("Sheet2")
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "read_aspects",
+            glossary_update_script.glossary_import.SheetProcessor.read_aspects,
+        )
+        assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
+        out = capsys.readouterr().out
+        assert "No 'Sheet2' worksheet found; no custom aspects will be changed." in out
