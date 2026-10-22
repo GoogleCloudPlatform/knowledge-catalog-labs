@@ -310,6 +310,11 @@ GLOSSARY_WRITE_API_CALL_DELAY_SECONDS = 60 / DEFAULT_GLOSSARY_WRITES_PER_MINUTE
 GLOSSARY_READ_API_CALL_DELAY_SECONDS = 60 / 180
 ENTRY_WRITE_API_CALL_DELAY_SECONDS = 60 / 600
 
-# After creating a term or category, Dataplex creates its catalog entry asynchronously.
-# Its aspects (overview, contacts, custom aspects) can only be written once the entry exists.
-ENTRY_WAIT_TIMEOUT_SECONDS = 60
+# After creating a term or category, Dataplex creates its catalog entry asynchronously (usually
+# within seconds, sometimes after more than a minute). Its aspects (overview, contacts, custom
+# aspects) can only be written once the entry exists.
+ENTRY_WAIT_TIMEOUT_SECONDS = 180
+# A term or category created this recently whose entry can't be read yet is waited for (up to
+# ENTRY_WAIT_TIMEOUT_SECONDS) before planning, e.g. when the update is run again right after
+# creating it. An older one without a readable entry is reported (missing permission).
+ENTRY_PENDING_WINDOW_SECONDS = 15 * 60

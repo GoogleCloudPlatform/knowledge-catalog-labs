@@ -21,6 +21,7 @@ glossary or apply a plan through utils.api_layer.
 
 import copy
 import csv
+import datetime
 import re
 import threading
 import time
@@ -35,6 +36,7 @@ from utils.constants import (
     CONTACT_ROLE_STEWARD,
     CONTACTS_ASPECT_KEY,
     DATAPLEX_SYSTEM_ENTRY_GROUP,
+    ENTRY_PENDING_WINDOW_SECONDS,
     ENTRY_WAIT_TIMEOUT_SECONDS,
     GLOSSARY_CATEGORY_TYPE,
     GLOSSARY_MAX_CATEGORIES,
@@ -77,6 +79,8 @@ FIELD_LABELS = "labels"
 FIELD_PARENT = "parent"
 
 _PARENT_CATEGORY_PATTERN = re.compile(r"/categories/(?P<category_id>[^/]+)$")
+# RFC 3339 timestamps returned by the API; the fraction and the 'Z' are ignored.
+_TIMESTAMP_PATTERN = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?Z$")
 
 NodeKey = Tuple[str, str]  # (type, id), e.g. ('TERM', 'revenue')
 
@@ -188,6 +192,7 @@ class LiveNode:
     labels: Dict[str, str]
     resource_name: str
     update_time: str = ""
+    create_time: str = ""
 
     @property
     def key(self) -> NodeKey:
@@ -428,6 +433,7 @@ def _live_node(node_type: str, resource: Dict) -> LiveNode:
         labels=dict(resource.get("labels", {}) or {}),
         resource_name=name,
         update_time=resource.get("updateTime", ""),
+        create_time=resource.get("createTime", ""),
     )
 
 
@@ -480,6 +486,65 @@ def fetch_entries(
         return {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         return dict(zip(keys, executor.map(lookup, keys)))
+
+
+def _parse_time(timestamp: str) -> Optional[datetime.datetime]:
+    """An RFC 3339 timestamp from the API ('2026-10-22T05:31:59.123456789Z'), or None."""
+    match = _TIMESTAMP_PATTERN.match(timestamp or "")
+    if not match:
+        return None
+    return datetime.datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+
+
+def recently_created_without_entry(
+    live_nodes: Dict[NodeKey, LiveNode],
+    live_entries: Dict[NodeKey, Optional[Dict]],
+    window_seconds: float = ENTRY_PENDING_WINDOW_SECONDS,
+    now: Optional[datetime.datetime] = None,
+) -> List[NodeKey]:
+    """The terms/categories without a readable catalog entry that were created very recently.
+
+    Dataplex creates the catalog entry of a new term or category asynchronously, usually within
+    seconds but sometimes after a minute or more. Such an entry is waited for (see
+    wait_for_entries) instead of being reported as unreadable.
+    """
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    keys = []
+    for key, entry in live_entries.items():
+        created = _parse_time(live_nodes[key].create_time) if key in live_nodes else None
+        if entry is None and created and (now - created).total_seconds() <= window_seconds:
+            keys.append(key)
+    return keys
+
+
+def wait_for_entries(
+    glossary: GlossaryRef,
+    keys: List[NodeKey],
+    live_entries: Dict[NodeKey, Optional[Dict]],
+    timeout: float = ENTRY_WAIT_TIMEOUT_SECONDS,
+    service_factory: Callable = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> List[NodeKey]:
+    """Poll the catalog entries of `keys` until they can be read, updating `live_entries`.
+
+    Returns:
+        The keys whose entry still can't be read after `timeout` seconds.
+    """
+    service_factory = service_factory or api_layer.get_dataplex_service
+    pending = list(keys)
+    deadline = time.monotonic() + timeout
+    delay = 2.0
+    while pending:
+        for key in list(pending):
+            entry = api_layer.lookup_entry(service_factory(), glossary.entry_name(*key), glossary.project_location)
+            if entry is not None:
+                live_entries[key] = entry
+                pending.remove(key)
+        if not pending or time.monotonic() + delay > deadline:
+            break
+        sleep(delay)
+        delay = min(delay * 2, 10.0)
+    return pending
 
 
 def _is_system_aspect_of_type(aspect_key: str, aspect_type_id: str) -> bool:
@@ -797,8 +862,8 @@ def _plan_upsert(
     if entry is None:
         plan.errors.append(
             f"Row {row.row_number}: could not read the catalog entry of {row.node_type.lower()} "
-            f"'{row.node_id}' (it doesn't exist or you don't have permission to read it), so its "
-            f"overview, contacts and aspects can't be compared."
+            f"'{row.node_id}' (it doesn't exist yet, or you don't have permission to read it: "
+            f"dataplex.entries.get), so its overview, contacts and aspects can't be compared."
         )
     else:
         live_aspects = extract_live_aspects(entry)

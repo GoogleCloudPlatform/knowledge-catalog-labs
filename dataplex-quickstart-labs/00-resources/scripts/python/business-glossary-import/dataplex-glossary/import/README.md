@@ -398,8 +398,12 @@ checked.
     are created and updated.
 3.  Overview, contacts and custom aspects are written. For a new term or
     category, the script waits until Dataplex has created its catalog entry
-    (up to 60 seconds).
+    (up to 3 minutes; it usually takes a few seconds).
 4.  The categories that the sheet moves something out of are deleted.
+
+When the update is run again shortly after creating terms or categories, the
+script also waits for the catalog entries of those created in the last 15
+minutes before comparing them with the sheet.
 
 A category is not deleted while something inside it is still there (because
 deleting or moving it out failed): Dataplex would move it up a level instead of

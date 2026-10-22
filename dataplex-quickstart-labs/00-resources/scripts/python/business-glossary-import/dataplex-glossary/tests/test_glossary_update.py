@@ -1240,3 +1240,65 @@ class TestGlossaryUpdateScript:
             "--glossary-url", f"https://console.cloud.google.com/dataplex/dp-glossaries/{GLOSSARY_NAME}",
             "--output-dir", str(tmp_path), *extra,
         ]
+
+
+# ============================================================================
+# Catalog entries of recently created terms/categories
+# ============================================================================
+
+class TestRecentlyCreatedEntries:
+
+    NOW = gu.datetime.datetime(2026, 10, 22, 6, 0, 0, tzinfo=gu.datetime.timezone.utc)
+
+    def _node(self, node_id, created):
+        node = live(node_id)
+        node.create_time = created
+        return node
+
+    def test_only_recent_nodes_without_an_entry_are_waited_for(self):
+        nodes = live_map(self._node("new", "2026-10-22T05:59:30.123456789Z"),
+                         self._node("old", "2026-10-21T05:00:00Z"),
+                         self._node("ok", "2026-10-22T05:59:59Z"),
+                         self._node("unknown", ""))
+        entries = {("TERM", "new"): None, ("TERM", "old"): None, ("TERM", "ok"): {"name": "e"},
+                   ("TERM", "unknown"): None}
+        assert gu.recently_created_without_entry(nodes, entries, now=self.NOW) == [("TERM", "new")]
+
+    def test_wait_for_entries_polls_until_the_entry_appears(self, monkeypatch):
+        answers = iter([None, None, {"name": "e", "updateTime": "e1"}])
+        monkeypatch.setattr(api_layer, "lookup_entry", lambda service, name, location: next(answers))
+        entries = {("TERM", "new"): None}
+        sleeps = []
+        missing = gu.wait_for_entries(GLOSSARY, [("TERM", "new")], entries, timeout=60,
+                                      service_factory=MagicMock, sleep=sleeps.append)
+        assert missing == []
+        assert entries[("TERM", "new")]["name"] == "e"
+        assert sleeps == [2.0, 4.0]
+
+    def test_wait_for_entries_gives_up_after_the_timeout(self, monkeypatch):
+        monkeypatch.setattr(api_layer, "lookup_entry", lambda service, name, location: None)
+        entries = {("TERM", "new"): None}
+        assert gu.wait_for_entries(GLOSSARY, [("TERM", "new")], entries, timeout=0,
+                                   service_factory=MagicMock, sleep=lambda s: None) == [("TERM", "new")]
+        assert entries[("TERM", "new")] is None
+
+    def test_script_waits_for_the_entry_of_a_term_created_just_before(self, monkeypatch, tmp_path, capsys):
+        new = live("revenue")
+        new.create_time = gu.datetime.datetime.now(gu.datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        script = TestGlossaryUpdateScript()
+        api = script._setup(monkeypatch, [HEADERS, sheet_row("revenue")], live_map(new))
+        monkeypatch.setattr(gu, "fetch_entries", lambda glossary, keys, max_workers=5: {k: None for k in keys})
+        waited = []
+
+        def wait_for_entries(glossary, keys, live_entries, **kwargs):
+            waited.append(list(keys))
+            for key in keys:
+                live_entries[key] = entry(*key)
+            return []
+        monkeypatch.setattr(gu, "wait_for_entries", wait_for_entries)
+        assert glossary_update_script.run(script._args(tmp_path, "--dry-run")) == 0
+        assert waited == [[("TERM", "revenue")]]
+        out = capsys.readouterr().out
+        assert "Waiting for Dataplex to create the catalog entries of 1 recently created" in out
+        assert "nothing to change" in out
+        assert api.calls == []

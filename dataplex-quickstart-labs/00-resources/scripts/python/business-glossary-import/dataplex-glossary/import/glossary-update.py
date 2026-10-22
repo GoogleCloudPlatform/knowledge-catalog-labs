@@ -220,6 +220,11 @@ def run(args: argparse.Namespace) -> int:
     if entry_keys:
         print(f"Reading the overview, contacts and aspects of {len(entry_keys)} existing term(s)/categor(ies)...")
     live_entries = glossary_update.fetch_entries(glossary, entry_keys, max_workers=MAX_WORKERS)
+    pending = glossary_update.recently_created_without_entry(live_nodes, live_entries)
+    if pending:
+        print(f"Waiting for Dataplex to create the catalog entries of {len(pending)} recently created "
+              f"term(s)/categor(ies)...")
+        glossary_update.wait_for_entries(glossary, pending, live_entries)
 
     plan = glossary_update.build_plan(
         rows, live_nodes, sheet_aspects, live_entries,
