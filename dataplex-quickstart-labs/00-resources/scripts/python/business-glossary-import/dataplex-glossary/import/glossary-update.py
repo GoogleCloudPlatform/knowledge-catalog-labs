@@ -145,6 +145,7 @@ def confirm(plan: glossary_update.UpdatePlan) -> bool:
     try:
         answer = input(prompt).strip().lower()
     except EOFError as error:
+        print()  # end the prompt's line
         raise ValueError("No answer to the confirmation prompt. Run with --yes to apply the changes.") from error
     return answer in accepted
 
