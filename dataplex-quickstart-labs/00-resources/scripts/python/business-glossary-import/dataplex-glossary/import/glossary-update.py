@@ -14,6 +14,10 @@ differs, with the glossary and entry APIs, so it needs no Cloud Storage bucket.
 
 Usage:
     python3 glossary-update.py --spreadsheet-url <URL> --glossary-url <URL> [--dry-run] [--yes]
+
+Exit codes: 0 when the changes were applied (or there was nothing to change, or it was a dry
+run); 1 when the sheet has errors, the update was cancelled, or a change failed or had a
+conflict; 2 for invalid arguments; 130 when interrupted with Ctrl+C.
 """
 
 import argparse
@@ -21,7 +25,7 @@ import datetime
 import importlib.util
 import os
 import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 curr_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(os.path.dirname(curr_dir))
@@ -69,16 +73,7 @@ class UpdateSheetProcessor(glossary_import.SheetProcessor):
 
 def make_row_validator(processor) -> glossary_update.RowValidator:
     """Validate a glossary sheet row with the same checks as glossary-import.py."""
-    def validate(row_data: Dict[str, str], row_number: int) -> None:
-        processor._validate_id(row_data.get("id"), row_number)
-        processor._validate_type(row_data.get("type"), row_number)
-        processor._validate_parent(row_data.get("parent"), row_data, row_number)
-        processor._validate_contacts(row_data, row_number)
-        processor._validate_display_name(row_data.get("display_name"), row_number)
-        processor._validate_description(row_data.get("description"), row_number)
-        processor._validate_overview(row_data.get("overview"), row_number)
-        processor._validate_labels(row_data, row_number)
-    return validate
+    return processor.validate_glossary_row
 
 
 def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -110,23 +105,79 @@ def parse_arguments(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 
 def open_glossary_worksheet(spreadsheet, spreadsheet_url: str):
-    """The tab given by the URL's gid, or the first tab (as glossary-import.py)."""
+    """The tab given by the URL's gid, or the first tab (as glossary-import.py).
+
+    Raises:
+        ValueError: If the spreadsheet has no tab with the URL's gid.
+    """
     match = SPREADSHEET_URL_PATTERN.match(spreadsheet_url)
     gid = match.group("gid") if match else None
-    if gid is not None:
+    if gid is None:
+        return spreadsheet.sheet1
+    try:
         return spreadsheet.get_worksheet_by_id(int(gid))
-    return spreadsheet.sheet1
+    except gspread.exceptions.WorksheetNotFound as error:
+        raise ValueError(
+            f"The spreadsheet has no tab with gid {gid} (from --spreadsheet-url). Open the glossary "
+            f"tab in the browser and copy its URL, or remove '#gid=...' to use the first tab."
+        ) from error
+
+
+def delete_warning(plan: glossary_update.UpdatePlan) -> Optional[str]:
+    """The warning shown with the plan when it deletes anything, or None."""
+    deletes = plan.by_action(glossary_update.ACTION_DELETE)
+    if not deletes:
+        return None
+    return (f"WARNING: {len(deletes)} term(s)/categor(ies) will be DELETED, together with their "
+            f"entry links (definition, synonym and related links). This can't be undone.")
 
 
 def confirm(plan: glossary_update.UpdatePlan) -> bool:
-    deletes = plan.by_action(glossary_update.ACTION_DELETE)
-    if deletes:
-        print(f"\nWARNING: {len(deletes)} term(s)/categor(ies) will be DELETED, together with their "
-              f"entry links (definition, synonym and related links). This can't be undone.")
-        answer = input("Type 'yes' to apply these changes: ").strip().lower()
-        return answer == "yes"
-    answer = input("\nApply these changes? [y/N]: ").strip().lower()
-    return answer in ("y", "yes")
+    """Ask before applying the plan; a plan with deletes needs 'yes' typed in full.
+
+    Raises:
+        ValueError: If there is no input to read the answer from (use --yes).
+    """
+    if plan.by_action(glossary_update.ACTION_DELETE):
+        prompt, accepted = "\nType 'yes' to apply these changes, including the deletes: ", ("yes",)
+    else:
+        prompt, accepted = "\nApply these changes? [y/N]: ", ("y", "yes")
+    try:
+        answer = input(prompt).strip().lower()
+    except EOFError as error:
+        raise ValueError("No answer to the confirmation prompt. Run with --yes to apply the changes.") from error
+    return answer in accepted
+
+
+def aspect_sheet_ids(rows: List[glossary_update.SheetRow]) -> Tuple[Set[str], Set[str]]:
+    """The term ids and category ids that rows of the aspects sheet may reference.
+
+    Rows marked 'delete' are included, so that a term can be deleted although the aspects
+    sheet still has rows for it (they are dropped, see drop_aspects_of_deleted_terms). A
+    delete row without a type may be a term. Category ids are passed separately so that
+    a row for a category gets a clear error, or a warning when a term shares the id.
+    """
+    term_ids = {row.node_id for row in rows if row.node_type in (GLOSSARY_TERM_TYPE, "")}
+    category_ids = {row.node_id for row in rows if row.node_type == GLOSSARY_CATEGORY_TYPE}
+    return term_ids, category_ids
+
+
+def drop_aspects_of_deleted_terms(
+    rows: List[glossary_update.SheetRow], sheet_aspects: Dict[str, Dict[str, Dict]]
+) -> Dict[str, Dict[str, Dict]]:
+    """The custom aspects without those of the terms that the sheet deletes (with a warning).
+
+    A term that is kept (not marked 'delete') keeps its aspects, also when a category with
+    the same id is deleted.
+    """
+    kept_term_ids = {row.node_id for row in rows if not row.is_delete and row.node_type == GLOSSARY_TERM_TYPE}
+    deleted_term_ids = {
+        row.node_id for row in rows if row.is_delete and row.node_type in (GLOSSARY_TERM_TYPE, "")
+    }
+    ignored = sorted((deleted_term_ids - kept_term_ids) & set(sheet_aspects))
+    for term_id in ignored:
+        print(f"Warning: term '{term_id}' is marked 'delete'; its rows in the aspects sheet are ignored.")
+    return {term_id: aspects for term_id, aspects in sheet_aspects.items() if term_id not in ignored}
 
 
 def run(args: argparse.Namespace) -> int:
@@ -153,18 +204,12 @@ def run(args: argparse.Namespace) -> int:
         _print_problems("The glossary sheet has errors; nothing was changed:", errors)
         return 1
 
-    term_ids = {
-        row.node_id for row in rows
-        if not row.is_delete and row.node_type == GLOSSARY_TERM_TYPE
-    }
-    category_ids = {
-        row.node_id for row in rows
-        if not row.is_delete and row.node_type == GLOSSARY_CATEGORY_TYPE
-    }
+    term_ids, category_ids = aspect_sheet_ids(rows)
     aspects_valid, sheet_aspects = processor.read_aspects(spreadsheet, term_ids, category_ids)
     if not aspects_valid:
         print("The aspects sheet has errors; nothing was changed.")
         return 1
+    sheet_aspects = drop_aspects_of_deleted_terms(rows, sheet_aspects)
 
     print("Reading the glossary...")
     dataplex_service = api_layer.get_dataplex_service()
@@ -177,7 +222,7 @@ def run(args: argparse.Namespace) -> int:
 
     plan = glossary_update.build_plan(
         rows, live_nodes, sheet_aspects, live_entries,
-        same_project=lambda project, other: api_layer._is_same_project(project, other, user_project=project_id),
+        same_project=lambda project, other: api_layer.is_same_project(project, other, user_project=project_id),
     )
     for warning in plan.warnings:
         logger.warning(warning)
@@ -193,6 +238,9 @@ def run(args: argparse.Namespace) -> int:
     if not plan.has_changes:
         print("\nThe glossary already matches the sheet; nothing to change.")
         return 0
+    warning = delete_warning(plan)
+    if warning:
+        print(f"\n{warning}")
     if args.dry_run:
         glossary_update.write_results_csv(results_path, planned_results, dry_run=True)
         print(f"\nDry run: nothing was changed. Planned changes written to {results_path}")
@@ -241,7 +289,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging_utils.setup_file_logging()
         return run(parse_arguments(argv))
     except KeyboardInterrupt:
-        logger.info("Update cancelled by user")
+        logger.info("Update cancelled by user. Changes that were already applied are kept; run the "
+                    "update again with the same sheet to apply the rest.")
+        # os._exit, not sys.exit: worker threads may still be waiting on API calls.
         os._exit(130)
     except (gspread.exceptions.APIError, gspread.exceptions.SpreadsheetNotFound) as sheet_error:
         logger.error(f"Unable to read the spreadsheet: {sheet_error}")

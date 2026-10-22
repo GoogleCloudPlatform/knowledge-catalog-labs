@@ -31,6 +31,7 @@ The test suite covers the following modules:
    - `schedule_category_operations()` - Valid order for category creations and moves
    - `apply_plan()` - Order of the API calls, aspects, conflicts and failures
    - The Operation column in glossary-import.py and the RAW values written by glossary-export.py
+   - The script: confirmation, the aspects sheet (terms only; rows of deleted terms are ignored), errors
 
 ### API and Service Layers
 3. **test_api_layer.py** - Tests for api_layer.py

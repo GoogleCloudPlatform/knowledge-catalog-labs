@@ -109,7 +109,9 @@ Exports categories and terms from a Dataplex business glossary into Google Sheet
 
 Values are written exactly as they are in Dataplex: Sheets doesn't convert them into numbers,
 dates, booleans or formulas, so the sheet can be imported back (with `glossary-import.py`) or
-used to update the glossary (with `glossary-update.py`) without changing them.
+used to update the glossary (with `glossary-update.py`) without changing them. (Values that you
+later *type* into the sheet are still converted by Sheets; type a `'` before a value such as
+`007` or `=x` to keep it as text.)
 
 ### Usage
 

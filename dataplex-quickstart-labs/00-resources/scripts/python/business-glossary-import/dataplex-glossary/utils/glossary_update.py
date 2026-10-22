@@ -432,7 +432,18 @@ def _live_node(node_type: str, resource: Dict) -> LiveNode:
 
 
 def fetch_live_nodes(dataplex_service, glossary: GlossaryRef) -> Dict[NodeKey, LiveNode]:
-    """Read all categories and terms of the glossary."""
+    """Read all categories and terms of the glossary.
+
+    Args:
+        dataplex_service: A Dataplex API client.
+        glossary: The glossary to read.
+
+    Returns:
+        The glossary's terms and categories, keyed by (type, id).
+
+    Raises:
+        DataplexAPIError: If the glossary's terms or categories can't be listed.
+    """
     nodes: Dict[NodeKey, LiveNode] = {}
     for category in api_layer.list_glossary_categories(dataplex_service, glossary.glossary_name):
         node = _live_node(CATEGORY, category)
@@ -477,7 +488,14 @@ def _is_system_aspect_of_type(aspect_key: str, aspect_type_id: str) -> bool:
 
 
 def extract_live_aspects(entry: Dict) -> LiveAspects:
-    """Pick the overview, contacts and custom aspects out of an entry returned by lookupEntry."""
+    """Pick the overview, contacts and custom aspects out of an entry returned by lookupEntry.
+
+    Args:
+        entry: The catalog entry of a term or category (lookupEntry with view=ALL).
+
+    Returns:
+        Its overview, contacts and custom (non-system) aspects.
+    """
     overview = ""
     contacts: List[Tuple[str, str]] = []
     custom: Dict[str, Dict] = {}
@@ -1016,12 +1034,21 @@ def apply_plan(
         resource_changes, live_nodes, {change.node_id for change in early_category_deletes}
     )
     scheduled = {id(step.change) for step in category_steps}
+    parked: Set[int] = set()  # categories moved to the glossary root as the first of two steps
     for step in category_steps:
         if id(step.change) in results:
             continue
         outcome = applier.write_resource(step.change, parent=step.parent, final=step.final)
-        if outcome is not None:
-            results[id(step.change)] = outcome
+        if outcome is None:
+            if not step.final:
+                parked.add(id(step.change))
+            continue
+        if id(step.change) in parked:
+            outcome.message = (
+                "left at the top of the glossary, where it was moved first to make room; run the "
+                "update again to move it to its parent: " + outcome.message
+            )
+        results[id(step.change)] = outcome
     other_category_updates = [
         change for change in resource_changes
         if change.node_type == CATEGORY and id(change) not in scheduled and change.fields
@@ -1053,6 +1080,13 @@ def split_category_deletes(
     """Split the category deletes into those that can be applied before the creations and moves
     (everything inside them is deleted too) and those that must wait until the terms and
     categories that the sheet moves out of them have been moved. Each list is deepest first.
+
+    Args:
+        deletes: The planned deletes (terms are ignored).
+        live_nodes: The glossary's current terms and categories.
+
+    Returns:
+        (early, late) category deletes.
     """
     deleted_keys = {change.key for change in deletes}
     live_children = _children_by_parent(live_nodes)
@@ -1138,6 +1172,9 @@ class _PlanApplier:
         # Terms/categories whose parent was changed (to their final parent, or to the glossary
         # root for a two-step move): they're no longer inside the category they were in.
         self.moved: Set[NodeKey] = set()
+        # Updates whose catalog entry was already checked for conflicts (see
+        # _entry_conflict_before_first_write).
+        self._entry_checked: Set[int] = set()
         self._lock = threading.Lock()
 
     # --- term/category writes -------------------------------------------------
@@ -1162,6 +1199,9 @@ class _PlanApplier:
                 return None
 
             conflict = self._conflict(service, change)
+            if conflict:
+                return conflict
+            conflict = self._entry_conflict_before_first_write(service, change)
             if conflict:
                 return conflict
             fields = change.fields if final else [FIELD_PARENT]
@@ -1219,14 +1259,15 @@ class _PlanApplier:
                 if entry is None:
                     return ChangeResult(
                         change, STATUS_FAILED,
-                        f"created, but its catalog entry didn't appear within {self.entry_wait_timeout:.0f}s, "
-                        f"so its overview/contacts/aspects weren't written. Run the update again to write them.",
+                        f"created, but its catalog entry couldn't be read within {self.entry_wait_timeout:.0f}s "
+                        f"(it wasn't created yet, or you lack dataplex.entries.get), so its "
+                        f"overview/contacts/aspects weren't written. Run the update again to write them.",
                     )
                 entry_name, entry_type = entry.get("name", ""), entry.get("entryType", "")
             elif not change.fields:
                 # Only aspects change: check that nobody changed the entry since it was read. (When
-                # fields were written, the term/category was checked, and our own write updates the
-                # entry, so the entry can't be compared.)
+                # fields change too, the entry was checked before the fields were written, see
+                # _entry_conflict_before_first_write: our own write updates the entry.)
                 conflict = self._entry_conflict(service, change)
                 if conflict:
                     return conflict
@@ -1288,6 +1329,23 @@ class _PlanApplier:
         if current is None or current.get("updateTime", "") != change.entry_update_time:
             return ChangeResult(change, STATUS_CONFLICT, _CONFLICT_MESSAGE)
         return None
+
+    def _entry_conflict_before_first_write(self, service, change: Change) -> Optional[ChangeResult]:
+        """For an update of both fields and aspects, check the catalog entry before the first write.
+
+        The check of the term/category itself doesn't see edits of its overview, contacts or
+        custom aspects (they're on its catalog entry, e.g. edited in the Cloud Console). The
+        entry can't be checked later in write_aspects: writing the fields makes Dataplex update
+        the entry too. A category moved in two steps is written twice; only the first write is
+        preceded by the check.
+        """
+        if not (change.fields and change.aspects):
+            return None
+        with self._lock:
+            if id(change) in self._entry_checked:
+                return None
+            self._entry_checked.add(id(change))
+        return self._entry_conflict(service, change)
 
 
 _CONFLICT_MESSAGE = (
@@ -1356,6 +1414,11 @@ def write_results_csv(path: str, results: List[ChangeResult], dry_run: bool = Fa
     """Write one line per term/category: row, type, id, action, status, details.
 
     For a dry run the status is PLANNED for the changes that would be applied.
+
+    Args:
+        path: The CSV file to write (overwritten).
+        results: One result per planned change.
+        dry_run: Whether the results are from a dry run (nothing was applied).
     """
     planned_status = {ACTION_UNCHANGED: STATUS_UNCHANGED, ACTION_SKIP: STATUS_SKIPPED}
     with open(path, "w", newline="", encoding="utf-8") as results_file:

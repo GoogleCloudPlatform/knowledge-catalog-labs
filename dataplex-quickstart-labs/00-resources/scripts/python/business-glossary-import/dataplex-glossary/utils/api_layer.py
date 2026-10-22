@@ -359,7 +359,21 @@ def create_glossary_resource(
 ) -> Dict:
     """Create a glossary term or category with the given id under `glossary_name`.
 
-    `body` holds displayName, description, labels and parent (the glossary or a category).
+    Transient errors (network, 429, 5xx, 409 ABORTED) are retried; the caller handles
+    'already exists' (HTTP 400 or 409 ALREADY_EXISTS), which a retried create can return.
+
+    Args:
+        dataplex_service: A Dataplex API client.
+        glossary_name: projects/<p>/locations/<l>/glossaries/<g>.
+        resource_type: GLOSSARY_TERM_TYPE or GLOSSARY_CATEGORY_TYPE.
+        resource_id: The id of the new term or category.
+        body: displayName, description, labels and parent (the glossary or a category).
+
+    Returns:
+        The created term or category.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error.
     """
     logger.debug(f"Request: glossaries.{resource_type.lower()}.create(id={resource_id}, body={body})")
     collection = _glossary_collection(dataplex_service, resource_type)
@@ -375,7 +389,21 @@ def create_glossary_resource(
 def update_glossary_resource(
     dataplex_service: build, resource_name: str, resource_type: str, body: Dict, update_mask: List[str]
 ) -> Dict:
-    """Update the fields in `update_mask` (display_name, description, labels, parent) of a term or category."""
+    """Update the fields in `update_mask` (display_name, description, labels, parent) of a term or category.
+
+    Args:
+        dataplex_service: A Dataplex API client.
+        resource_name: The term's or category's resource name.
+        resource_type: GLOSSARY_TERM_TYPE or GLOSSARY_CATEGORY_TYPE.
+        body: The new values; only the fields in `update_mask` are written.
+        update_mask: The fields to write.
+
+    Returns:
+        The updated term or category.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error.
+    """
     mask = ",".join(update_mask)
     logger.debug(f"Request: glossaries.{resource_type.lower()}.patch(name={resource_name}, updateMask={mask})")
     request = _glossary_collection(dataplex_service, resource_type).patch(
@@ -387,7 +415,13 @@ def update_glossary_resource(
 
 
 def delete_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> None:
-    """Delete a glossary term or category."""
+    """Delete a glossary term or category.
+
+    Deleting a category doesn't delete what's inside it: Dataplex moves its contents up a level.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error (404 when it's already deleted).
+    """
     logger.debug(f"Request: glossaries.{resource_type.lower()}.delete(name={resource_name})")
     request = _glossary_collection(dataplex_service, resource_type).delete(name=resource_name)
     _execute_rate_limited(
@@ -400,7 +434,18 @@ def update_entry_aspects(
 ) -> Dict:
     """Write the given aspects of an entry, leaving its other aspects unchanged.
 
-    `aspects` maps aspect keys (e.g. 'dataplex-types.global.overview') to {'data': {...}}.
+    Args:
+        dataplex_service: A Dataplex API client.
+        entry_name: The catalog entry's resource name (with the project number).
+        aspects: Aspect keys (e.g. 'dataplex-types.global.overview') -> {'data': {...}}. Only
+            these keys are written (aspectKeys); other aspects are kept.
+        entry_type: The entry's type, sent with the entry when known.
+
+    Returns:
+        The updated entry.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error.
     """
     body = {"name": entry_name, "aspects": aspects}
     if entry_type:
@@ -1022,7 +1067,7 @@ def _name_splits(identifier: str) -> List[tuple]:
     return splits
 
 
-def _is_same_project(project: str, other_project: str, user_project: str = "") -> bool:
+def is_same_project(project: str, other_project: str, user_project: str = "") -> bool:
     """Whether two project IDs or numbers name the same project.
 
     A project ID and a project number are compared by looking up the number of the ID. If that
@@ -1066,7 +1111,7 @@ def check_term_matches_display_identifier(
     term_display_name = _term_display_name(term)
     names_term = (
         parsed.location == match.group('location_id')
-        and _is_same_project(parsed.project_id, match.group('project_id'), user_project)
+        and is_same_project(parsed.project_id, match.group('project_id'), user_project)
         and any(
             _glossary_match_rank(glossary, glossary_part) is not None and term_part in ("", term_display_name)
             for glossary_part, term_part in _name_splits(identifier)

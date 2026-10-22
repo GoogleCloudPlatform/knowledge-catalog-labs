@@ -584,6 +584,7 @@ class FakeApi:
         node_id = name.rsplit("/", 1)[-1]
         self.calls.append(("update", node_type, node_id, tuple(mask), body["parent"]))
         self._maybe_fail(("update", node_id))
+        self.current_update_time[node_id] = "t2"  # what a later get returns
         return {"updateTime": "t2"}
 
     def delete(self, service, name, node_type):
@@ -677,6 +678,64 @@ class TestApplyPlan:
         plan = plan_for([sheet_row("revenue", overview="new")], live_map(live("revenue")), entries=entries)
         results = apply(plan, live_map(live("revenue")))
         assert results[0].status == gu.STATUS_CONFLICT  # FakeApi returns updateTime e1, plan read e0
+
+    def test_field_and_aspect_update_checks_the_entry_before_writing(self, monkeypatch):
+        # Someone edited the overview in the Console (the entry changed, the term didn't): the
+        # term's own check doesn't see it, so the entry is checked before anything is written.
+        api = FakeApi(monkeypatch)
+        entries = {("TERM", "revenue"): entry("TERM", "revenue", overview="old", update_time="e0")}
+        plan = plan_for([sheet_row("revenue", description="new", overview="new")],
+                        live_map(live("revenue")), entries=entries)
+        results = apply(plan, live_map(live("revenue")))
+        assert results[0].status == gu.STATUS_CONFLICT
+        assert not any(call[0] in ("update", "aspects") for call in api.calls)
+
+    def test_field_and_aspect_update_without_concurrent_edit_is_applied(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        entries = {("TERM", "revenue"): entry("TERM", "revenue", overview="old", update_time="e1")}
+        plan = plan_for([sheet_row("revenue", description="new", overview="new")],
+                        live_map(live("revenue")), entries=entries)
+        results = apply(plan, live_map(live("revenue")))
+        assert results[0].status == gu.STATUS_DONE
+        assert [call[0] for call in api.calls] == ["update", "aspects"]
+        assert api.polls == 1  # one entry check, before the fields were written
+
+    def _parked_category_plan(self, monkeypatch, **row_kwargs):
+        # x is moved to the glossary root first, then under z (see TestScheduleCategories).
+        def valid(tree):
+            return not (tree["x"] == "z" and tree["z"] != "p") and not (tree["z"] == "p" and tree["x"] == "q")
+        monkeypatch.setattr(gu, "_category_tree_is_valid", valid)
+        nodes = live_map(live("p", "CATEGORY"), live("q", "CATEGORY", parent="p"),
+                         live("x", "CATEGORY", parent="q"), live("z", "CATEGORY"))
+        entries = {key: entry(*key) for key in [("CATEGORY", "x"), ("CATEGORY", "z")]}
+        plan = plan_for([sheet_row("x", node_type="CATEGORY", parent="z", **row_kwargs),
+                         sheet_row("z", node_type="CATEGORY", parent="p")], nodes, entries=entries)
+        assert plan.errors == []
+        return plan, nodes
+
+    def test_parked_category_whose_final_move_fails_says_where_it_is(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        plan, nodes = self._parked_category_plan(monkeypatch)
+        original_update = api.update
+
+        def update(service, name, node_type, body, mask):
+            if name.endswith("/x") and body["parent"].endswith("/z"):
+                api.calls.append(("update", node_type, "x", tuple(mask), body["parent"]))
+                raise http_error(500)
+            return original_update(service, name, node_type, body, mask)
+        monkeypatch.setattr(api_layer, "update_glossary_resource", update)
+
+        results = {r.change.node_id: r for r in apply(plan, nodes)}
+        assert results["x"].status == gu.STATUS_FAILED
+        assert results["x"].message.startswith("left at the top of the glossary")
+        assert results["z"].status == gu.STATUS_DONE
+
+    def test_parked_category_checks_its_entry_only_before_the_first_move(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        plan, nodes = self._parked_category_plan(monkeypatch, description="new", overview="new")
+        results = {r.change.node_id: r for r in apply(plan, nodes)}
+        assert results["x"].status == gu.STATUS_DONE
+        assert api.polls == 1
 
     def test_failure_does_not_stop_other_changes(self, monkeypatch):
         api = FakeApi(monkeypatch)
@@ -1038,7 +1097,8 @@ class TestGlossaryUpdateScript:
 
         monkeypatch.setattr(glossary_update_script.UpdateSheetProcessor, "read_aspects", fake_read_aspects)
         assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
-        assert seen == [({"sales", "revenue"}, {"sales", "finance"})]
+        # Terms marked 'delete' may still have rows in the aspects sheet (they are ignored).
+        assert seen == [({"sales", "revenue", "gone"}, {"sales", "finance", "gone-cat"})]
 
     def test_category_only_id_in_aspects_sheet_is_rejected(self, monkeypatch, tmp_path, capsys):
         values = [HEADERS, sheet_row("revenue"), sheet_row("finance", "CATEGORY")]
@@ -1098,3 +1158,85 @@ class TestGlossaryUpdateScript:
         assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
         out = capsys.readouterr().out
         assert "No 'Sheet2' worksheet found; no custom aspects will be changed." in out
+
+    def _use_real_aspects_sheet(self, monkeypatch, aspect_rows):
+        aspect_ws = MagicMock()
+        aspect_ws.get_all_values.return_value = [["id", "Aspect name", "Aspect value"]] + aspect_rows
+        spreadsheet = glossary_update_script.gspread.authorize(None).open_by_url("x")
+        spreadsheet.worksheet.return_value = aspect_ws
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "read_aspects",
+            glossary_update_script.glossary_import.SheetProcessor.read_aspects,
+        )
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "_get_aspect_field_types",
+            lambda self, resource: {"tier": "string"},
+        )
+
+    def test_term_marked_delete_is_deleted_although_the_aspects_sheet_has_rows_for_it(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        values = [HEADERS + ["Operation"], sheet_row("revenue") + ["delete"], sheet_row("cost") + [""]]
+        api = self._setup(monkeypatch, values, live_map(live("revenue"), live("cost")))
+        self._use_real_aspects_sheet(monkeypatch, [
+            ["revenue", "custom-gov.tier", "HIGH"],
+            ["cost", "custom-gov.tier", "LOW"],
+        ])
+        assert glossary_update_script.run(self._args(tmp_path, "--yes")) == 0
+        out = capsys.readouterr().out
+        assert "Warning: term 'revenue' is marked 'delete'; its rows in the aspects sheet are ignored." in out
+        assert sorted(api.calls) == [
+            ("aspects", "cost", ("my-project.global.custom-gov",)),
+            ("delete", "TERM", "revenue"),
+        ]
+
+    def test_delete_row_without_type_may_have_aspect_rows(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS + ["Operation"], delete_row("revenue")]
+        api = self._setup(monkeypatch, values, live_map(live("revenue")))
+        self._use_real_aspects_sheet(monkeypatch, [["revenue", "custom-gov.tier", "HIGH"]])
+        assert glossary_update_script.run(self._args(tmp_path, "--yes")) == 0
+        assert "its rows in the aspects sheet are ignored" in capsys.readouterr().out
+        assert api.calls == [("delete", "TERM", "revenue")]
+
+    def test_deleted_category_does_not_drop_the_aspects_of_a_kept_term_with_the_same_id(self):
+        rows, errors = gu.parse_sheet(
+            [HEADERS + ["Operation"], upsert_row("sales"), delete_row("sales", "CATEGORY")], real_validator()
+        )
+        assert errors == []
+        aspects = {"sales": {"r": {"tier": "HIGH"}}}
+        assert glossary_update_script.drop_aspects_of_deleted_terms(rows, aspects) == aspects
+        assert glossary_update_script.aspect_sheet_ids(rows) == ({"sales"}, {"sales"})
+
+    def test_delete_warning_is_shown_with_the_plan(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS + ["Operation"], delete_row("revenue", "TERM")]
+        self._setup(monkeypatch, values, live_map(live("revenue")))
+        assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
+        assert "will be DELETED, together with their entry links" in capsys.readouterr().out
+
+    def test_confirmation_without_input_asks_for_yes(self, monkeypatch, tmp_path):
+        api = self._setup(monkeypatch, [HEADERS, sheet_row("revenue", description="new")], live_map(live("revenue")))
+
+        def no_input(prompt):
+            raise EOFError
+        monkeypatch.setattr("builtins.input", no_input)
+        monkeypatch.setattr(glossary_update_script.logging_utils, "setup_file_logging", lambda: None)
+        errors = []
+        monkeypatch.setattr(glossary_update_script.logger, "error", errors.append)
+        assert glossary_update_script.main(self._args_list(tmp_path)) == 1
+        assert api.calls == []
+        assert any("Run with --yes" in message for message in errors)
+
+    def test_tab_in_the_url_that_does_not_exist_is_a_clear_error(self):
+        spreadsheet = MagicMock()
+        spreadsheet.get_worksheet_by_id.side_effect = glossary_update_script.gspread.exceptions.WorksheetNotFound("7")
+        with pytest.raises(ValueError, match="has no tab with gid 7"):
+            glossary_update_script.open_glossary_worksheet(
+                spreadsheet, "https://docs.google.com/spreadsheets/d/abc/edit#gid=7"
+            )
+
+    def _args_list(self, tmp_path, *extra):
+        return [
+            "--spreadsheet-url", "https://docs.google.com/spreadsheets/d/abc/edit",
+            "--glossary-url", f"https://console.cloud.google.com/dataplex/dp-glossaries/{GLOSSARY_NAME}",
+            "--output-dir", str(tmp_path), *extra,
+        ]

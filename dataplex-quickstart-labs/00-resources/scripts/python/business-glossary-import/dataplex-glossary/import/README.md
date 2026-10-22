@@ -32,7 +32,7 @@ gcloud services enable sheets.googleapis.com
 
 ### 3. GCS Buckets
 
-For the import operation, create one or more empty Google Cloud Storage buckets. The script uses these buckets as a staging area for the import files.
+For the import operation, create one or more empty Google Cloud Storage buckets. The script uses these buckets as a staging area for the import files. The [Glossary Update](#2-glossary-update) doesn't need a bucket.
 
 Grant the following roles to the Dataplex service account (`service-PROJECT_NUMBER@gcp-sa-dataplex.iam.gserviceaccount.com`) on each GCS bucket:
 
@@ -363,12 +363,23 @@ to another parent. (This matters when you edit a full export.)
 A blank cell clears the value, as in the Glossary Import (for example, a blank
 `overview` removes the overview).
 
+Google Sheets converts what you *type* into a cell: `007` becomes `7`, and text
+starting with `=`, `+` or `-` becomes a formula. To keep such a value as text,
+type a `'` before it (`'007`). Values written by the Glossary Export are kept
+exactly.
+
 Custom aspects for terms come from the aspects sheet, as in the Glossary Import
 (custom aspects can only be set on terms). The update can **add** custom aspects
 and **change** their fields, but never removes them: aspects and aspect fields
-that aren't in the aspects sheet are left as they are. To remove a custom
+that aren't in the aspects sheet are left as they are. A `map` field is merged
+key by key, so a key can be added or changed but not removed. To remove a custom
 aspect, use the Cloud Console or the [Glossary Import](#1-glossary-import),
 which replaces everything.
+
+Each row of the aspects sheet must be for a term that is in the glossary sheet,
+also when the glossary sheet holds only the rows to change. The rows of a term
+marked `delete` are ignored (with a warning): deleting a term also deletes its
+aspects.
 
 The same validations as the Glossary Import apply to each row. The parent of a
 row must be a category that is in the sheet or already in the glossary, and the
@@ -395,17 +406,39 @@ deleting or moving it out failed): Dataplex would move it up a level instead of
 deleting it.
 
 Before changing or deleting an existing term or category, the script checks that
-it hasn't changed since the script read it. If it has (for example, someone
-edited it in the Cloud Console meanwhile), it's reported as a `CONFLICT` and left
-alone. The same happens when a term or category to create was created by someone
-else meanwhile. A change that fails doesn't stop the others.
+it hasn't changed since the script read it. When the overview, contacts or
+custom aspects change too, it also checks the term's or category's catalog entry
+(where they're stored). If something changed (for example, someone edited it in
+the Cloud Console meanwhile), it's reported as a `CONFLICT` and left alone. The
+same happens when a term or category to create was created by someone else
+meanwhile. A change that fails doesn't stop the others.
+
+Deleting a term also deletes its entry links (definition, synonym and related
+links). The script warns about it with the planned changes.
 
 The results are printed and written to
 `glossary-update-<glossary>-<timestamp>.csv`, one line per term or category with
 its action (`CREATE`, `UPDATE`, `UNCHANGED`, `DELETE`, `SKIP`) and status
 (`DONE`, `UNCHANGED`, `SKIPPED`, `CONFLICT`, `FAILED`). After fixing a problem,
 run the update again with the same sheet: what was already applied is now
-unchanged, so only the rest is applied.
+unchanged, so only the rest is applied. This also works after stopping the
+script with Ctrl+C.
+
+The script exits with:
+
+| Exit code | When |
+|---|---|
+| `0` | The changes were applied, there was nothing to change, or it was a dry run |
+| `1` | The sheet has errors, the update was cancelled, or a change failed or had a conflict |
+| `2` | Invalid arguments |
+| `130` | Stopped with Ctrl+C |
+
+### Updating entry links
+
+Entry links (a term linked to a table or column, synonyms, related terms) are
+imported with the [EntryLinks Import](#3-entrylinks-import), which already
+works as a delta: it creates the links in its sheet and never deletes existing
+links. To add a few links, use a sheet with only the new links.
 
 ### Time and quotas
 

@@ -327,6 +327,32 @@ class SheetProcessor:
         if label2_key and label2_value:
             if LABEL_PATTERN.match(label2_key) is None or LABEL_PATTERN.match(label2_value) is None:
                 raise InvalidLabelException(f"Invalid Label format in row {row_num}. Label key and value should contain only lowercase letters, numbers, or hyphens and should start with a lowercase letter. '{LABEL2_KEY_COLUMN_NAME}' is: {label2_key}, while '{LABEL2_VALUE_COLUMN_NAME}' is {label2_value}")
+
+    def validate_glossary_row(self, row_data, row_num):
+        """Validates one row of the glossary sheet (Sheet 1).
+
+        The same checks are used by glossary-update.py, so both scripts accept
+        exactly the same rows. Whether the parent category is in the sheet is
+        not checked here.
+
+        Args:
+            row_data: The row as a dict of column name -> value (whitespace
+              already stripped).
+            row_num: The row number, used in the error messages.
+
+        Raises:
+            InvalidNameException, InvalidTypeException, InvalidParentException,
+            InvalidContactException, InvalidLabelException or
+            ValidationException: For the first invalid value of the row.
+        """
+        self._validate_id(row_data.get(ID_COLUMN), row_num)
+        self._validate_type(row_data.get(TYPE_COLUMN_NAME), row_num)
+        self._validate_parent(row_data.get(PARENT_COLUMN_NAME), row_data, row_num)
+        self._validate_contacts(row_data, row_num)
+        self._validate_display_name(row_data.get(DISPLAY_NAME_COLUMN_NAME), row_num)
+        self._validate_description(row_data.get(DESCRIPTION_COLUMN_NAME), row_num)
+        self._validate_overview(row_data.get(OVERVIEW_COLUMN_NAME), row_num)
+        self._validate_labels(row_data, row_num)
         
 
     def _generate_full_name(self, name, type_value):
@@ -872,14 +898,7 @@ class SheetProcessor:
                     print(f"Invalid sheet. The number of terms exceeds the maximum allowed limit of {MAX_NUM_TERMS}. Actual number of terms: {num_terms}")
                     is_dump_valid = False
             try:
-                self._validate_id(id, row_num)
-                self._validate_type(type_value, row_num)
-                self._validate_parent(parent, row_data, row_num)
-                self._validate_contacts(row_data, row_num)
-                self._validate_display_name(row_data.get(DISPLAY_NAME_COLUMN_NAME), row_num)
-                self._validate_description(row_data.get(DESCRIPTION_COLUMN_NAME), row_num)
-                self._validate_overview(row_data.get(OVERVIEW_COLUMN_NAME), row_num)
-                self._validate_labels(row_data, row_num)
+                self.validate_glossary_row(row_data, row_num)
                 row_data[ENTRY_NAME_COLUMN] = self._generate_full_name(id, type_value)
                 row_data[PARENT_ENTRY_COLUMN_NAME] = self._generate_full_parent(parent)
                 valid_rows.append(row_data)
