@@ -36,6 +36,8 @@ SPREADSHEET_URL_PATTERN = re.compile(r"https://docs\.google\.com/spreadsheets/d/
 # Validation Patterns
 EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
+# Maximum length of a term or category id (checked by glossary-import.py as well).
+ID_MAX_LENGTH = 63
 PARENT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 LABEL_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 

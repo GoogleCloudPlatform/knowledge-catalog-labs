@@ -43,6 +43,7 @@ from utils.constants import (
     GLOSSARY_MAX_TERMS,
     GLOSSARY_SHEET_HEADERS,
     GLOSSARY_TERM_TYPE,
+    ID_MAX_LENGTH,
     ID_PATTERN,
     MAX_WORKERS,
     OPERATION_COLUMN,
@@ -156,6 +157,58 @@ def resolve_project_number(dataplex_service, glossary: GlossaryRef) -> str:
     if not project_number:
         raise ValueError(f"Could not find the project number of '{glossary.project_id}'.")
     return project_number
+
+
+class ProjectComparisonError(ValueError):
+    """Raised when it can't be told whether a project id and a project number are one project."""
+
+
+def make_project_matcher(glossary: GlossaryRef, user_project: str = "") -> Callable[[str, str], bool]:
+    """A function that tells whether two project ids/numbers name the same project.
+
+    Used to find the entry's aspect of an aspect type from the aspects sheet: the sheet names the
+    aspect type's project by id or number, the entry's aspect keys use the number. A project has
+    exactly one id and one number, so a comparison that involves the glossary's project is decided
+    with the glossary's id and number (resolve_project_number), without Resource Manager. Other
+    projects are compared with Resource Manager (resourcemanager.projects.get); when that lookup
+    fails, the function raises instead of guessing, because a wrong guess would write the sheet's
+    values into the aspect of another project's aspect type.
+
+    Args:
+        glossary: The glossary, with its project number resolved.
+        user_project: The project to bill the Resource Manager calls to.
+
+    Returns:
+        A function (project, other_project) -> bool. It raises ProjectComparisonError when the
+        projects can't be compared, and the API error when the lookup fails transiently.
+    """
+    known_id = "" if glossary.project_id.isdigit() else glossary.project_id
+    known_number = glossary.project_number
+
+    def same_project(project: str, other_project: str) -> bool:
+        if project == other_project:
+            return True
+        if project.isdigit() == other_project.isdigit():
+            return False  # two different ids, or two different numbers
+        project_id, project_number = (other_project, project) if project.isdigit() else (project, other_project)
+        if known_id and known_number:
+            if project_id == known_id:
+                return project_number == known_number
+            if project_number == known_number:
+                return False  # the glossary's project number belongs to the glossary's project id only
+        try:
+            return api_layer.get_project_number(project_id, user_project or project_id) == project_number
+        except Exception as error:
+            if api_layer.is_transient_error(error):
+                raise
+            raise ProjectComparisonError(
+                f"can't tell whether project '{project_id}' is project {project_number}, because its "
+                f"project number couldn't be read ({_error_message(error)}; it needs "
+                f"resourcemanager.projects.get). Use the project number instead of '{project_id}' in "
+                f"the aspect name in the aspects sheet."
+            ) from error
+
+    return same_project
 
 
 @dataclass
@@ -366,8 +419,12 @@ def _parse_row(row_number: int, cells: Dict[str, str], operation: str, validate_
     if operation == OPERATION_DELETE:
         if not node_id:
             raise ValueError("A row marked 'delete' needs the 'id' of the term or category to delete.")
-        if not ID_PATTERN.match(node_id):
-            raise ValueError(f"Invalid 'id' '{node_id}' on a row marked 'delete'.")
+        if not ID_PATTERN.match(node_id) or len(node_id) > ID_MAX_LENGTH:
+            raise ValueError(
+                f"Invalid 'id' '{node_id}' on a row marked 'delete'. Ids start with a lowercase "
+                f"letter, contain only lowercase letters, digits, '-' and '_', and have at most "
+                f"{ID_MAX_LENGTH} characters."
+            )
         if node_type and node_type not in NODE_TYPES:
             raise ValueError(f"Invalid 'type' '{node_type}'. Expected one of: {', '.join(NODE_TYPES)}.")
         return SheetRow(row_number=row_number, node_id=node_id, node_type=node_type, operation=operation)
@@ -596,7 +653,8 @@ def build_plan(
     live_entries: Dict[NodeKey, Optional[Dict]],
     same_project: Callable[[str, str], bool] = lambda a, b: a == b,
 ) -> UpdatePlan:
-    """Compare the sheet with the glossary and plan the changes. Makes no API calls.
+    """Compare the sheet with the glossary and plan the changes. Makes no API calls (except through
+    `same_project`).
 
     Args:
         rows: The parsed sheet rows.
@@ -605,7 +663,8 @@ def build_plan(
         live_entries: The catalog entries of the existing terms/categories in the sheet
             (fetch_entries for keys_needing_entries).
         same_project: Whether two project ids/numbers name the same project, used to match
-            the sheet's custom aspect types with the entry's aspect keys.
+            the sheet's custom aspect types with the entry's aspect keys (see
+            make_project_matcher). A ProjectComparisonError it raises becomes a plan error.
     """
     plan = UpdatePlan()
     deleted = _plan_deletes(rows, live_nodes, plan)
@@ -870,7 +929,13 @@ def _plan_upsert(
         change.entry_name = live_aspects.entry_name
         change.entry_type = live_aspects.entry_type
         change.entry_update_time = entry.get("updateTime", "")
-        change.aspects = _aspect_changes(row, row_sheet_aspects, live_aspects, same_project)
+        try:
+            change.aspects = _aspect_changes(row, row_sheet_aspects, live_aspects, same_project)
+        except ProjectComparisonError as error:
+            plan.errors.append(
+                f"Row {row.row_number}: the custom aspects of term '{row.node_id}' can't be compared "
+                f"with the glossary: {error}"
+            )
 
     if not change.fields and not change.aspects:
         change.action = ACTION_UNCHANGED
@@ -1274,8 +1339,10 @@ class _PlanApplier:
             response = api_layer.update_glossary_resource(
                 service, change.live.resource_name, change.node_type, body, fields
             )
-            if change.live and isinstance(response, dict) and response.get("updateTime"):
-                change.live.update_time = response["updateTime"]  # our own write isn't a conflict
+            if change.live:
+                # Our own write isn't a conflict: the second step of a two-step move compares
+                # with the time this write returned, or skips the check if none was returned.
+                change.live.update_time = response.get("updateTime", "") if isinstance(response, dict) else ""
             if FIELD_PARENT in fields:
                 with self._lock:
                     self.moved.add(change.key)

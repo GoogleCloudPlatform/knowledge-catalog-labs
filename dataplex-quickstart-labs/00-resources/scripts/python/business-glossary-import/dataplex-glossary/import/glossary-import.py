@@ -579,13 +579,38 @@ class SheetProcessor:
             f"populated, then edit and re-import that spreadsheet."
         )
 
-    def read_aspects(self, spreadsheet=None, term_ids=None, category_ids=None):
+    @staticmethod
+    def _warn_ignored_aspect_rows(sheet_name, row_numbers_by_id, max_listed_ids=10):
+        """Prints one warning for the aspect rows ignored because their id isn't in Sheet 1.
+
+        Args:
+            sheet_name: The name of the aspects sheet.
+            row_numbers_by_id: The ignored row numbers, by id, in sheet order.
+            max_listed_ids: How many ids the warning lists by name.
+        """
+        ids = list(row_numbers_by_id)
+        listed = ", ".join(f"'{term_id}'" for term_id in ids[:max_listed_ids])
+        if len(ids) > max_listed_ids:
+            listed += f" and {len(ids) - max_listed_ids} more"
+        row_count = sum(len(row_numbers) for row_numbers in row_numbers_by_id.values())
+        print(
+            f"Warning: {row_count} row(s) of the aspects sheet '{sheet_name}' are ignored "
+            f"because their id isn't in the glossary sheet: {listed}. To change the custom "
+            f"aspects of a term, keep the term's row in the glossary sheet."
+        )
+
+    def read_aspects(self, spreadsheet=None, term_ids=None, category_ids=None,
+                     ignore_unknown_ids=False):
         """Reads and resolves custom aspects from the aspects sheet (Sheet 2).
 
         Custom aspects can only be set on terms: every row must reference the
         id of a term in Sheet 1. A row whose id is only a category is an error.
         A row whose id is both a term and a category (Dataplex allows a term
         and a category to share an id) is applied to the term, with a warning.
+        With ignore_unknown_ids, a row whose id is neither a term nor a
+        category in Sheet 1 is ignored instead, with one warning for all such
+        rows (used by glossary-update.py, whose sheet may hold only the rows
+        to change).
 
         All rows sharing an (id, aspect type) are aggregated into a single
         aspect ``data`` dict. Dotted field names rebuild nested records, so
@@ -607,6 +632,9 @@ class SheetProcessor:
             category_ids: Optional set of category ids declared in Sheet 1,
                 used to explain why a category id is rejected and to warn when
                 an id is both a term and a category.
+            ignore_unknown_ids: Ignore (with a warning) instead of reject the
+                rows whose id is in neither term_ids nor category_ids. Has no
+                effect when term_ids is None.
 
         Returns:
             A tuple (is_valid, aspects_by_id) where aspects_by_id maps
@@ -659,8 +687,20 @@ class SheetProcessor:
         assigned_paths = {}
         field_types_cache = {}
         aspects_by_id = {}
+        ignored_rows_by_id = {}
 
         for aspect_row in aspect_rows:
+            if (
+                ignore_unknown_ids
+                and term_ids is not None
+                and aspect_row.term_id  # a missing id is still an error
+                and aspect_row.term_id not in term_ids
+                and aspect_row.term_id not in category_ids
+            ):
+                ignored_rows_by_id.setdefault(aspect_row.term_id, []).append(
+                    aspect_row.row_number
+                )
+                continue
             try:
                 parsed = self._validate_aspect_row(
                     aspect_row,
@@ -732,6 +772,8 @@ class SheetProcessor:
                     f"only be set on terms, so this row is applied to the term."
                 )
 
+        if ignored_rows_by_id:
+            self._warn_ignored_aspect_rows(sheet_name, ignored_rows_by_id)
         aspect_count = sum(len(by_type) for by_type in aspects_by_id.values())
         print(
             f"Resolved {aspect_count} custom aspect(s) across {len(aspects_by_id)} "

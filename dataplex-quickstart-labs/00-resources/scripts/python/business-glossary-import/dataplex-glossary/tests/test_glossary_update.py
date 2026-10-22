@@ -4,6 +4,7 @@ Unit tests for the glossary update tooling (import/glossary-update.py, utils/glo
 Test coverage:
 - parse_sheet: headers (optional, case-insensitive Operation column), delete rows, the full
   import's row validators, duplicate rows
+- make_project_matcher: project id/number comparisons for custom aspect types
 - build_plan: create / update / unchanged detection (fields, overview, contacts, custom
   aspects), deletes (whole categories, missing ids, ambiguous ids), parent, cycle, depth and
   size validation
@@ -186,6 +187,57 @@ class TestProjectNumber:
             gu.resolve_project_number(MagicMock(), gu.GlossaryRef("my-project", "global", "g"))
 
 
+class TestProjectMatcher:
+    """make_project_matcher: comparisons with the glossary's project need no Resource Manager call."""
+
+    GLOSSARY_WITH_NUMBER = gu.GlossaryRef("my-project", "global", "g", project_number="123")
+
+    def _no_lookup(self, monkeypatch):
+        monkeypatch.setattr(api_layer, "get_project_number", lambda *args: pytest.fail("no lookup expected"))
+
+    @pytest.mark.parametrize("project, other, expected", [
+        ("123", "my-project", True),          # the glossary's number and id
+        ("my-project", "123", True),
+        ("123", "123", True),
+        ("456", "my-project", False),         # another number with the glossary's id
+        ("123", "other-project", False),      # the glossary's number with another id
+        ("other-project", "my-project", False),  # two different ids
+        ("456", "123", False),                # two different numbers
+    ])
+    def test_comparisons_with_the_glossary_project_are_local(self, monkeypatch, project, other, expected):
+        self._no_lookup(monkeypatch)
+        assert gu.make_project_matcher(self.GLOSSARY_WITH_NUMBER)(project, other) is expected
+
+    @pytest.mark.parametrize("number, expected", [("456", True), ("789", False)])
+    def test_other_projects_are_compared_with_resource_manager(self, monkeypatch, number, expected):
+        calls = []
+        monkeypatch.setattr(api_layer, "get_project_number",
+                            lambda project_id, user_project: calls.append((project_id, user_project)) or "456")
+        same_project = gu.make_project_matcher(self.GLOSSARY_WITH_NUMBER, user_project="my-project")
+        assert same_project(number, "other-project") is expected
+        assert calls == [("other-project", "my-project")]
+
+    def test_failed_lookup_is_an_error_not_a_guess(self, monkeypatch):
+        def denied(project_id, user_project):
+            raise api_layer.DataplexAPIError("Failed to fetch project info for 'other-project': 403")
+        monkeypatch.setattr(api_layer, "get_project_number", denied)
+        with pytest.raises(gu.ProjectComparisonError, match="Use the project number instead of 'other-project'"):
+            gu.make_project_matcher(self.GLOSSARY_WITH_NUMBER)("456", "other-project")
+
+    def test_transient_lookup_failure_is_raised(self, monkeypatch):
+        def unavailable(project_id, user_project):
+            raise api_layer.TransientAPIError("503")
+        monkeypatch.setattr(api_layer, "get_project_number", unavailable)
+        with pytest.raises(api_layer.TransientAPIError):
+            gu.make_project_matcher(self.GLOSSARY_WITH_NUMBER)("456", "other-project")
+
+    def test_glossary_url_with_the_number_looks_up_ids(self, monkeypatch):
+        # The glossary's project id isn't known, so an id is compared with Resource Manager.
+        monkeypatch.setattr(api_layer, "get_project_number", lambda project_id, user_project: "123")
+        glossary = gu.GlossaryRef("123", "global", "g", project_number="123")
+        assert gu.make_project_matcher(glossary)("123", "my-project") is True
+
+
 # ============================================================================
 # parse_sheet
 # ============================================================================
@@ -216,6 +268,19 @@ class TestParseSheet:
     def test_delete_row_without_id_is_an_error(self):
         _, errors = parse([[""] * 5 + ["TERM"] + [""] * 8 + ["delete"]], HEADERS + ["Operation"])
         assert "needs the 'id'" in errors[0]
+
+    @pytest.mark.parametrize("node_id", [
+        "term_with_underscore", "a" * 63, "a" * 64, "1-starts-with-a-digit", "-starts-with-a-hyphen",
+        "Uppercase", "has.dot",
+    ])
+    def test_delete_rows_accept_the_same_ids_as_the_other_rows(self, node_id):
+        # Delete rows don't go through the full import's row validator (they have only an id),
+        # so their id check must accept exactly the ids that the full import accepts.
+        _, upsert_errors = parse([sheet_row(node_id)])
+        _, delete_errors = parse([delete_row(node_id)], HEADERS + ["Operation"])
+        assert (delete_errors == []) == (upsert_errors == [])
+        if delete_errors:
+            assert "on a row marked 'delete'" in delete_errors[0]
 
     def test_invalid_operation_value(self):
         _, errors = parse([sheet_row("revenue") + ["update"]], HEADERS + ["Operation"])
@@ -322,6 +387,19 @@ class TestBuildPlan:
         plan = gu.build_plan(parsed, live_map(live("revenue")), sheet_aspects, entries,
                              same_project=lambda a, b: {a, b} == {"123", "my-project"} or a == b)
         assert change_for(plan, "revenue").aspects == {"123.global.gov": {"data": {"tier": "2"}}}
+
+    def test_aspect_type_project_that_cannot_be_compared_is_a_plan_error(self):
+        entries = {("TERM", "revenue"): entry("TERM", "revenue", custom={"456.global.gov": {"tier": "1"}})}
+        sheet_aspects = {"revenue": {"projects/other-project/locations/global/aspectTypes/gov": {"tier": "2"}}}
+        parsed, _ = parse([sheet_row("revenue")])
+
+        def same_project(project, other):
+            raise gu.ProjectComparisonError("can't tell whether project 'other-project' is project 456")
+        plan = gu.build_plan(parsed, live_map(live("revenue")), sheet_aspects, entries, same_project=same_project)
+        assert plan.errors == [
+            "Row 2: the custom aspects of term 'revenue' can't be compared with the glossary: "
+            "can't tell whether project 'other-project' is project 456"
+        ]
 
     def test_categories_never_get_custom_aspects_even_when_sharing_an_id_with_a_term(self):
         sheet_aspects = {"sales": {"projects/123/locations/global/aspectTypes/gov": {"tier": "1"}}}
@@ -737,6 +815,36 @@ class TestApplyPlan:
         assert results["x"].status == gu.STATUS_DONE
         assert api.polls == 1
 
+    def test_parked_category_whose_first_move_returns_no_update_time_is_moved(self, monkeypatch):
+        # Without the time of our own first write, the second step can't be compared: it must not
+        # be reported as changed by someone else.
+        api = FakeApi(monkeypatch)
+        plan, nodes = self._parked_category_plan(monkeypatch)
+        original_update = api.update
+
+        def update_without_time(service, name, node_type, body, mask):
+            original_update(service, name, node_type, body, mask)
+            return {}
+        monkeypatch.setattr(api_layer, "update_glossary_resource", update_without_time)
+        results = {r.change.node_id: r for r in apply(plan, nodes)}
+        assert results["x"].status == gu.STATUS_DONE
+        assert [call[4] for call in api.calls if call[2] == "x"] == [GLOSSARY_NAME, f"{GLOSSARY_NAME}/categories/z"]
+
+    def test_parked_category_edited_between_the_two_moves_is_a_conflict(self, monkeypatch):
+        api = FakeApi(monkeypatch)
+        plan, nodes = self._parked_category_plan(monkeypatch)
+        original_update = api.update
+
+        def update_then_someone_edits(service, name, node_type, body, mask):
+            response = original_update(service, name, node_type, body, mask)
+            if name.endswith("/x"):
+                api.current_update_time["x"] = "edited-by-someone"
+            return response
+        monkeypatch.setattr(api_layer, "update_glossary_resource", update_then_someone_edits)
+        results = {r.change.node_id: r for r in apply(plan, nodes)}
+        assert results["x"].status == gu.STATUS_CONFLICT
+        assert results["x"].message.startswith("left at the top of the glossary")
+
     def test_failure_does_not_stop_other_changes(self, monkeypatch):
         api = FakeApi(monkeypatch)
         api.fail[("create", "a")] = http_error(400)
@@ -817,7 +925,7 @@ class TestApplyPlan:
         results = apply(gu.build_plan(parsed, nodes, {}, {}), nodes)
         assert results[0].status == gu.STATUS_SKIPPED
 
-    def test_two_step_move(self, monkeypatch):
+    def test_move_under_a_category_that_moves_first(self, monkeypatch):
         api = FakeApi(monkeypatch)
         nodes = live_map(live("a", "CATEGORY"), live("b", "CATEGORY", parent="a"))
         plan = plan_for([sheet_row("a", node_type="CATEGORY", parent="b", description="d"),
@@ -1006,7 +1114,7 @@ class TestGlossaryUpdateScript:
         monkeypatch.setattr(glossary_update_script.gspread, "authorize", lambda creds: client)
         monkeypatch.setattr(glossary_update_script, "default", lambda scopes: (MagicMock(), "p"))
         monkeypatch.setattr(glossary_update_script.UpdateSheetProcessor, "read_aspects",
-                            lambda self, spreadsheet, term_ids, category_ids=None: (True, {}))
+                            lambda self, spreadsheet, term_ids, category_ids=None, ignore_unknown_ids=False: (True, {}))
         monkeypatch.setattr(api_layer, "get_dataplex_service", lambda: MagicMock())
         monkeypatch.setattr(api_layer, "get_glossary",
                             lambda service, name: {"name": "projects/123456/locations/global/glossaries/my-glossary"})
@@ -1091,14 +1199,15 @@ class TestGlossaryUpdateScript:
         self._setup(monkeypatch, values, live_map(live("gone"), live("gone-cat", "CATEGORY")))
         seen = []
 
-        def fake_read_aspects(self, spreadsheet, term_ids, category_ids=None):
-            seen.append((term_ids, category_ids))
+        def fake_read_aspects(self, spreadsheet, term_ids, category_ids=None, ignore_unknown_ids=False):
+            seen.append((term_ids, category_ids, ignore_unknown_ids))
             return True, {}
 
         monkeypatch.setattr(glossary_update_script.UpdateSheetProcessor, "read_aspects", fake_read_aspects)
         assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
         # Terms marked 'delete' may still have rows in the aspects sheet (they are ignored).
-        assert seen == [({"sales", "revenue", "gone"}, {"sales", "finance", "gone-cat"})]
+        # Rows for ids in neither set are ignored: the sheet may hold only the rows to change.
+        assert seen == [({"sales", "revenue", "gone"}, {"sales", "finance", "gone-cat"}, True)]
 
     def test_category_only_id_in_aspects_sheet_is_rejected(self, monkeypatch, tmp_path, capsys):
         values = [HEADERS, sheet_row("revenue"), sheet_row("finance", "CATEGORY")]
@@ -1197,6 +1306,57 @@ class TestGlossaryUpdateScript:
         assert glossary_update_script.run(self._args(tmp_path, "--yes")) == 0
         assert "its rows in the aspects sheet are ignored" in capsys.readouterr().out
         assert api.calls == [("delete", "TERM", "revenue")]
+
+    def test_aspect_rows_of_terms_not_in_the_glossary_sheet_are_ignored(self, monkeypatch, tmp_path, capsys):
+        # A glossary sheet with only the rows to change, and an aspects sheet that is a full export.
+        values = [HEADERS, sheet_row("revenue")]
+        api = self._setup(monkeypatch, values, live_map(live("revenue"), live("cost"), live("margin")))
+        self._use_real_aspects_sheet(monkeypatch, [
+            ["cost", "custom-gov.tier", "LOW"],
+            ["revenue", "custom-gov.tier", "HIGH"],
+            ["margin", "custom-gov.tier", "MID"],
+            ["cost", "custom-gov.owner", "Ann"],
+        ])
+        aspect_type_reads = []
+        monkeypatch.setattr(
+            glossary_update_script.UpdateSheetProcessor, "_get_aspect_field_types",
+            lambda self, resource: aspect_type_reads.append(resource) or {"tier": "string"},
+        )
+        assert glossary_update_script.run(self._args(tmp_path, "--yes")) == 0
+        out = capsys.readouterr().out
+        assert out.count("are ignored because their id isn't in the glossary sheet") == 1
+        assert "Warning: 3 row(s) of the aspects sheet 'Sheet2' are ignored because their id isn't in " \
+               "the glossary sheet: 'cost', 'margin'." in out
+        assert api.calls == [("aspects", "revenue", ("my-project.global.custom-gov",))]
+        assert len(aspect_type_reads) == 1  # the ignored rows don't read their aspect type
+
+    def test_ignored_aspect_rows_list_at_most_ten_ids(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS, sheet_row("revenue")]
+        self._setup(monkeypatch, values, live_map(live("revenue")))
+        self._use_real_aspects_sheet(monkeypatch, [[f"t{i:02d}", "custom-gov.tier", "X"] for i in range(12)])
+        assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 0
+        out = capsys.readouterr().out
+        assert "'t08', 't09' and 2 more. To change the custom aspects of a term" in out
+        assert "'t10'" not in out
+
+    def test_aspect_row_without_id_is_still_an_error(self, monkeypatch, tmp_path, capsys):
+        values = [HEADERS, sheet_row("revenue")]
+        self._setup(monkeypatch, values, live_map(live("revenue")))
+        self._use_real_aspects_sheet(monkeypatch, [["", "custom-gov.tier", "HIGH"]])
+        assert glossary_update_script.run(self._args(tmp_path, "--dry-run")) == 1
+        assert "Missing 'id' value in aspects sheet row 2." in capsys.readouterr().out
+
+    def test_full_import_still_rejects_aspect_rows_of_unknown_terms(self, capsys):
+        processor = glossary_update_script.glossary_import.SheetProcessor(
+            "https://docs.google.com/spreadsheets/d/x", f"dp-glossaries/{GLOSSARY_NAME}", MagicMock()
+        )
+        spreadsheet = MagicMock()
+        spreadsheet.worksheet.return_value.get_all_values.return_value = [
+            ["id", "Aspect name", "Aspect value"], ["ghost", "custom-gov.tier", "HIGH"],
+        ]
+        is_valid, _ = processor.read_aspects(spreadsheet, {"revenue"}, set())
+        assert not is_valid
+        assert "Unknown 'id' 'ghost' in aspects sheet row 2" in capsys.readouterr().out
 
     def test_deleted_category_does_not_drop_the_aspects_of_a_kept_term_with_the_same_id(self):
         rows, errors = gu.parse_sheet(

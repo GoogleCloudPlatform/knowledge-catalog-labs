@@ -1067,7 +1067,7 @@ def _name_splits(identifier: str) -> List[tuple]:
     return splits
 
 
-def is_same_project(project: str, other_project: str, user_project: str = "") -> bool:
+def _is_same_project(project: str, other_project: str, user_project: str = "") -> bool:
     """Whether two project IDs or numbers name the same project.
 
     A project ID and a project number are compared by looking up the number of the ID. If that
@@ -1111,7 +1111,7 @@ def check_term_matches_display_identifier(
     term_display_name = _term_display_name(term)
     names_term = (
         parsed.location == match.group('location_id')
-        and is_same_project(parsed.project_id, match.group('project_id'), user_project)
+        and _is_same_project(parsed.project_id, match.group('project_id'), user_project)
         and any(
             _glossary_match_rank(glossary, glossary_part) is not None and term_part in ("", term_display_name)
             for glossary_part, term_part in _name_splits(identifier)

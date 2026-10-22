@@ -127,11 +127,15 @@ Where:
 *   `label2_key` (optional): Label2's key.
 *   `label2_value` (optional): Label2's value.
 
-The sheet may also have an `Operation` column (used by the
-[Glossary Update](#2-glossary-update)). The Glossary Import accepts it when it
-is empty, but refuses rows marked `delete`: the import replaces the whole
-glossary with the sheet, so it deletes everything that isn't in the sheet and
-can't delete single rows.
+The sheet may also have an `Operation` column. It is used by the
+[Glossary Update](#2-glossary-update), which changes single terms and
+categories: a blank `Operation` creates the row's term or category, or updates
+it if it already exists, and `delete` deletes it. The Glossary Import doesn't
+need it, because it makes the glossary match the whole sheet: every row is
+created or updated, and every term or category that isn't in the sheet is
+deleted. The import accepts the column, so that the same spreadsheet works with
+both scripts, but stops with an error if a row is marked `delete`. To delete a
+term or category with the import, remove its row.
 
 ### Sheets file schema (Aspects — second sheet)
 
@@ -376,10 +380,13 @@ key by key, so a key can be added or changed but not removed. To remove a custom
 aspect, use the Cloud Console or the [Glossary Import](#1-glossary-import),
 which replaces everything.
 
-Each row of the aspects sheet must be for a term that is in the glossary sheet,
-also when the glossary sheet holds only the rows to change. The rows of a term
-marked `delete` are ignored (with a warning): deleting a term also deletes its
-aspects.
+The aspects sheet can stay a full export when the glossary sheet holds only the
+rows to change: rows whose `id` isn't in the glossary sheet are ignored, and one
+warning lists their ids. So to change the custom aspects of a term, keep the
+term's row in the glossary sheet. The rows of a term marked `delete` are ignored
+too (with a warning): deleting a term also deletes its aspects. A row for an id
+that is only a category in the glossary sheet is an error, as in the Glossary
+Import.
 
 The same validations as the Glossary Import apply to each row. The parent of a
 row must be a category that is in the sheet or already in the glossary, and the
@@ -472,6 +479,7 @@ The account the script runs as needs:
 | Creating, updating and deleting terms and categories | `dataplex.glossaryTerms.create`, `dataplex.glossaryTerms.update`, `dataplex.glossaryTerms.delete`, `dataplex.glossaryCategories.create`, `dataplex.glossaryCategories.update`, `dataplex.glossaryCategories.delete` | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
 | Writing overview, contacts and custom aspects (`entries.patch`) | `dataplex.entries.update`, `dataplex.entryGroups.useOverviewAspect` and `dataplex.entryGroups.useContactsAspect` on the glossary project's `@dataplex` entry group, and `dataplex.aspectTypes.use` on the custom aspect types | Dataplex Catalog Editor (`roles/dataplex.catalogEditor`) |
 | Finding the project number, when `--glossary-url` has the project id | `resourcemanager.projects.get` (or put the project number in `--glossary-url`) | Browser (`roles/browser`) |
+| Matching a custom aspect type of another project, named by its project id in the aspects sheet, with the term's aspects | `resourcemanager.projects.get` on that project (or use its project number in the `Aspect name`) | Browser (`roles/browser`) |
 | Reading the sheet | Viewer access to the spreadsheet | |
 
 ---

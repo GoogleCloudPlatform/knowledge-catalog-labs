@@ -156,7 +156,9 @@ def aspect_sheet_ids(rows: List[glossary_update.SheetRow]) -> Tuple[Set[str], Se
     Rows marked 'delete' are included, so that a term can be deleted although the aspects
     sheet still has rows for it (they are dropped, see drop_aspects_of_deleted_terms). A
     delete row without a type may be a term. Category ids are passed separately so that
-    a row for a category gets a clear error, or a warning when a term shares the id.
+    a row for a category gets a clear error, or a warning when a term shares the id. Rows
+    for ids that are in neither set are ignored with a warning: the sheet may hold only the
+    rows to change, and terms that aren't in it are not touched.
     """
     term_ids = {row.node_id for row in rows if row.node_type in (GLOSSARY_TERM_TYPE, "")}
     category_ids = {row.node_id for row in rows if row.node_type == GLOSSARY_CATEGORY_TYPE}
@@ -206,7 +208,9 @@ def run(args: argparse.Namespace) -> int:
         return 1
 
     term_ids, category_ids = aspect_sheet_ids(rows)
-    aspects_valid, sheet_aspects = processor.read_aspects(spreadsheet, term_ids, category_ids)
+    aspects_valid, sheet_aspects = processor.read_aspects(
+        spreadsheet, term_ids, category_ids, ignore_unknown_ids=True
+    )
     if not aspects_valid:
         print("The aspects sheet has errors; nothing was changed.")
         return 1
@@ -228,7 +232,7 @@ def run(args: argparse.Namespace) -> int:
 
     plan = glossary_update.build_plan(
         rows, live_nodes, sheet_aspects, live_entries,
-        same_project=lambda project, other: api_layer.is_same_project(project, other, user_project=project_id),
+        same_project=glossary_update.make_project_matcher(glossary, user_project=project_id),
     )
     for warning in plan.warnings:
         logger.warning(warning)
