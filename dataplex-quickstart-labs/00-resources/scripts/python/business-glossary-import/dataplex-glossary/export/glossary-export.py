@@ -1,8 +1,18 @@
 from google.auth import default
 from googleapiclient.discovery import build
+import os
 import re
+import sys
 import logging
 from typing import List, Dict, Optional
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from utils import api_layer, business_glossary_utils, sheet_utils
+from utils.constants import ASPECT_SHEET_HEADERS, SYSTEM_ASPECT_PROJECTS
+from utils.error import InvalidAspectIdentifierError
+from utils.retry_utils import execute_with_retry
 
 # --- Configure logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -46,6 +56,7 @@ class InvalidEntryIdFormatError(Exception):
 
 GLOSSARY_URL_PATTERN = re.compile(r".*dp-glossaries/projects/(?P<project_id>[^/]+)/locations/(?P<location_id>[^/]+)/glossaries/(?P<glossary_id>[^/?#]+).*")
 TERM_NAME_REGEX_PATTERN = re.compile(r"projects/([^/]+)/locations/([^/]+)/glossaries/([^/]+)/terms/([^/]+)")
+GLOSSARY_RESOURCE_NAME_PATTERN = re.compile(r"^projects/(?P<project_id>[^/]+)/locations/(?P<location_id>[^/]+)/glossaries/(?P<glossary_id>[^/]+)$")
 CATERGORY_NAME_REGEX_PATTERN = re.compile(r"projects/(?P<project_id>[^/]+)/locations/(?P<location_id>[^/]+)/glossaries/(?P<glossary_id>[^/?#]+)/categories/(?P<category_id>[^/]+)")
 GLOSSARY_NAME_REGEX_PATTERN = re.compile(r"projects/([^/]+)/locations/([^/]+)/glossaries/([^/]+)")
 ENTRY_NAME_REGEX_PATTERN = re.compile(r"projects/([^/]+)/locations/([^/]+)/entryGroups/@dataplex/entries/.*")
@@ -221,6 +232,9 @@ def _extract_project_and_location_from_entry_id(entry_id: str) -> tuple:
 def _lookup_entry(dataplex_service: build, entry_id: str) -> Optional[Dict]:
     """Looks up an entry using the Dataplex API.
 
+    Transient errors (HTTP 429 and 5xx, network errors) are retried with
+    backoff before giving up.
+
     Args:
         dataplex_service: The Dataplex API service object.
         entry_id: The entry ID to look up.
@@ -235,21 +249,58 @@ def _lookup_entry(dataplex_service: build, entry_id: str) -> Optional[Dict]:
         project_id, location_id = _extract_project_and_location_from_entry_id(entry_id)
         name = f"projects/{project_id}/locations/{location_id}"
         request = dataplex_service.projects().locations().lookupEntry(name=name, entry=entry_id, view="ALL")
-        response = request.execute()
+        response = execute_with_retry(request.execute, f"lookupEntry {entry_id}")
         return response
     except Exception as e:
         logging.error(f"Error while looking up entry {entry_id}: {e}")
         raise DataplexAPIError(f"Error while looking up entry {entry_id}: {e}")
 
+_unresolvable_projects = set()
+
+
+def _resolve_project_number(project: str) -> str:
+    """Returns the project number for a project id, or the input if it can't be resolved.
+
+    Business glossary entries are stored under the project NUMBER in the
+    inner path of their entry name
+    ('.../entries/projects/<number>/locations/...'), so looking one up with
+    the project id in that position returns ENTRY_NOT_FOUND. Resolving the
+    number (cached) lets the export accept glossary URLs with either form.
+
+    Args:
+        project: A project id or project number.
+
+    Returns:
+        The project number, or the input unchanged when it is already a number
+        or the lookup fails (for example without resourcemanager.projects.get).
+    """
+    if project in _unresolvable_projects:
+        return project
+    try:
+        return api_layer.get_project_number(project, user_project=project) or project
+    except Exception as e:
+        _unresolvable_projects.add(project)
+        logging.warning(
+            f"Could not resolve the project number of '{project}' ({e}). Looking up entries "
+            f"with the project id, which finds no entries if they are stored under the "
+            f"project number. Grant resourcemanager.projects.get (roles/browser) or use a "
+            f"glossary URL with the project number."
+        )
+        return project
+
+
 def _generate_entry_name_from_category_name(category_name: str) -> str:
     """Generates an entryId from a category name.
-    
+
+    The inner path of the entry name uses the project number, which is how
+    Dataplex stores glossary entries.
+
     Args:
         category_name: The full category name.
-        
+
     Returns:
         The generated entryId.
-        
+
     Raises:
         InvalidCategoryNameError: If the category name format is invalid.
     """
@@ -258,17 +309,21 @@ def _generate_entry_name_from_category_name(category_name: str) -> str:
         logging.error(f"Invalid category name format: {category_name}")
         raise InvalidCategoryNameError(f"Invalid category name format: {category_name}")
     project_id, location_id, glossary_id, category_id = match.groups()
-    return f"projects/{project_id}/locations/{location_id}/entryGroups/@dataplex/entries/projects/{project_id}/locations/{location_id}/glossaries/{glossary_id}/categories/{category_id}"
+    project_number = _resolve_project_number(project_id)
+    return f"projects/{project_id}/locations/{location_id}/entryGroups/@dataplex/entries/projects/{project_number}/locations/{location_id}/glossaries/{glossary_id}/categories/{category_id}"
 
 def _generate_entry_name_from_term_name(term_name: str) -> str:
     """Generates an entryId from a term name.
-    
+
+    The inner path of the entry name uses the project number, which is how
+    Dataplex stores glossary entries.
+
     Args:
         term_name: The full term name.
-        
+
     Returns:
         The generated entryId.
-        
+
     Raises:
         InvalidTermNameError: If the term name format is invalid.
     """
@@ -277,7 +332,8 @@ def _generate_entry_name_from_term_name(term_name: str) -> str:
         logging.error(f"Invalid term name format: {term_name}")
         raise InvalidTermNameError(f"Invalid term name format: {term_name}")
     project_id, location_id, glossary_id, term_id = match.groups()
-    return f"projects/{project_id}/locations/{location_id}/entryGroups/@dataplex/entries/projects/{project_id}/locations/{location_id}/glossaries/{glossary_id}/terms/{term_id}"
+    project_number = _resolve_project_number(project_id)
+    return f"projects/{project_id}/locations/{location_id}/entryGroups/@dataplex/entries/projects/{project_number}/locations/{location_id}/glossaries/{glossary_id}/terms/{term_id}"
 
 def _get_sheet_row_for_category(category, entry):
     """Generates a sheet row from category and entry.
@@ -416,12 +472,25 @@ def _get_aspects_from_entry(entry):
     """
         Extracts simplified aspects from an entry.
         This function simplifies the aspects of an entry to include only the overview and identities.
+
+        The "overview" and "identities" keys are the long-standing contract used
+        to populate the Sheet 1 columns. The additional "custom" key carries
+        every NON-system aspect, keyed by its aspect key, for Sheet 2.
+
+        System aspects (overview, contacts, glossary-term-aspect,
+        glossary-category-aspect, glossary-aspect) are matched on their aspect
+        type id alone, whatever the project, because the Dataplex glossary
+        import treats those ids as built-in in any project. This also covers
+        both project spellings: export observes the numeric project number
+        ('655216118709.global.overview') while import writes the friendly
+        project id ('dataplex-types.global.overview').
+
         Args:
             entry: An Entry object.
         Returns:
-            A dictionary with simplified aspects containing "overview" and "identities".
+            A dictionary with simplified aspects containing "overview", "identities" and "custom".
     """
-    simplified_aspects = {"overview": "", "identities": []}
+    simplified_aspects = {"overview": "", "identities": [], "custom": {}}
     aspects_map = entry["aspects"]
     # append overview
     if aspects_map and aspects_map.get(OVERVIEW_ASPECT_ID):
@@ -434,23 +503,176 @@ def _get_aspects_from_entry(entry):
         contacts = aspects_map[CONTACTS_ASPECT_ID]
         if contacts.get("data") and contacts.get("data").get("identities"):
             simplified_aspects["identities"] = contacts.get("data").get("identities")
+    # append custom (non-system) aspects
+    for aspect_key, aspect in (aspects_map or {}).items():
+        if business_glossary_utils.is_system_aspect(aspect_key):
+            split_key = business_glossary_utils.split_aspect_key(aspect_key)
+            if split_key and split_key[0] not in SYSTEM_ASPECT_PROJECTS:
+                logging.warning(
+                    f"Aspect '{aspect_key}' uses the reserved aspect type id "
+                    f"'{split_key[2]}', which Dataplex Business Glossary treats as a built-in "
+                    f"aspect in any project. It is not exported to the aspects sheet and "
+                    f"cannot be set through glossary import."
+                )
+            continue
+        aspect_data = aspect.get("data") if isinstance(aspect, dict) else None
+        if not aspect_data:
+            continue
+        simplified_aspects["custom"][aspect_key] = aspect_data
     return simplified_aspects
 
-def _write_to_sheet(sheets_service: build, spreadsheet_id: str, data: List[List[str]]) -> None:
-    """Writes data to a Google Sheet.
-    
+
+def _resolve_project_id(project: str, user_project: str) -> str:
+    """Resolves a numeric project number to its project id (cached, best effort)."""
+    return api_layer.get_project_id_from_number(project, user_project=user_project)
+
+
+def _get_aspect_rows_for_entry(
+    term_or_category,
+    entry,
+    glossary_project_id: Optional[str] = None,
+    glossary_location_id: Optional[str] = None,
+) -> List[List[str]]:
+    """Builds the Sheet 2 rows for a single term.
+
+    The export only calls this for terms: custom aspects can only be set on
+    terms, so categories get no aspect rows.
+
+    Each custom aspect's ``data`` dict is flattened into one row per field.
+    Record and map sub-fields are flattened one level into dotted names
+    ('custom-gov.owner.email'); anything deeper is serialized as a JSON object
+    string.
+
+    The 'Aspect name' cell must import back to the same AspectType. Import
+    resolves the short '<aspect_type_id>.<field_name>' form against the target
+    glossary's project and location, so the short form is only written for
+    aspect types in the glossary's own project and location. Other aspect types
+    (for example a 'global' aspect type on a regional glossary, or one from a
+    shared project) are written in the qualified
+    '<project>.<location>.<aspect_type_id>.<field_name>' form, or in the
+    resource-path form when the qualified form would be ambiguous.
+
+    Args:
+        term_or_category: A Term or Category resource dict.
+        entry: The Entry representing that term or category.
+        glossary_project_id: The glossary's project. Defaults to the project in
+            the term or category resource name.
+        glossary_location_id: The glossary's location. Defaults to the location
+            in the term or category resource name.
+
+    Returns:
+        A list of [id, Aspect name, Aspect value] rows, empty when the entry
+        carries no custom aspects.
+    """
+    resource_name = term_or_category.get("name", "")
+    match = TERM_NAME_REGEX_PATTERN.match(resource_name) or CATERGORY_NAME_REGEX_PATTERN.match(resource_name)
+    if not match:
+        logging.warning(f"Could not determine id for aspect rows from: {resource_name}")
+        return []
+    resource_id = match.groups()[-1]
+    glossary_project = _resolve_project_id(
+        glossary_project_id or match.groups()[0], user_project=glossary_project_id or match.groups()[0]
+    )
+    glossary_location = glossary_location_id or match.groups()[1]
+
+    simplified_aspects = _get_aspects_from_entry(entry)
+    aspect_rows = []
+
+    for aspect_key, aspect_data in simplified_aspects["custom"].items():
+        split_key = business_glossary_utils.split_aspect_key(aspect_key)
+        if not split_key:
+            logging.warning(
+                f"Skipping aspect '{aspect_key}' on '{resource_id}': the aspect key does not "
+                f"carry a project and a location."
+            )
+            continue
+        aspect_project, aspect_location, aspect_type_id = split_key
+        aspect_project = _resolve_project_id(aspect_project, user_project=glossary_project)
+
+        for field_name, cell_value in business_glossary_utils.flatten_aspect_data(aspect_data):
+            if cell_value == "":
+                # Null or empty fields are unset: the importer rejects rows
+                # without a value, and leaving the row out round-trips as unset.
+                continue
+            try:
+                aspect_name = business_glossary_utils.format_aspect_identifier_for_sheet(
+                    aspect_project,
+                    aspect_location,
+                    aspect_type_id,
+                    field_name,
+                    default_project=glossary_project,
+                    default_location=glossary_location,
+                )
+            except InvalidAspectIdentifierError as format_error:
+                logging.warning(
+                    f"Skipping field '{field_name}' of aspect '{aspect_key}' on "
+                    f"'{resource_id}': {format_error}"
+                )
+                continue
+            aspect_rows.append([resource_id, aspect_name, cell_value])
+
+    return aspect_rows
+
+
+def _warn_about_category_custom_aspects(category, entry) -> None:
+    """Logs a warning when a category carries custom aspects.
+
+    Custom aspects can only be set on terms, so the aspects sheet holds term
+    aspects only and the import rejects rows for categories. A custom aspect
+    on a category (which can only be attached outside the Business Glossary
+    UI, e.g. through the API) is therefore not exported, and re-importing the
+    spreadsheet removes it, because glossary import replaces the aspects of
+    every imported category with the contents of the spreadsheet.
+
+    Args:
+        category: A Category resource dict.
+        entry: The Entry representing that category.
+    """
+    custom_aspect_keys = sorted(_get_aspects_from_entry(entry)["custom"])
+    if not custom_aspect_keys:
+        return
+    category_id = category.get("name", "").rsplit("/", 1)[-1]
+    logging.warning(
+        f"Category '{category_id}' has custom aspect(s) {', '.join(custom_aspect_keys)}, which "
+        f"are not exported: custom aspects can only be set on terms. Re-importing this "
+        f"spreadsheet removes them from the category."
+    )
+
+
+def _write_to_sheet(
+    sheets_service: build,
+    spreadsheet_id: str,
+    data: List[List[str]],
+    sheet_name: Optional[str] = None,
+) -> None:
+    """Writes data to a Google Sheet, replacing the target tab's contents.
+
+    The tab is cleared first. Otherwise, when the glossary has fewer rows than
+    an earlier export into the same spreadsheet, the leftover rows would stay
+    and re-importing the sheet would bring back terms/categories that have
+    since been deleted.
+
     Args:
         sheets_service: The Google Sheets API service object.
         spreadsheet_id: The ID of the spreadsheet.
         data: The data to write to the sheet.
-    
+        sheet_name: Optional worksheet name to target. When omitted the clear
+            and the write are untargeted ('A:ZZ' / 'A1'), which the Sheets API
+            applies to the first tab, as before.
+
     Raises:
         SheetsAPIError: If there is an error during the write operation.
     """
+    target_range = f"'{sheet_name}'!A1" if sheet_name else 'A1'
+    clear_range = f"'{sheet_name}'!A:ZZ" if sheet_name else 'A:ZZ'
     try:
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id,
+            range=clear_range,
+        ).execute()
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id,
-            range='A1',
+            range=target_range,
             valueInputOption='USER_ENTERED',
             body={'values': data}
         ).execute()
@@ -458,6 +680,53 @@ def _write_to_sheet(sheets_service: build, spreadsheet_id: str, data: List[List[
     except Exception as e:
         logging.error(f"Error while writing to spreadsheet: {e}")
         raise SheetsAPIError(f"Error while writing to spreadsheet: {e}")
+
+
+def _write_aspects_to_sheet(
+    sheets_service: build, spreadsheet_id: str, aspect_rows: List[List[str]]
+) -> None:
+    """Writes the collected custom aspect rows to the aspects sheet (Sheet 2).
+
+    When there are no custom aspects and the spreadsheet has no aspects tab,
+    nothing is written and no tab is created: a single informational line is
+    logged, so glossaries without custom aspects export exactly as they did
+    before. When there are no custom aspects but the tab already exists (from
+    an earlier export), it is reset to the header row: glossary import
+    replaces each entry's aspects with the sheet contents, so leftover rows
+    would bring back aspects that have since been removed in Dataplex.
+
+    The write clears the target tab first, so aspect rows removed since the
+    previous export do not linger as orphans (which would later fail import
+    validation with an unknown id, or bring back removed aspects).
+
+    Args:
+        sheets_service: The Google Sheets API service object.
+        spreadsheet_id: The ID of the spreadsheet.
+        aspect_rows: Rows of [id, Aspect name, Aspect value], header excluded.
+
+    Raises:
+        SheetsAPIError: If there is an error during the write operation.
+    """
+    if not aspect_rows:
+        aspects_sheet_name = sheet_utils.resolve_aspects_sheet_name()
+        if not sheet_utils.sheet_exists(sheets_service, spreadsheet_id, aspects_sheet_name):
+            logging.info("No custom aspects found; skipping the aspects sheet.")
+            return
+        logging.info(
+            f"No custom aspects found; clearing the existing '{aspects_sheet_name}' tab so "
+            f"rows from an earlier export are not re-imported."
+        )
+
+    try:
+        target_sheet_name = sheet_utils.write_aspect_rows(
+            sheets_service, spreadsheet_id, [ASPECT_SHEET_HEADERS] + aspect_rows
+        )
+        logging.info(
+            f"Wrote {len(aspect_rows)} custom aspect row(s) to '{target_sheet_name}'."
+        )
+    except Exception as e:
+        logging.error(f"Error while writing aspects to spreadsheet: {e}")
+        raise SheetsAPIError(f"Error while writing aspects to spreadsheet: {e}")
 
 # --- Main Function ---
 def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -> None:
@@ -486,6 +755,12 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
         # 4. List glossary terms
         terms = _list_glossary_terms(dataplex_service, glossary_name)
 
+        # The glossary's project and location decide which aspect names can use
+        # the short form on export (import resolves short names against them).
+        glossary_name_match = GLOSSARY_RESOURCE_NAME_PATTERN.match(glossary_name)
+        glossary_project_id = glossary_name_match.group("project_id") if glossary_name_match else None
+        glossary_location_id = glossary_name_match.group("location_id") if glossary_name_match else None
+
         entry_names_map = {}
         # 5. Get Category and Terms.
         for category in categories:
@@ -501,18 +776,30 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
                 continue
             entry_names_map[term_name] = _generate_entry_name_from_term_name(term_name)
 
-        # 6. Lookup entries and store results
+        # 6. Lookup entries and store results. Every term and category must be
+        # read: a sheet that silently leaves one out would DELETE it when it is
+        # re-imported (glossary import removes entries missing from the file).
         entry_id_to_entry_map = {}
+        failed_lookups = []
         for entry_id, entry_name in entry_names_map.items():
             try:
                 entry_response = _lookup_entry(dataplex_service, entry_name)
-                if entry_response:
-                    entry_id_to_entry_map[entry_id] = entry_response
             except DataplexAPIError as e:
-                logging.warning(f"Skipping entry {entry_name} due to lookup error: {e}")
+                failed_lookups.append(f"{entry_id}: {e}")
                 continue
+            if not entry_response:
+                failed_lookups.append(f"{entry_id}: lookupEntry returned no entry")
+                continue
+            entry_id_to_entry_map[entry_id] = entry_response
+        if failed_lookups:
+            raise DataplexAPIError(
+                f"Could not read {len(failed_lookups)} of {len(entry_names_map)} glossary "
+                f"entries, so nothing was written (an incomplete export would delete the "
+                f"missing terms/categories if re-imported). First failure: {failed_lookups[0]}"
+            )
 
         sheet_data = [SHEET_HEADERS]
+        aspect_rows = []
         # 7. Add Categories data in the sheet
         for category in categories:
             category_entry = entry_id_to_entry_map.get(category.get("name"))
@@ -527,6 +814,9 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
                 else:
                     category_row.append("")
             sheet_data.append(category_row)
+            # Custom aspects can only be set on terms, so categories get no
+            # aspect rows (see _warn_about_category_custom_aspects).
+            _warn_about_category_custom_aspects(category, category_entry)
 
         # 8. Add Terms data in the sheet
         for term in terms:
@@ -542,9 +832,15 @@ def list_and_write_glossary_taxonomy(spreadsheet_url: str, glossary_name: str) -
             else:
               term_row.append("")
           sheet_data.append(term_row)
+          aspect_rows.extend(
+              _get_aspect_rows_for_entry(term, term_entry, glossary_project_id, glossary_location_id)
+          )
         
         # 9. Write data to the sheet
         _write_to_sheet(sheets_service, spreadsheet_id, sheet_data)
+
+        # 10. Write custom aspects to the aspects sheet (no-op when there are none)
+        _write_aspects_to_sheet(sheets_service, spreadsheet_id, aspect_rows)
 
         logging.info("Process completed successfully.")
 

@@ -104,3 +104,97 @@ class SpreadsheetRow:
             target_id=_value('target_id'),
             row_number=row_number,
         )
+
+
+@dataclass
+class AspectRow:
+    """Represents a row from the aspects sheet (Sheet 2).
+
+    Sheet 2 has a normalized 3-column schema: (id, Aspect name, Aspect value).
+    Custom aspects can only be set on terms, so the id is a term id. A single
+    term may own many rows, one per aspect field.
+
+    Attributes:
+        term_id: Foreign key into the Sheet 1 'id' column (a term id).
+        aspect_name: Aspect field identifier, e.g. 'custom-gov.tier'.
+        aspect_value: Raw (unparsed) cell value.
+        row_number: 1-based spreadsheet row number, used in validation messages.
+    """
+    term_id: str = ""
+    aspect_name: str = ""
+    aspect_value: str = ""
+    row_number: int = 0
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, str], row_number: int = 0) -> 'AspectRow':
+        """Create an AspectRow from a dictionary, tolerating header spellings.
+
+        Args:
+            data: Mapping of column header to cell value. Headers are matched
+                case-insensitively, like rows_to_aspect_rows: the canonical
+                headers ('id', 'Aspect name', 'Aspect value') and snake_case
+                variants ('term_id', 'aspect_name', 'aspect_value') are accepted.
+            row_number: 1-based spreadsheet row number for error reporting.
+
+        Returns:
+            A populated AspectRow with all string fields stripped.
+        """
+        normalized = {str(key).strip().lower(): value for key, value in data.items()}
+
+        def _value(*keys: str) -> Any:
+            for key in keys:
+                if normalized.get(key):
+                    return normalized[key]
+            return ''
+
+        aspect_value = _value('aspect value', 'aspect_value', 'aspectvalue')
+        return cls(
+            term_id=str(_value('id', 'term_id', 'term id')).strip(),
+            aspect_name=str(_value('aspect name', 'aspect_name', 'aspectname')).strip(),
+            aspect_value=aspect_value.strip() if isinstance(aspect_value, str) else aspect_value,
+            row_number=row_number,
+        )
+
+    def to_row(self) -> List[str]:
+        """Convert to a spreadsheet row [id, Aspect name, Aspect value]."""
+        return [self.term_id, self.aspect_name, self.aspect_value]
+
+    def is_empty(self) -> bool:
+        """Return True when the row carries no usable data."""
+        return not (self.term_id or self.aspect_name or self.aspect_value)
+
+
+@dataclass
+class ParsedAspectIdentifier:
+    """Represents a parsed 'Aspect name' cell.
+
+    Attributes:
+        project_id: Project owning the AspectType (defaulted to the glossary's).
+        location: Location of the AspectType (defaulted to the glossary's).
+        aspect_type_id: AspectType id, e.g. 'custom-gov'.
+        field_name: Field within the aspect, possibly dotted for record
+            sub-fields, e.g. 'tier' or 'owner.email'.
+    """
+    project_id: str
+    location: str
+    aspect_type_id: str
+    field_name: str
+
+    @property
+    def aspect_type_resource(self) -> str:
+        """Full AspectType resource name."""
+        return (
+            f"projects/{self.project_id}/locations/{self.location}"
+            f"/aspectTypes/{self.aspect_type_id}"
+        )
+
+    @property
+    def aspect_key(self) -> str:
+        """Key used in an Entry's 'aspects' map, e.g. 'my-proj.us-central1.custom-gov'."""
+        return f"{self.project_id}.{self.location}.{self.aspect_type_id}"
+
+    @property
+    def field_path(self) -> List[str]:
+        """Field name split into its dotted segments."""
+        return [segment for segment in self.field_name.split('.') if segment]
+

@@ -62,6 +62,8 @@ _project_number_to_id_cache: Dict[str, str] = {}
 _known_entry_names: set = set()
 # (project ID, dataset ID) -> location of the BigQuery dataset's entries, learned from resolved entries.
 _bigquery_dataset_locations: Dict[tuple, str] = {}
+_aspect_type_cache: Dict[str, Optional[Dict]] = {}
+
 
 _MISSING = object()
 _key_locks: Dict[tuple, threading.RLock] = {}
@@ -82,7 +84,7 @@ def clear_caches():
         _locations_cache, _glossary_cache, _term_cache, _project_glossaries_cache,
         _glossary_terms_cache, _fqn_to_entry_cache, _entry_to_fqn_cache,
         _project_id_to_number_cache, _project_number_to_id_cache, _known_entry_names,
-        _bigquery_dataset_locations,
+        _bigquery_dataset_locations, _aspect_type_cache,
     ):
         cache.clear()
     with _key_locks_guard:
@@ -1078,3 +1080,115 @@ def lookup_entry_by_fqn(dataplex_service: build, fqn: str, user_project: str) ->
 def is_known_entry(entry_name: str) -> bool:
     """Whether the entry was already confirmed to exist while resolving sheet rows."""
     return entry_name in _known_entry_names
+
+
+def get_aspect_type(dataplex_service: build, aspect_type_resource: str) -> Optional[Dict]:
+    """Fetch an AspectType resource by name, with in-memory caching.
+
+    Any failure is treated as "schema unavailable" rather than fatal: the
+    caller then falls back to heuristic value coercion. Permission and
+    not-found results are cached, so a missing AspectType is only looked up
+    once per run. Transient failures (network, 429, 5xx, after retries) are
+    not cached, so a later call tries again (see _get_or_fetch).
+
+    Args:
+        dataplex_service: The Dataplex API service object.
+        aspect_type_resource: Full AspectType resource name, i.e.
+            'projects/{project}/locations/{location}/aspectTypes/{aspect_type}'.
+
+    Returns:
+        The AspectType resource dict, or None when it cannot be read.
+    """
+    if not aspect_type_resource:
+        return None
+
+    def fetch() -> Optional[Dict]:
+        logger.debug(f"Request: aspectTypes.get(name={aspect_type_resource})")
+        request = dataplex_service.projects().locations().aspectTypes().get(
+            name=aspect_type_resource
+        )
+        try:
+            return execute_with_retry(request.execute, f"Get aspect type {aspect_type_resource}")
+        except HttpError as http_error:
+            status_code = http_error.resp.status if hasattr(http_error, 'resp') else None
+            if status_code in (401, 403, 404):
+                logger.warning(
+                    f"Could not read AspectType {aspect_type_resource} (HTTP {status_code}). "
+                    f"Falling back to heuristic value coercion."
+                )
+                return None
+            raise
+
+    try:
+        return _get_or_fetch(_aspect_type_cache, aspect_type_resource, fetch)
+    except Exception as aspect_type_error:
+        logger.warning(
+            f"Error fetching AspectType {aspect_type_resource}: {aspect_type_error}. "
+            f"Falling back to heuristic value coercion."
+        )
+        return None
+
+
+def _flatten_metadata_template(
+    template: Dict, prefix: str = "", field_types: Optional[Dict[str, str]] = None
+) -> Dict[str, str]:
+    """Flatten an AspectType MetadataTemplate into a {field_path: type} map.
+
+    Record sub-fields are recorded under their dotted path ('owner.email') so
+    they line up with the dotted 'Aspect name' values used in Sheet 2. The
+    value type of a map is recorded under the map's path plus '.*'
+    ('labels.*'), because export writes each map entry as its own row
+    ('labels.code'); the item type of an array is recorded under the array's
+    path plus '[]' ('tags[]'). business_glossary_utils.resolve_field_type
+    reads these keys.
+
+    Args:
+        template: A MetadataTemplate node.
+        prefix: Dotted path accumulated so far.
+        field_types: Accumulator dict (created on first call).
+
+    Returns:
+        Mapping of field path to declared MetadataTemplate type.
+    """
+    if field_types is None:
+        field_types = {}
+    if not isinstance(template, dict):
+        return field_types
+
+    def add_node(node: Dict, path: str) -> None:
+        node_type = (node.get('type') or '').lower()
+        if node_type:
+            field_types[path] = node_type
+        if node.get('recordFields'):
+            _flatten_metadata_template(node, path, field_types)
+        if isinstance(node.get('mapItems'), dict):
+            add_node(node['mapItems'], f"{path}.*")
+        if isinstance(node.get('arrayItems'), dict):
+            add_node(node['arrayItems'], f"{path}[]")
+
+    for record_field in template.get('recordFields', []) or []:
+        field_name = record_field.get('name')
+        if not field_name:
+            continue
+        add_node(record_field, f"{prefix}.{field_name}" if prefix else field_name)
+
+    return field_types
+
+
+def get_aspect_field_types(dataplex_service: build, aspect_type_resource: str) -> Dict[str, str]:
+    """Return the declared field types for an AspectType.
+
+    Args:
+        dataplex_service: The Dataplex API service object.
+        aspect_type_resource: Full AspectType resource name.
+
+    Returns:
+        Mapping of field path to MetadataTemplate type (e.g.
+        {'tier': 'string', 'owner.email': 'string', 'labels': 'map',
+        'labels.*': 'string', 'tags': 'array', 'tags[]': 'string'}). Empty
+        when the AspectType cannot be read, which signals heuristic coercion.
+    """
+    aspect_type = get_aspect_type(dataplex_service, aspect_type_resource)
+    if not aspect_type:
+        return {}
+    return _flatten_metadata_template(aspect_type.get('metadataTemplate', {}) or {})

@@ -49,6 +49,10 @@ Share the Google Sheet with the service account (`SA_EMAIL`) as a **Viewer** so 
 
 *   **Glossary Import**: The sheet should contain the following header row:
     `id, parent, display_name, description, overview, type, contact1_email, contact1_name, contact2_email, contact2_name, label1_key, label1_value, label2_key, label2_value`
+    *   *(Optional)* To import custom Dataplex Aspects, add a second worksheet
+        (`Sheet2` by default) with the header row `id, Aspect name, Aspect value`.
+        See [Sheets file schema (Aspects)](#sheets-file-schema-aspects--second-sheet)
+        below. The second sheet is optional.
 *   **EntryLinks Import**: The sheet should contain the following header row (the format written by the EntryLinks export):
     `Entry link type, Source Name, Source ID, Column, Target Name, Target ID`
     See [Sheets file schema (EntryLinks)](#sheets-file-schema-entrylinks) for what each column contains.
@@ -120,6 +124,163 @@ Where:
 *   `label1_value` (optional): Label1's value.
 *   `label2_key` (optional): Label2's key.
 *   `label2_value` (optional): Label2's value.
+
+### Sheets file schema (Aspects — second sheet)
+
+Custom Dataplex **Aspects** on terms are read from an optional **second
+worksheet** (`Sheet2` by default), one row per aspect field. The first sheet
+must still contain exactly the 14 columns above.
+
+`id, Aspect name, Aspect value`
+
+Where:
+
+*   `id` (required): The id of a **term** in Sheet 1: custom aspects can only
+    be set on terms. One term can have many aspect rows. If a term and a
+    category share the id (Dataplex allows that), the row is applied to the
+    term and a warning is printed.
+*   `Aspect name` (required): The aspect field identifier, in any of:
+    *   Short — `<aspectTypeId>.<fieldName>`, e.g. `custom-gov.tier`
+    *   Qualified — `<project>.<location>.<aspectTypeId>.<fieldName>`, e.g.
+        `my-project.us-central1.custom-gov.tier`
+    *   Full resource path —
+        `projects/{project}/locations/{location}/aspectTypes/{aspectType}/{field}`
+
+    Project and location default to the **target glossary's** when omitted,
+    so use the qualified or resource-path form for aspect types that live in a
+    different project or location (for example a `global` aspect type used on
+    a regional glossary). Dotted field names address record sub-fields
+    (`custom-gov.owner.email`). The resource-path form is never ambiguous; use
+    it when the project id contains `.` or `:`, or when a short-form field
+    starts with a segment that looks like a location (`custom-gov.us.tax.rate`
+    would be read as project `custom-gov`, location `us`). Project, location
+    and aspect type names are not case-sensitive (`Custom-Gov.tier` is the
+    same as `custom-gov.tier`); field names are.
+*   `Aspect value` (required): The scalar or serialized value.
+
+#### Worked example
+
+Sheet 2:
+
+| id | Aspect name | Aspect value |
+|---|---|---|
+| `term-customer-id` | `custom-gov.tier` | `HIGH` |
+| `term-customer-id` | `custom-gov.is_pii` | `true` |
+| `term-customer-id` | `custom-gov.retention_days` | `365` |
+
+All rows for the same term and aspect type are combined into **one** aspect on
+the term. Here, term `term-customer-id` gets one `custom-gov` aspect with the
+value `{"tier": "HIGH", "is_pii": true, "retention_days": 365}`.
+
+#### Datatypes
+
+Field types are the ones defined in the aspect type.
+
+| Type | Accepted cell value | Parsed as |
+|---|---|---|
+| `string` | any text | `str` |
+| `enum` | any text | `str` |
+| `int` | `365`, `-42` | `int` |
+| `double` | `3.14` | `float` |
+| `bool` | `true`/`false`/`yes`/`no`/`y`/`n`/`t`/`f` (case-insensitive) | `bool` |
+| `datetime` | RFC 3339, e.g. `2024-01-15T10:30:00Z` | `str` (passed through) |
+| `array` | `["finance","core"]`, or `finance,core` | `list` |
+| `record` / `map` | `{"email":"a@b.c"}`, or dotted sub-field rows | `dict` |
+
+Notes on ambiguous cells:
+
+*   `1` and `0` are read as **integers** unless the AspectType declares the
+    field as `bool`, in which case they are read as `true`/`false`.
+*   A comma-separated list is only split into an array when the AspectType
+    declares the field as `array`; otherwise it stays a string. Each item is
+    converted to the array's item type (`007, yes` stays `["007", "yes"]` in a
+    string array).
+*   Dotted field names rebuild nested records:
+    `custom-gov.owner.email` → `{"owner": {"email": ...}}`. For a map, a
+    dotted row sets one entry (`custom-gov.labels.code` → `{"labels":
+    {"code": ...}}`), converted to the map's value type.
+
+The importer reads each aspect type to convert the values to the right field
+types. If it cannot read an aspect type (permission denied, or it does not
+exist), it prints a warning and uses the rules above instead.
+
+The aspect types used in Sheet 2 must exist before you import. The account
+running the import needs `dataplex.aspectTypes.use` on each of them to attach
+the aspects, and `dataplex.aspectTypes.get` to read their field types.
+
+#### Validation
+
+Aspect rows are validated with row-numbered messages, like the glossary sheet:
+
+*   A non-empty aspects sheet whose first row does not contain the
+    `id`, `Aspect name` and `Aspect value` headers.
+*   Missing `id`, `Aspect name` or `Aspect value`. To leave a field unset,
+    delete its row.
+*   `id` that is not a term in Sheet 1. An id that is only a category gets its
+    own message: custom aspects can only be set on terms.
+*   Malformed `Aspect name` (no field component, empty dotted segments, bad
+    resource path).
+*   Duplicate `(id, aspect type, field)` combinations. Names are compared after
+    parsing, so `custom-gov.tier` and
+    `my-project.us-central1.custom-gov.tier` count as the same field. Field
+    names are case-sensitive, like in the aspect type.
+*   Overlapping fields for the same `(id, aspect type)`, such as
+    `custom-gov.owner` and `custom-gov.owner.email`: set either the whole value
+    or its sub-fields, not both.
+*   Reserved aspect type ids (`overview`, `contacts`, `glossary-term-aspect`,
+    `glossary-category-aspect`, `glossary-aspect`), in **any** project or
+    location. Dataplex Business Glossary treats these ids as its built-in
+    aspects: `overview` and `contacts` come from Sheet 1's `overview` and
+    `contact*` columns, and the `glossary-*` aspects are structural.
+
+Any aspect validation error fails the run before anything is uploaded. So does
+any failure to read the aspects sheet (the spreadsheet or worksheet cannot be
+opened, or its values cannot be read), so that a transient Sheets API error can
+never turn into an import that drops custom aspects.
+
+#### Aspect sync semantics (IMPORTANT)
+
+The metadata job is created with `"entry_sync_mode": "FULL"` and
+`"aspect_sync_mode": "INCREMENTAL"`, scoped to the glossary. For glossary
+imports, Dataplex **recreates** every term and category that already exists in
+the glossary from the import file: the existing entry is replaced, and only the
+aspects present in the file are kept. Aspects that are not in the file are
+**not** preserved.
+
+In practice, the spreadsheet is the complete description of each term's
+aspects:
+
+*   Adding or changing a row in Sheet 2 adds or updates that aspect field.
+*   Deleting a row from Sheet 2 **removes** that field (and the aspect, once all
+    of its rows are gone) on the next import.
+*   Importing with Sheet 2 missing or empty **removes all custom aspects** from
+    the imported terms.
+*   Categories never carry custom aspects after an import. A custom aspect
+    attached to a category outside the Business Glossary UI (for example
+    through the API) is removed; the export warns about such aspects.
+
+> [!WARNING]
+> **Always export first.** Before importing into a glossary whose terms
+> already carry custom aspects, run the export into the spreadsheet
+> you are going to import, so that Sheet 2 holds the current aspects. Then edit
+> and import that spreadsheet. The importer prints a warning whenever it is
+> about to import without custom aspects.
+
+#### Spreadsheets without an aspects sheet
+
+If the second sheet is missing, empty, or has only the header row, the import
+runs with no custom aspects and prints a warning. As described above, any
+custom aspects already attached to the imported terms and categories are then
+removed. To keep them, export the glossary first and import that spreadsheet.
+
+#### Overriding the sheet name
+
+The aspects worksheet defaults to `Sheet2`. To use a different tab, set:
+
+```bash
+export GLOSSARY_ASPECTS_SHEET_NAME="Aspects"
+```
+
 
 ---
 

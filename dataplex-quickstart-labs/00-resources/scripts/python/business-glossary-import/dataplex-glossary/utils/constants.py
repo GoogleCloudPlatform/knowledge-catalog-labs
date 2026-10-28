@@ -155,3 +155,109 @@ SOURCE_ID_HEADER_ALIASES = ["source id"]
 COLUMN_HEADER_ALIASES = ["column", "source_path"]
 TARGET_NAME_HEADER_ALIASES = ["target name", "target_entry"]
 TARGET_ID_HEADER_ALIASES = ["target id"]
+
+# =============================================================================
+# Aspect Sheet (Sheet 2) Constants
+# =============================================================================
+# Custom Dataplex Aspects are carried in a SECOND sheet/CSV with a normalized
+# (id, Aspect name, Aspect value) schema, leaving the 14-column glossary sheet
+# (Sheet 1) completely untouched.
+
+ASPECT_ID_COLUMN = "id"
+ASPECT_NAME_COLUMN = "Aspect name"
+ASPECT_VALUE_COLUMN = "Aspect value"
+
+ASPECT_SHEET_HEADERS = [ASPECT_ID_COLUMN, ASPECT_NAME_COLUMN, ASPECT_VALUE_COLUMN]
+
+# Default worksheet/tab name holding the aspect rows. Can be overridden at
+# runtime with the GLOSSARY_ASPECTS_SHEET_NAME environment variable (the
+# glossary import/export scripts are prompt-driven rather than argparse-driven).
+ASPECTS_SHEET_NAME = "Sheet2"
+ASPECTS_SHEET_NAME_ENV_VAR = "GLOSSARY_ASPECTS_SHEET_NAME"
+
+# --- Aspect identifier patterns ---
+# Full resource-path form:
+#   projects/{project}/locations/{location}/aspectTypes/{aspect_type}/{field}
+ASPECT_RESOURCE_PATTERN = re.compile(
+    r"^projects/(?P<project_id>[^/]+)/locations/(?P<location_id>[^/]+)"
+    r"/aspectTypes/(?P<aspect_type_id>[^/]+)(?:/(?P<field_name>.+))?$"
+)
+
+# Aspect type resource without a field:
+#   projects/{project}/locations/{location}/aspectTypes/{aspect_type}
+ASPECT_TYPE_RESOURCE_PATTERN = re.compile(
+    r"^projects/(?P<project_id>[^/]+)/locations/(?P<location_id>[^/]+)"
+    r"/aspectTypes/(?P<aspect_type_id>[^/]+)$"
+)
+
+# Matches a Google Cloud location id. Deliberately strict: every regional id
+# ends with a digit ('us-central1', 'europe-west4', 'northamerica-northeast1'),
+# which is what lets us tell 'my-project.us-central1.custom-gov.tier'
+# (qualified) apart from 'custom-gov.owner.email' (dotted record sub-field).
+LOCATION_ID_PATTERN = re.compile(r"^(global|us|eu|asia|[a-z]+-[a-z]+\d+)$")
+
+# --- System vs custom aspects ---
+# System aspects are already represented by dedicated Sheet 1 columns (or are
+# purely structural) and MUST NOT be duplicated into Sheet 2.
+#
+# Matching is done on the aspect type id alone, whatever the project and
+# location. This mirrors the Dataplex glossary import validation
+# (ValidateGlossaryTaxonomyItemFn), which treats any aspect whose type id is
+# 'overview' or 'contacts' as the built-in aspect and rejects the 'glossary-*'
+# structural aspects regardless of their project. It also covers both project
+# spellings: export sees the numeric project number
+# ('655216118709.global.overview') while import writes the friendly project id
+# ('dataplex-types.global.overview').
+ASPECT_TYPE_GLOSSARY = "glossary-aspect"
+
+SYSTEM_ASPECT_TYPE_IDS = frozenset({
+    ASPECT_OVERVIEW,
+    ASPECT_CONTACTS,
+    ASPECT_TYPE_TERM,
+    ASPECT_TYPE_CATEGORY,
+    ASPECT_TYPE_GLOSSARY,
+})
+
+# Projects that own the built-in (1P) Dataplex aspect types.
+SYSTEM_ASPECT_PROJECTS = frozenset({PROJECT_NUMBER, "dataplex-types"})
+
+# --- AspectType MetadataTemplate datatypes ---
+# See google/cloud/dataplex/v1/catalog.proto (AspectType.MetadataTemplate).
+ASPECT_FIELD_TYPE_STRING = "string"
+ASPECT_FIELD_TYPE_INT = "int"
+ASPECT_FIELD_TYPE_BOOL = "bool"
+ASPECT_FIELD_TYPE_DOUBLE = "double"
+ASPECT_FIELD_TYPE_DATETIME = "datetime"
+ASPECT_FIELD_TYPE_ENUM = "enum"
+ASPECT_FIELD_TYPE_ARRAY = "array"
+ASPECT_FIELD_TYPE_MAP = "map"
+ASPECT_FIELD_TYPE_RECORD = "record"
+
+ASPECT_FIELD_TYPES = frozenset({
+    ASPECT_FIELD_TYPE_STRING,
+    ASPECT_FIELD_TYPE_INT,
+    ASPECT_FIELD_TYPE_BOOL,
+    ASPECT_FIELD_TYPE_DOUBLE,
+    ASPECT_FIELD_TYPE_DATETIME,
+    ASPECT_FIELD_TYPE_ENUM,
+    ASPECT_FIELD_TYPE_ARRAY,
+    ASPECT_FIELD_TYPE_MAP,
+    ASPECT_FIELD_TYPE_RECORD,
+})
+
+# Accepted spellings when coercing a cell into a bool.
+BOOL_TRUE_LITERALS = frozenset({"true", "yes", "y", "t"})
+BOOL_FALSE_LITERALS = frozenset({"false", "no", "n", "f"})
+# '1'/'0' are only treated as booleans when the AspectType schema declares the
+# field as 'bool'; with no schema available they coerce to int (numeric wins).
+BOOL_NUMERIC_TRUE_LITERALS = frozenset({"1"})
+BOOL_NUMERIC_FALSE_LITERALS = frozenset({"0"})
+
+INTEGER_LITERAL_PATTERN = re.compile(r"^[+-]?\d+$")
+DECIMAL_LITERAL_PATTERN = re.compile(r"^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?$")
+
+# Maximum nesting depth (in dotted path segments below the aspect type) that is
+# flattened into its own Sheet 2 row. Anything deeper is serialized as JSON.
+# e.g. 'custom-gov.owner.email' is flattened; {'owner': {'meta': {...}}} yields
+# 'custom-gov.owner.meta' holding a JSON object string.
+MAX_ASPECT_FLATTEN_DEPTH = 2

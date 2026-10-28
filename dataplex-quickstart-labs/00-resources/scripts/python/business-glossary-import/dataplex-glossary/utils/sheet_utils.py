@@ -1,11 +1,15 @@
 """Sheet Utility Functions - Google Sheets API operations and data transformations."""
 
+import os
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from google.auth import default
 from googleapiclient.discovery import build
 
 from utils import api_layer, business_glossary_utils, logging_utils
 from utils.constants import (
+    ASPECTS_SHEET_NAME,
+    ASPECTS_SHEET_NAME_ENV_VAR,
+    ASPECT_SHEET_HEADERS,
     COLUMN_HEADER_ALIASES,
     DP_LINK_TYPE_DEFINITION,
     ENTRYLINK_SHEET_HEADERS,
@@ -19,7 +23,8 @@ from utils.constants import (
     TARGET_NAME_HEADER_ALIASES,
     TYPE_HEADER_ALIASES,
 )
-from utils.error import InvalidSpreadsheetURLError, SheetsAPIError
+from utils.error import AspectSheetHeaderError, InvalidSpreadsheetURLError, SheetsAPIError
+from utils.models import AspectRow
 from utils.retry_utils import execute_with_retry, is_network_error
 
 logger = logging_utils.get_logger()
@@ -447,3 +452,279 @@ def rows_to_entry_link_dicts(
         entry_link_dicts.append(entry_link_dict)
 
     return entry_link_dicts
+
+
+# =============================================================================
+# Aspect sheet (Sheet 2) helpers
+# =============================================================================
+
+
+def resolve_aspects_sheet_name(sheet_name: str = None) -> str:
+    """Resolve the worksheet name holding the aspect rows.
+
+    Precedence: explicit argument > GLOSSARY_ASPECTS_SHEET_NAME env var >
+    the ASPECTS_SHEET_NAME default ('Sheet2').
+
+    Args:
+        sheet_name: Explicit worksheet name, if the caller has one.
+
+    Returns:
+        The worksheet name to use for aspect rows.
+    """
+    if sheet_name:
+        return sheet_name
+    return os.environ.get(ASPECTS_SHEET_NAME_ENV_VAR, '').strip() or ASPECTS_SHEET_NAME
+
+
+def sheet_exists(sheets_service, spreadsheet_id: str, title: str) -> bool:
+    """Check whether a worksheet with the given title exists.
+
+    A failure to read the spreadsheet metadata is raised rather than reported
+    as "absent": the export uses this check to decide whether to reset a
+    leftover aspects tab, and skipping that reset would leave stale rows that
+    bring back removed aspects on the next import.
+
+    Args:
+        sheets_service: The Google Sheets API service object.
+        spreadsheet_id: The spreadsheet ID.
+        title: The worksheet title to look for.
+
+    Returns:
+        True when the worksheet exists, False when it does not.
+
+    Raises:
+        SheetsAPIError: If the spreadsheet metadata cannot be read.
+    """
+    try:
+        metadata = execute_with_retry(
+            sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute,
+            f"Read spreadsheet metadata {spreadsheet_id}",
+            is_retryable=is_network_error,
+        )
+    except Exception as metadata_error:
+        logger.error(f"Could not read spreadsheet metadata: {metadata_error}")
+        raise SheetsAPIError(f"Could not read spreadsheet metadata: {metadata_error}")
+
+    for sheet in metadata.get('sheets', []):
+        if sheet.get('properties', {}).get('title') == title:
+            return True
+    return False
+
+
+def ensure_sheet_exists(sheets_service, spreadsheet_id: str, title: str) -> int:
+    """Return the sheetId of a worksheet, creating the tab when it is absent.
+
+    Args:
+        sheets_service: The Google Sheets API service object.
+        spreadsheet_id: The spreadsheet ID.
+        title: The worksheet title.
+
+    Returns:
+        The numeric sheetId of the existing or newly created worksheet.
+
+    Raises:
+        SheetsAPIError: If the worksheet cannot be read or created.
+    """
+    def _do_ensure():
+        metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        for sheet in metadata.get('sheets', []):
+            properties = sheet.get('properties', {})
+            if properties.get('title') == title:
+                return properties.get('sheetId')
+
+        logger.info(f"Creating worksheet '{title}' in spreadsheet {spreadsheet_id}")
+        response = sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={'requests': [{'addSheet': {'properties': {'title': title}}}]}
+        ).execute()
+        replies = response.get('replies', [])
+        if replies and 'addSheet' in replies[0]:
+            return replies[0]['addSheet']['properties']['sheetId']
+        return None
+
+    try:
+        return execute_with_retry(
+            _do_ensure, f"Ensure sheet '{title}' in {spreadsheet_id}", is_retryable=is_network_error
+        )
+    except Exception as ensure_error:
+        logger.error(f"Error ensuring worksheet '{title}' exists: {ensure_error}")
+        raise SheetsAPIError(f"Error ensuring worksheet '{title}' exists: {ensure_error}")
+
+
+def rows_to_aspect_rows(spreadsheet_data: List[List[str]]) -> List[AspectRow]:
+    """Convert raw Sheet 2 values into AspectRow objects.
+
+    The header row is validated leniently: the three canonical headers are
+    detected case-insensitively in any order. Blank rows are skipped.
+
+    A sheet that is completely blank, or has a valid header and no data rows,
+    yields an empty list. A sheet that has content but no valid header is an
+    error rather than "no aspects": glossary import replaces each entry's
+    aspects with the sheet contents, so silently ignoring a mistyped header
+    would remove every custom aspect.
+
+    Args:
+        spreadsheet_data: Raw values as returned by the Sheets API, header first.
+
+    Returns:
+        A list of AspectRow objects, empty when the sheet is blank or
+        header-only.
+
+    Raises:
+        AspectSheetHeaderError: If the sheet has content but row 1 does not
+            contain the required headers.
+    """
+    def _is_blank(row) -> bool:
+        return not row or all(not str(cell).strip() for cell in row)
+
+    if not spreadsheet_data or all(_is_blank(row) for row in spreadsheet_data):
+        return []
+
+    headers = [str(header).strip() for header in spreadsheet_data[0]]
+    normalized = [header.lower() for header in headers]
+
+    def _index_of(*candidates: str) -> int:
+        for candidate in candidates:
+            if candidate in normalized:
+                return normalized.index(candidate)
+        return -1
+
+    id_idx = _index_of('id', 'term_id', 'term id')
+    name_idx = _index_of('aspect name', 'aspect_name', 'aspectname')
+    value_idx = _index_of('aspect value', 'aspect_value', 'aspectvalue')
+
+    if id_idx < 0 or name_idx < 0 or value_idx < 0:
+        raise AspectSheetHeaderError(
+            f"Aspects sheet header must contain the columns {ASPECT_SHEET_HEADERS}, "
+            f"but row 1 is {headers}."
+        )
+
+    aspect_rows = []
+    for row_number, data_row in enumerate(spreadsheet_data[1:], start=2):
+        def _cell(index: int) -> str:
+            return str(data_row[index]).strip() if 0 <= index < len(data_row) else ''
+
+        aspect_row = AspectRow(
+            term_id=_cell(id_idx),
+            aspect_name=_cell(name_idx),
+            aspect_value=_cell(value_idx),
+            row_number=row_number,
+        )
+        if aspect_row.is_empty():
+            continue
+        aspect_rows.append(aspect_row)
+
+    return aspect_rows
+
+
+def write_aspect_rows(
+    sheets_service,
+    spreadsheet_id: str,
+    row_data: List[List[str]],
+    sheet_name: str = None,
+) -> str:
+    """Write aspect rows to the aspects sheet, creating the tab when needed.
+
+    Args:
+        sheets_service: The Google Sheets API service object.
+        spreadsheet_id: The spreadsheet ID.
+        row_data: Rows to write, header row included.
+        sheet_name: Optional worksheet name override.
+
+    Returns:
+        The worksheet name that was written to.
+
+    Raises:
+        SheetsAPIError: If the write fails.
+    """
+    target_sheet_name = resolve_aspects_sheet_name(sheet_name)
+    logger.debug(
+        f"[WRITE ASPECT SHEET] Request: spreadsheet_id={spreadsheet_id}, "
+        f"rows={len(row_data)}, sheet_name={target_sheet_name}"
+    )
+
+    sheet_id = ensure_sheet_exists(sheets_service, spreadsheet_id, target_sheet_name)
+
+    def _do_write():
+        sheets_service.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=f"'{target_sheet_name}'!A:ZZ"
+        ).execute()
+        # RAW, not USER_ENTERED: Sheets must not reinterpret aspect values as if
+        # they were typed ('007' -> 7, '50%' -> 0.5, '=x' -> formula, long
+        # integers losing precision), or they would not import back unchanged.
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=f"'{target_sheet_name}'!A1",
+            valueInputOption='RAW', body={'values': row_data}
+        ).execute()
+        if sheet_id is not None:
+            _apply_aspect_sheet_formatting(sheets_service, spreadsheet_id, sheet_id, len(row_data))
+        return target_sheet_name
+
+    try:
+        result = execute_with_retry(
+            _do_write, f"Write aspect sheet {spreadsheet_id}", is_retryable=is_network_error
+        )
+        logger.debug(f"[WRITE ASPECT SHEET] Response: wrote {len(row_data)} rows")
+        return result
+    except Exception as write_error:
+        logger.error(f"Error writing aspects to spreadsheet: {write_error}")
+        raise SheetsAPIError(f"Error writing aspects to spreadsheet: {write_error}")
+
+
+def _apply_aspect_sheet_formatting(
+    sheets_service, spreadsheet_id: str, sheet_id: int, row_count: int
+) -> None:
+    """Apply formatting to the aspects sheet.
+
+    Mirrors _apply_sheet_formatting: fixed column widths, wrapped text, a bold
+    header row and auto-resized rows -- sized for [id, Aspect name, Aspect value].
+    """
+    column_widths = [(0, 220), (1, 300), (2, 450)]
+    column_count = len(ASPECT_SHEET_HEADERS)
+    requests = []
+
+    for col_index, width in column_widths:
+        requests.append({
+            'updateDimensionProperties': {
+                'range': {
+                    'sheetId': sheet_id, 'dimension': 'COLUMNS',
+                    'startIndex': col_index, 'endIndex': col_index + 1
+                },
+                'properties': {'pixelSize': width},
+                'fields': 'pixelSize'
+            }
+        })
+
+    requests.append({
+        'repeatCell': {
+            'range': {
+                'sheetId': sheet_id, 'startRowIndex': 0, 'endRowIndex': row_count,
+                'startColumnIndex': 0, 'endColumnIndex': column_count
+            },
+            'cell': {'userEnteredFormat': {'wrapStrategy': 'WRAP'}},
+            'fields': 'userEnteredFormat.wrapStrategy'
+        }
+    })
+
+    requests.append({
+        'repeatCell': {
+            'range': {
+                'sheetId': sheet_id, 'startRowIndex': 0, 'endRowIndex': 1,
+                'startColumnIndex': 0, 'endColumnIndex': column_count
+            },
+            'cell': {'userEnteredFormat': {'textFormat': {'bold': True}}},
+            'fields': 'userEnteredFormat.textFormat.bold'
+        }
+    })
+
+    requests.append({
+        'autoResizeDimensions': {
+            'dimensions': {
+                'sheetId': sheet_id, 'dimension': 'ROWS', 'startIndex': 0, 'endIndex': row_count
+            }
+        }
+    })
+
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id, body={'requests': requests}
+    ).execute()
