@@ -36,6 +36,8 @@ SPREADSHEET_URL_PATTERN = re.compile(r"https://docs\.google\.com/spreadsheets/d/
 # Validation Patterns
 EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
 ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
+# Maximum length of a term or category id (checked by glossary-import.py as well).
+ID_MAX_LENGTH = 63
 PARENT_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 LABEL_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 
@@ -261,3 +263,60 @@ DECIMAL_LITERAL_PATTERN = re.compile(r"^[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?
 # e.g. 'custom-gov.owner.email' is flattened; {'owner': {'meta': {...}}} yields
 # 'custom-gov.owner.meta' holding a JSON object string.
 MAX_ASPECT_FLATTEN_DEPTH = 2
+
+
+# =============================================================================
+# Glossary Update (import/glossary-update.py) Constants
+# =============================================================================
+# The update script reads the same sheet as the full import (glossary-import.py):
+# these 14 columns, plus an optional Operation column.
+GLOSSARY_SHEET_HEADERS = [
+    "id", "parent", "display_name", "description", "overview", "type",
+    "contact1_email", "contact1_name", "contact2_email", "contact2_name",
+    "label1_key", "label1_value", "label2_key", "label2_value",
+]
+
+# Optional column. Its header is matched case-insensitively ('Operation').
+# Blank: create the row's term/category, or update it when it changed.
+# 'delete': delete the term/category (a category is deleted with everything in it).
+OPERATION_COLUMN = "operation"
+OPERATION_DELETE = "delete"
+
+GLOSSARY_TERM_TYPE = "TERM"
+GLOSSARY_CATEGORY_TYPE = "CATEGORY"
+
+# A glossary holds at most 5,000 terms and 200 categories.
+GLOSSARY_MAX_TERMS = 5000
+GLOSSARY_MAX_CATEGORIES = 200
+# The Dataplex API rejects a category creation or move that nests categories more than 3 deep
+# (CreateGlossaryCategory / UpdateGlossaryCategory). Terms can be in any category, so a term
+# can be up to 4 levels below the glossary: glossary > category > category > category > term.
+SERVER_MAX_CATEGORY_DEPTH = 3
+
+# Aspect keys written by the update script (the full import uses the same keys).
+OVERVIEW_ASPECT_KEY = "dataplex-types.global.overview"
+CONTACTS_ASPECT_KEY = "dataplex-types.global.contacts"
+CONTACT_ROLE_STEWARD = "steward"
+
+# Dataplex quotas (standard tier) for the calls made by the update script, per project and region:
+#   - glossary writes (create/update/delete of terms and categories): 250 per minute per project
+#     and 100 per minute per user;
+#   - glossary reads (get/list of terms and categories): 500 per minute per project and 200 per
+#     minute per user;
+#   - catalog entry writes (entries.patch, for aspects): 1,500 per minute per project.
+# The delays below are the minimum time between two such calls across all threads, chosen to stay
+# under the per-user quotas. Calls that still get a 429 (quota exceeded) are retried with
+# exponential backoff (see retry_utils.execute_with_retry).
+DEFAULT_GLOSSARY_WRITES_PER_MINUTE = 90  # see --max-qpm in glossary-update.py
+GLOSSARY_WRITE_API_CALL_DELAY_SECONDS = 60 / DEFAULT_GLOSSARY_WRITES_PER_MINUTE
+GLOSSARY_READ_API_CALL_DELAY_SECONDS = 60 / 180
+ENTRY_WRITE_API_CALL_DELAY_SECONDS = 60 / 600
+
+# After creating a term or category, Dataplex creates its catalog entry asynchronously (usually
+# within seconds, sometimes after more than a minute). Its aspects (overview, contacts, custom
+# aspects) can only be written once the entry exists.
+ENTRY_WAIT_TIMEOUT_SECONDS = 180
+# A term or category created this recently whose entry can't be read yet is waited for (up to
+# ENTRY_WAIT_TIMEOUT_SECONDS) before planning, e.g. when the update is run again right after
+# creating it. An older one without a readable entry is reported (missing permission).
+ENTRY_PENDING_WINDOW_SECONDS = 15 * 60

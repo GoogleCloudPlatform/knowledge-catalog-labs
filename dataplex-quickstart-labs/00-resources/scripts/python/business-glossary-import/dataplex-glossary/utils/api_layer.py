@@ -1,5 +1,6 @@
 """API Layer for Dataplex Glossary Operations."""
 
+import json
 import os
 import sys
 import threading
@@ -23,7 +24,12 @@ from .constants import (
     DATAPLEX_BASE_URL,
     ENTRY_NAME_PATTERN,
     ENTRY_READ_API_CALL_DELAY_SECONDS,
+    ENTRY_WRITE_API_CALL_DELAY_SECONDS,
     EXCLUDED_LOCATIONS,
+    GLOSSARY_CATEGORY_TYPE,
+    GLOSSARY_READ_API_CALL_DELAY_SECONDS,
+    GLOSSARY_TERM_TYPE,
+    GLOSSARY_WRITE_API_CALL_DELAY_SECONDS,
     PAGE_SIZE,
     PLAIN_BIGQUERY_ENTRY_ID_PATTERN,
     PROJECT_PATTERN,
@@ -170,14 +176,62 @@ class _RateLimiter:
 _entry_links_rate_limiter = _RateLimiter(API_CALL_DELAY_SECONDS)  # lookupEntryLinks
 _search_rate_limiter = _RateLimiter(SEARCH_API_CALL_DELAY_SECONDS)  # searchEntries
 _entry_read_rate_limiter = _RateLimiter(ENTRY_READ_API_CALL_DELAY_SECONDS)  # lookupEntry
+_write_rate_limiter = _RateLimiter(GLOSSARY_WRITE_API_CALL_DELAY_SECONDS)  # term/category create/patch/delete
+_glossary_read_rate_limiter = _RateLimiter(GLOSSARY_READ_API_CALL_DELAY_SECONDS)  # term/category get
+_entry_write_rate_limiter = _RateLimiter(ENTRY_WRITE_API_CALL_DELAY_SECONDS)  # entries.patch
 
 
-def _execute_rate_limited(rate_limiter: _RateLimiter, request, description: str) -> Any:
+def _execute_rate_limited(
+    rate_limiter: _RateLimiter,
+    request,
+    description: str,
+    is_retryable: Callable[[Exception], bool] = is_retryable_google_api_error,
+) -> Any:
     """Execute a Google API client request with retries, waiting for `rate_limiter` before every attempt."""
     def attempt():
         rate_limiter.wait()
         return request.execute()
-    return execute_with_retry(attempt, description)
+    if is_retryable is is_retryable_google_api_error:
+        return execute_with_retry(attempt, description)
+    return execute_with_retry(attempt, description, is_retryable=is_retryable)
+
+
+def _http_error_field(error: Exception, field_name: str) -> str:
+    """A string field ('status', 'message') of a Google API error's JSON body, or ''."""
+    content = getattr(error, "content", None)
+    if not content:
+        return ""
+    try:
+        body = json.loads(content.decode("utf-8") if isinstance(content, bytes) else content)
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    error_body = body.get("error") if isinstance(body, dict) else None
+    value = error_body.get(field_name) if isinstance(error_body, dict) else None
+    return value if isinstance(value, str) else ""
+
+
+def http_error_status_name(error: Exception) -> str:
+    """The canonical status of a Google API error (e.g. 'ALREADY_EXISTS'), or '' if unknown."""
+    return _http_error_field(error, "status")
+
+
+def http_error_message(error: Exception) -> str:
+    """The message of a Google API error, or '' if unknown."""
+    return _http_error_field(error, "message")
+
+
+def _is_retryable_write_error(error: Exception) -> bool:
+    """Network, 429 and 5xx errors, and ABORTED (HTTP 409 for a concurrent transaction).
+
+    ALREADY_EXISTS is also HTTP 409, but isn't retried: the caller handles it.
+    """
+    if is_retryable_google_api_error(error):
+        return True
+    return (
+        isinstance(error, HttpError)
+        and getattr(error.resp, "status", None) == 409
+        and http_error_status_name(error) == "ABORTED"
+    )
 
 
 def initialize_locations_cache(user_project: str) -> List[str]:
@@ -242,6 +296,168 @@ def list_glossary_terms(dataplex_service: build, glossary_name: str) -> List[Dic
     
     logger.debug(f"Response: {len(all_terms)} terms for {glossary_name}")
     return all_terms
+
+
+def list_glossary_categories(dataplex_service: build, glossary_name: str) -> List[Dict]:
+    """Lists categories from a Dataplex glossary with pagination support.
+
+    Returns an empty list when the glossary has no categories.
+    """
+    all_categories = []
+    logger.debug(f"Request: glossaries.categories.list(parent={glossary_name})")
+    categories_api = dataplex_service.projects().locations().glossaries().categories()
+    categories_request = categories_api.list(parent=glossary_name, pageSize=PAGE_SIZE)
+
+    while categories_request:
+        try:
+            page_response = execute_with_retry(
+                categories_request.execute,
+                f"List glossary categories for {glossary_name}"
+            )
+        except Exception as categories_error:
+            raise DataplexAPIError(
+                f"Error while listing glossary categories for {glossary_name}: {categories_error}"
+            )
+
+        all_categories.extend(page_response.get('categories', []))
+        categories_request = categories_api.list_next(categories_request, page_response)
+
+    logger.debug(f"Response: {len(all_categories)} categories for {glossary_name}")
+    return all_categories
+
+
+# -----------------------------------------------------------------------------
+# Glossary term/category and entry writes (used by glossary-update.py)
+# -----------------------------------------------------------------------------
+
+def set_write_rate_limit(max_calls_per_minute: int) -> None:
+    """Limit term/category creates, updates and deletes to `max_calls_per_minute` across all threads."""
+    if max_calls_per_minute <= 0:
+        raise ValueError("max_calls_per_minute must be positive")
+    _write_rate_limiter.min_interval_seconds = 60.0 / max_calls_per_minute
+
+
+def _glossary_collection(dataplex_service: build, resource_type: str):
+    """The terms() or categories() collection of the Dataplex API for a term or a category."""
+    glossaries = dataplex_service.projects().locations().glossaries()
+    if resource_type == GLOSSARY_TERM_TYPE:
+        return glossaries.terms()
+    if resource_type == GLOSSARY_CATEGORY_TYPE:
+        return glossaries.categories()
+    raise ValueError(f"Unknown glossary resource type: {resource_type}")
+
+
+def get_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> Dict:
+    """Fetch the current state of a glossary term or category (not cached)."""
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.get(name={resource_name})")
+    request = _glossary_collection(dataplex_service, resource_type).get(name=resource_name)
+    return _execute_rate_limited(_glossary_read_rate_limiter, request, f"Get {resource_type.lower()} {resource_name}")
+
+
+def create_glossary_resource(
+    dataplex_service: build, glossary_name: str, resource_type: str, resource_id: str, body: Dict
+) -> Dict:
+    """Create a glossary term or category with the given id under `glossary_name`.
+
+    Transient errors (network, 429, 5xx, 409 ABORTED) are retried; the caller handles
+    'already exists' (HTTP 400 or 409 ALREADY_EXISTS), which a retried create can return.
+
+    Args:
+        dataplex_service: A Dataplex API client.
+        glossary_name: projects/<p>/locations/<l>/glossaries/<g>.
+        resource_type: GLOSSARY_TERM_TYPE or GLOSSARY_CATEGORY_TYPE.
+        resource_id: The id of the new term or category.
+        body: displayName, description, labels and parent (the glossary or a category).
+
+    Returns:
+        The created term or category.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error.
+    """
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.create(id={resource_id}, body={body})")
+    collection = _glossary_collection(dataplex_service, resource_type)
+    if resource_type == GLOSSARY_TERM_TYPE:
+        request = collection.create(parent=glossary_name, termId=resource_id, body=body)
+    else:
+        request = collection.create(parent=glossary_name, categoryId=resource_id, body=body)
+    return _execute_rate_limited(
+        _write_rate_limiter, request, f"Create {resource_type.lower()} {resource_id}", is_retryable=_is_retryable_write_error
+    )
+
+
+def update_glossary_resource(
+    dataplex_service: build, resource_name: str, resource_type: str, body: Dict, update_mask: List[str]
+) -> Dict:
+    """Update the fields in `update_mask` (display_name, description, labels, parent) of a term or category.
+
+    Args:
+        dataplex_service: A Dataplex API client.
+        resource_name: The term's or category's resource name.
+        resource_type: GLOSSARY_TERM_TYPE or GLOSSARY_CATEGORY_TYPE.
+        body: The new values; only the fields in `update_mask` are written.
+        update_mask: The fields to write.
+
+    Returns:
+        The updated term or category.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error.
+    """
+    mask = ",".join(update_mask)
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.patch(name={resource_name}, updateMask={mask})")
+    request = _glossary_collection(dataplex_service, resource_type).patch(
+        name=resource_name, updateMask=mask, body=body
+    )
+    return _execute_rate_limited(
+        _write_rate_limiter, request, f"Update {resource_type.lower()} {resource_name}", is_retryable=_is_retryable_write_error
+    )
+
+
+def delete_glossary_resource(dataplex_service: build, resource_name: str, resource_type: str) -> None:
+    """Delete a glossary term or category.
+
+    Deleting a category doesn't delete what's inside it: Dataplex moves its contents up a level.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error (404 when it's already deleted).
+    """
+    logger.debug(f"Request: glossaries.{resource_type.lower()}.delete(name={resource_name})")
+    request = _glossary_collection(dataplex_service, resource_type).delete(name=resource_name)
+    _execute_rate_limited(
+        _write_rate_limiter, request, f"Delete {resource_type.lower()} {resource_name}", is_retryable=_is_retryable_write_error
+    )
+
+
+def update_entry_aspects(
+    dataplex_service: build, entry_name: str, aspects: Dict[str, Dict], entry_type: str = ""
+) -> Dict:
+    """Write the given aspects of an entry, leaving its other aspects unchanged.
+
+    Args:
+        dataplex_service: A Dataplex API client.
+        entry_name: The catalog entry's resource name (with the project number).
+        aspects: Aspect keys (e.g. 'dataplex-types.global.overview') -> {'data': {...}}. Only
+            these keys are written (aspectKeys); other aspects are kept.
+        entry_type: The entry's type, sent with the entry when known.
+
+    Returns:
+        The updated entry.
+
+    Raises:
+        HttpError: If the call fails with a non-transient error.
+    """
+    body = {"name": entry_name, "aspects": aspects}
+    if entry_type:
+        body["entryType"] = entry_type
+    aspect_keys = sorted(aspects)
+    logger.debug(f"Request: entries.patch(name={entry_name}, aspectKeys={aspect_keys})")
+    request = dataplex_service.projects().locations().entryGroups().entries().patch(
+        name=entry_name, updateMask="aspects", aspectKeys=aspect_keys, body=body
+    )
+    return _execute_rate_limited(
+        _entry_write_rate_limiter, request, f"Update aspects of {entry_name}", is_retryable=_is_retryable_write_error
+    )
 
 def parse_entry_name(entry_name: str) -> tuple:
     """Parse a full entry resource name to extract project, location, entry group, and entry ID."""

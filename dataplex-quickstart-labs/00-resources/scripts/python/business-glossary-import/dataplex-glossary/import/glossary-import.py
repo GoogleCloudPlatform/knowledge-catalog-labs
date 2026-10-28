@@ -17,7 +17,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from utils import api_layer, business_glossary_utils, sheet_utils
-from utils.constants import ASPECT_SHEET_HEADERS, ASPECTS_SHEET_NAME_ENV_VAR
+from utils.constants import (
+    ASPECT_SHEET_HEADERS,
+    ASPECTS_SHEET_NAME_ENV_VAR,
+    OPERATION_COLUMN,
+    OPERATION_DELETE,
+)
 from utils.error import AspectSheetHeaderError, AspectValidationError, InvalidAspectIdentifierError
 
 # Regex pattern for the glossary URL, allowing any valid URL
@@ -322,6 +327,32 @@ class SheetProcessor:
         if label2_key and label2_value:
             if LABEL_PATTERN.match(label2_key) is None or LABEL_PATTERN.match(label2_value) is None:
                 raise InvalidLabelException(f"Invalid Label format in row {row_num}. Label key and value should contain only lowercase letters, numbers, or hyphens and should start with a lowercase letter. '{LABEL2_KEY_COLUMN_NAME}' is: {label2_key}, while '{LABEL2_VALUE_COLUMN_NAME}' is {label2_value}")
+
+    def validate_glossary_row(self, row_data, row_num):
+        """Validates one row of the glossary sheet (Sheet 1).
+
+        The same checks are used by glossary-update.py, so both scripts accept
+        exactly the same rows. Whether the parent category is in the sheet is
+        not checked here.
+
+        Args:
+            row_data: The row as a dict of column name -> value (whitespace
+              already stripped).
+            row_num: The row number, used in the error messages.
+
+        Raises:
+            InvalidNameException, InvalidTypeException, InvalidParentException,
+            InvalidContactException, InvalidLabelException or
+            ValidationException: For the first invalid value of the row.
+        """
+        self._validate_id(row_data.get(ID_COLUMN), row_num)
+        self._validate_type(row_data.get(TYPE_COLUMN_NAME), row_num)
+        self._validate_parent(row_data.get(PARENT_COLUMN_NAME), row_data, row_num)
+        self._validate_contacts(row_data, row_num)
+        self._validate_display_name(row_data.get(DISPLAY_NAME_COLUMN_NAME), row_num)
+        self._validate_description(row_data.get(DESCRIPTION_COLUMN_NAME), row_num)
+        self._validate_overview(row_data.get(OVERVIEW_COLUMN_NAME), row_num)
+        self._validate_labels(row_data, row_num)
         
 
     def _generate_full_name(self, name, type_value):
@@ -548,13 +579,38 @@ class SheetProcessor:
             f"populated, then edit and re-import that spreadsheet."
         )
 
-    def read_aspects(self, spreadsheet=None, term_ids=None, category_ids=None):
+    @staticmethod
+    def _warn_ignored_aspect_rows(sheet_name, row_numbers_by_id, max_listed_ids=10):
+        """Prints one warning for the aspect rows ignored because their id isn't in Sheet 1.
+
+        Args:
+            sheet_name: The name of the aspects sheet.
+            row_numbers_by_id: The ignored row numbers, by id, in sheet order.
+            max_listed_ids: How many ids the warning lists by name.
+        """
+        ids = list(row_numbers_by_id)
+        listed = ", ".join(f"'{term_id}'" for term_id in ids[:max_listed_ids])
+        if len(ids) > max_listed_ids:
+            listed += f" and {len(ids) - max_listed_ids} more"
+        row_count = sum(len(row_numbers) for row_numbers in row_numbers_by_id.values())
+        print(
+            f"Warning: {row_count} row(s) of the aspects sheet '{sheet_name}' are ignored "
+            f"because their id isn't in the glossary sheet: {listed}. To change the custom "
+            f"aspects of a term, keep the term's row in the glossary sheet."
+        )
+
+    def read_aspects(self, spreadsheet=None, term_ids=None, category_ids=None,
+                     ignore_unknown_ids=False):
         """Reads and resolves custom aspects from the aspects sheet (Sheet 2).
 
         Custom aspects can only be set on terms: every row must reference the
         id of a term in Sheet 1. A row whose id is only a category is an error.
         A row whose id is both a term and a category (Dataplex allows a term
         and a category to share an id) is applied to the term, with a warning.
+        With ignore_unknown_ids, a row whose id is neither a term nor a
+        category in Sheet 1 is ignored instead, with one warning for all such
+        rows (used by glossary-update.py, whose sheet may hold only the rows
+        to change).
 
         All rows sharing an (id, aspect type) are aggregated into a single
         aspect ``data`` dict. Dotted field names rebuild nested records, so
@@ -576,6 +632,9 @@ class SheetProcessor:
             category_ids: Optional set of category ids declared in Sheet 1,
                 used to explain why a category id is rejected and to warn when
                 an id is both a term and a category.
+            ignore_unknown_ids: Ignore (with a warning) instead of reject the
+                rows whose id is in neither term_ids nor category_ids. Has no
+                effect when term_ids is None.
 
         Returns:
             A tuple (is_valid, aspects_by_id) where aspects_by_id maps
@@ -628,8 +687,20 @@ class SheetProcessor:
         assigned_paths = {}
         field_types_cache = {}
         aspects_by_id = {}
+        ignored_rows_by_id = {}
 
         for aspect_row in aspect_rows:
+            if (
+                ignore_unknown_ids
+                and term_ids is not None
+                and aspect_row.term_id  # a missing id is still an error
+                and aspect_row.term_id not in term_ids
+                and aspect_row.term_id not in category_ids
+            ):
+                ignored_rows_by_id.setdefault(aspect_row.term_id, []).append(
+                    aspect_row.row_number
+                )
+                continue
             try:
                 parsed = self._validate_aspect_row(
                     aspect_row,
@@ -701,6 +772,8 @@ class SheetProcessor:
                     f"only be set on terms, so this row is applied to the term."
                 )
 
+        if ignored_rows_by_id:
+            self._warn_ignored_aspect_rows(sheet_name, ignored_rows_by_id)
         aspect_count = sum(len(by_type) for by_type in aspects_by_id.values())
         print(
             f"Resolved {aspect_count} custom aspect(s) across {len(aspects_by_id)} "
@@ -817,10 +890,24 @@ class SheetProcessor:
         # Trim whitespace
         headers = [header.strip() for header in headers]
 
-        if set(headers) != ALLOWED_HEADERS:
-            print(f"Invalid sheet. The first row of the sheet should be headers conatin exactly : {ALLOWED_HEADERS}. Actual headers: {headers}")
+        # The optional 'Operation' column is used by glossary-update.py. The full import
+        # accepts it, so the same sheet works for both scripts, but it can't delete single
+        # rows: it replaces the whole glossary with the sheet.
+        operation_header = next((header for header in headers if header.lower() == OPERATION_COLUMN), None)
+        column_headers = [header for header in headers if header != operation_header]
+
+        if set(column_headers) != ALLOWED_HEADERS:
+            print(f"Invalid sheet. The first row of the sheet should be headers conatin exactly : {ALLOWED_HEADERS}, and optionally '{OPERATION_COLUMN.capitalize()}'. Actual headers: {headers}")
             is_dump_valid = False
             return is_dump_valid, dump_entries
+
+        if operation_header:
+            operation_errors = _check_operation_column(data[1:], headers.index(operation_header))
+            if operation_errors:
+                for operation_error in operation_errors:
+                    print(operation_error)
+                is_dump_valid = False
+                return is_dump_valid, dump_entries
 
         # First, populate category_names
         for row_num, row in enumerate(data[1:], start=2):
@@ -853,14 +940,7 @@ class SheetProcessor:
                     print(f"Invalid sheet. The number of terms exceeds the maximum allowed limit of {MAX_NUM_TERMS}. Actual number of terms: {num_terms}")
                     is_dump_valid = False
             try:
-                self._validate_id(id, row_num)
-                self._validate_type(type_value, row_num)
-                self._validate_parent(parent, row_data, row_num)
-                self._validate_contacts(row_data, row_num)
-                self._validate_display_name(row_data.get(DISPLAY_NAME_COLUMN_NAME), row_num)
-                self._validate_description(row_data.get(DESCRIPTION_COLUMN_NAME), row_num)
-                self._validate_overview(row_data.get(OVERVIEW_COLUMN_NAME), row_num)
-                self._validate_labels(row_data, row_num)
+                self.validate_glossary_row(row_data, row_num)
                 row_data[ENTRY_NAME_COLUMN] = self._generate_full_name(id, type_value)
                 row_data[PARENT_ENTRY_COLUMN_NAME] = self._generate_full_parent(parent)
                 valid_rows.append(row_data)
@@ -905,6 +985,38 @@ class SheetProcessor:
                 dump_entries.append(self._convert_to_import_item(row_data, ancestors_map[entry_name]))
 
         return is_dump_valid, dump_entries
+
+
+def _check_operation_column(rows, operation_index):
+    """Errors for the 'Operation' column of the full import: it can't delete single rows.
+
+    Args:
+        rows: The sheet rows, header excluded.
+        operation_index: The index of the 'Operation' column.
+
+    Returns:
+        A list of error messages, empty when every Operation cell is blank.
+    """
+    delete_rows = []
+    errors = []
+    for row_num, row in enumerate(rows, start=2):
+        operation = row[operation_index].strip().lower() if operation_index < len(row) else ""
+        if operation == OPERATION_DELETE:
+            delete_rows.append(row_num)
+        elif operation:
+            errors.append(
+                f"Invalid '{OPERATION_COLUMN.capitalize()}' value '{operation}' in row {row_num}. "
+                f"Leave it empty, or use '{OPERATION_DELETE}' with glossary-update.py."
+            )
+    if delete_rows:
+        errors.append(
+            f"Row(s) {', '.join(str(row_num) for row_num in delete_rows)} are marked "
+            f"'{OPERATION_DELETE}' in the '{OPERATION_COLUMN.capitalize()}' column. The full import "
+            f"replaces the whole glossary with the sheet and does not delete single rows. To delete "
+            f"specific terms or categories, use glossary-update.py, or remove the rows from the sheet "
+            f"(the full import deletes everything that isn't in the sheet)."
+        )
+    return errors
 
 
 def write_json_to_file(output_file_path, data):
