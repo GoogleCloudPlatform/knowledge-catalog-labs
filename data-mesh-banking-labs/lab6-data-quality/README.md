@@ -67,7 +67,7 @@ As part of the setup we have already defined a yaml file and stored in the gcs b
 ```bash
 export PROJECT_ID=$(gcloud config get-value project)
 
-gsutil cat gs://${PROJECT_ID}_dataplex_process/customer-source-configs/dq_customer_data_product.yaml
+gsutil cat gs://${PROJECT_ID}_dataplex_process/code/customer-source-configs/dq_customer_data_product.yaml
 ```
 
 Here we have performing 3 key DQ rules: 
@@ -144,7 +144,7 @@ By appending " --summary_to_stdout" flag to your data quality jobs, you can easi
     export PUBLIC_GCS_BUCKET_NAME="dataplex-clouddq-artifacts-${REGION_ID}"
 
     # Location of DQ YAML Specifications file
-    export YAML_CONFIGS_GCS_PATH="gs://${PROJECT_ID}_dataplex_process/customer-source-configs/dq_customer_data_product.yaml"
+    export YAML_CONFIGS_GCS_PATH="gs://${PROJECT_ID}_dataplex_process/code/customer-source-configs/dq_customer_data_product.yaml"
 
     # The Dataplex lake where your task is created.
     export LAKE_NAME="consumer-banking--customer--domain"
@@ -233,7 +233,7 @@ Once we have the DQ results available, using a custom utility which will automat
         --execution-service-account=customer-sa@${PROJECT_ID}.iam.gserviceaccount.com \
         --spark-main-class="com.google.cloud.dataplex.templates.dataquality.DataProductQuality" \
         --spark-file-uris="gs://${PROJECT_ID}_dataplex_process/customer-source-configs/data-product-quality-tag-auto.yaml" \
-        --container-image-java-jars="gs://${PROJECT_ID}_dataplex_process/common/tagmanager-1.0-SNAPSHOT.jar" \
+        --container-image-java-jars="gs://${PROJECT_ID}_dataplex_process/code/common/tagmanager-1.0-SNAPSHOT.jar" \
         --execution-args=^::^TASK_ARGS="--tag_template_id=projects/${PROJECT_ID}/locations/us-central1/tagTemplates/data_product_quality, --project_id=${PROJECT_ID},--location=us-central1,--lake_id=consumer-banking--customer--domain,--zone_id=customer-data-product-zone,--entity_id=customer_data,--input_file=data-product-quality-tag-auto.yaml"
         ```
 - Monitor the job. Go to Dataplex -> Process tab --> Custom spark --> "customer-dp-dq-tag" job. Refresh the page if you don't see your job. 
