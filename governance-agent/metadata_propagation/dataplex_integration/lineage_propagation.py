@@ -351,37 +351,22 @@ class LineageGraphTraverser:
         except Exception as e:
             logger.warning(f"Failed to load insights from {json_path}: {e}")
 
+    _BQ_FQN_RE = re.compile(
+        r"(?:^//[^/]+/|/entries/[^/]+/)projects/([^/]+)/datasets/([^/]+)/tables/([^/]+)$"
+    )
+
     def _normalize_fqn(self, fqn):
         """
         Normalizes various FQN formats to 'project.dataset.table'.
         """
         if not fqn:
             return ""
-        if fqn.startswith("//bigquery.googleapis.com/"):
-            # //bigquery.googleapis.com/projects/P/datasets/D/tables/T
-            parts = fqn.split("/")
-            # parts indices: 4=project, 6=dataset, 8=table
-            if len(parts) >= 9:
-                return f"{parts[4]}.{parts[6]}.{parts[8]}"
-        elif "/entryGroups/" in fqn and "/entries/" in fqn:
-            # projects/P/locations/L/entryGroups/G/entries/bigquery.googleapis.com/projects/P/datasets/D/tables/T
-            parts = fqn.split("/")
-            if "bigquery.googleapis.com" in parts:
-                idx = parts.index("bigquery.googleapis.com")
-                # Look for project name after 'projects'
-                p_name, d_name, t_name = "", "", ""
-                for i in range(idx, len(parts) - 1):
-                    if parts[i] == "projects" and not p_name:
-                        p_name = parts[i + 1]
-                    if parts[i] == "datasets" and not d_name:
-                        d_name = parts[i + 1]
-                    if parts[i] == "tables" and not t_name:
-                        t_name = parts[i + 1]
-
-                if p_name and d_name and t_name:
-                    return f"{p_name}.{d_name}.{t_name}"
-        elif fqn.startswith("bigquery:"):
-            return fqn.replace("bigquery:", "")
+        match = self._BQ_FQN_RE.search(fqn)
+        if match:
+            p_name, d_name, t_name = match.groups()
+            return f"{p_name}.{d_name}.{t_name}"
+        if fqn.startswith("bigquery:"):
+            return fqn.replace("bigquery:", "", 1)
         return fqn
 
     def _search_links(self, fqn, fields=None, search_type="target"):

@@ -170,8 +170,14 @@ def handle_doc_uploads(
     if not isinstance(uploaded_files, list):
         uploaded_files = [uploaded_files]
 
+    temp_root = os.path.realpath(tempfile.gettempdir()) + os.sep
+    upload_root = os.path.realpath(UPLOAD_DIR) + os.sep
+
     for file_obj in uploaded_files:
-        file_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+        raw_path = file_obj.name if hasattr(file_obj, "name") else str(file_obj)
+        file_path = os.path.realpath(raw_path)
+        if not file_path.startswith(temp_root):
+            continue
         if not os.path.exists(file_path):
             continue
 
@@ -191,7 +197,9 @@ def handle_doc_uploads(
         label = f"{clean_name} ({size_str})"
 
         safe_filename = f"{uuid.uuid4().hex[:8]}_{clean_name}"
-        dest_path = os.path.join(UPLOAD_DIR, safe_filename)
+        dest_path = os.path.realpath(os.path.join(UPLOAD_DIR, safe_filename))
+        if not dest_path.startswith(upload_root):
+            continue
         shutil.copy2(file_path, dest_path)
         try:
             os.chmod(dest_path, 0o600)
