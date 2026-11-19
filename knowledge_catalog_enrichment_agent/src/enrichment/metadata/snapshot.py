@@ -102,7 +102,7 @@ def download_entries(dir: pathlib.Path, dataset: str):
     )
 
     table_name, markdown = _entry_to_md(jsonpb.MessageToDict(entry._pb))
-    table_path = dir / f'{table_name}.md'
+    table_path = _safe_table_path(dir, table_name)
     table_path.write_text(markdown)
     print(f'Downloaded {table_name}')
 
@@ -130,9 +130,30 @@ def publish_entries(dir: pathlib.Path):
 def list_entries(dir: pathlib.Path):
   return [table_path.stem for table_path in dir.glob('*.md')]
 
+
+def _safe_table_path(base: pathlib.Path, table_name: str) -> pathlib.Path:
+  if (
+    not table_name
+    or '/' in table_name
+    or '\\' in table_name
+    or '\x00' in table_name
+    or table_name in ('.', '..')
+  ):
+    raise ValueError(
+      f'table_name resolves outside snapshot directory: {table_name!r}'
+    )
+  base = base.resolve()
+  path = (base / f'{table_name}.md').resolve()
+  if not path.is_relative_to(base) or path.parent != base:
+    raise ValueError(
+      f'table_name resolves outside snapshot directory: {table_name!r}'
+    )
+  return path
+
+
 def update_entry(dir: pathlib.Path, out_dir: pathlib.Path, table_name: str, content: str):
-  table_path = dir / f'{table_name}.md'
-  out_table_path = out_dir / f'{table_name}.md'
+  table_path = _safe_table_path(dir, table_name)
+  out_table_path = _safe_table_path(out_dir, table_name)
 
   entry_data = _md_to_entry(table_path.read_text())
   entry_data['aspects'][OVERVIEW_ASPECT_KEY]['data']['content'] = content
@@ -142,5 +163,5 @@ def update_entry(dir: pathlib.Path, out_dir: pathlib.Path, table_name: str, cont
 
 
 def show_entry(dir: pathlib.Path, table_name: str):
-  table_path = dir / f'{table_name}.md'
+  table_path = _safe_table_path(dir, table_name)
   print(table_path.read_text())
