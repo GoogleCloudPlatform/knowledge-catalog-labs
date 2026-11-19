@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import threading
 from typing import Any
 
@@ -27,6 +28,9 @@ from .doc_description_plugin import DocDescriptionPlugin
 from .similarity_engine import SimilarityEngine
 
 logger = logging.getLogger(__name__)
+
+_BQ_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,299}$")
+_BQ_PROJECT_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,300}$")
 
 
 class GlossaryPlugin(BasePlugin):
@@ -117,12 +121,29 @@ class GlossaryPlugin(BasePlugin):
         os.makedirs(base_dir, exist_ok=True)
         return os.path.join(base_dir, "glossary_embeddings_cache.json")
 
+    def _validated_bq_cache_table_ref(self) -> str:
+        if not isinstance(
+            self.project_id, str
+        ) or not _BQ_PROJECT_IDENT.fullmatch(self.project_id):
+            raise ValueError(
+                f"Invalid BigQuery identifier for project_id: {self.project_id!r}"
+            )
+        for name, val in (
+            ("cache_dataset_id", self.cache_dataset_id),
+            ("cache_table_id", self.cache_table_id),
+        ):
+            if not isinstance(val, str) or not _BQ_IDENT.fullmatch(val):
+                raise ValueError(
+                    f"Invalid BigQuery identifier for {name}: {val!r}"
+                )
+        return (
+            f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
+        )
+
     def _init_bq_cache_table_if_not_exists(self):
         """Creates the glossary_embeddings_cache table in BigQuery if missing."""
         client = self._bq_client
-        table_ref = (
-            f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
-        )
+        table_ref = self._validated_bq_cache_table_ref()
         try:
             client.get_table(table_ref)
         except Exception:
@@ -161,10 +182,10 @@ class GlossaryPlugin(BasePlugin):
         logger.info(
             "Local cache missing or corrupt. Reading from BigQuery cache table..."
         )
+        table_ref = self._validated_bq_cache_table_ref()
         bq_cache = {}
         try:
             self._init_bq_cache_table_if_not_exists()
-            table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
             query = (
                 f"SELECT term_id, hash_val, embedding_json FROM `{table_ref}`"
             )
@@ -209,16 +230,22 @@ class GlossaryPlugin(BasePlugin):
         if not new_entries:
             return
 
+        table_ref = self._validated_bq_cache_table_ref()
         try:
             self._init_bq_cache_table_if_not_exists()
-            table_ref = f"{self.project_id}.{self.cache_dataset_id}.{self.cache_table_id}"
 
             # First, delete existing rows for the updated terms to avoid duplicates
-            term_ids_str = ", ".join([f"'{tid}'" for tid in new_entries.keys()])
             delete_query = (
-                f"DELETE FROM `{table_ref}` WHERE term_id IN ({term_ids_str})"
+                f"DELETE FROM `{table_ref}` WHERE term_id IN UNNEST(@term_ids)"
             )
-            self._bq_client.query(delete_query).result()
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ArrayQueryParameter(
+                        "term_ids", "STRING", list(new_entries.keys())
+                    )
+                ]
+            )
+            self._bq_client.query(delete_query, job_config=job_config).result()
 
             # Insert new rows
             rows_to_insert = []
@@ -296,10 +323,18 @@ class GlossaryPlugin(BasePlugin):
 
         # 2. Try to fetch via Cloud Resource Manager API using active credentials
         try:
+            if (
+                not isinstance(self.project_id, str)
+                or not _BQ_PROJECT_IDENT.fullmatch(self.project_id)
+                or ".." in self.project_id
+            ):
+                raise ValueError(
+                    f"Invalid GCP project_id: {self.project_id!r}"
+                )
             creds = get_credentials(self.project_id)
             authed_session = AuthorizedSession(creds)
             url = f"https://cloudresourcemanager.googleapis.com/v3/projects/{self.project_id}"
-            response = authed_session.get(url)
+            response = authed_session.get(url, timeout=15)
             if response.status_code == 200:
                 project_data = response.json()
                 p_num = (

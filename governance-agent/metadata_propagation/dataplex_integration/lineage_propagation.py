@@ -13,6 +13,9 @@ from google.cloud import bigquery
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_BQ_PROJECT_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,300}$")
+_BQ_REGION_IDENT = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
 
 class SQLFetcher:
     """
@@ -51,17 +54,40 @@ class SQLFetcher:
             if "europe" in self.location:
                 region = "europe-west1"  # handle europe specific multi-region/regional variation
 
+            if not isinstance(
+                self.project_id, str
+            ) or not _BQ_PROJECT_IDENT.fullmatch(self.project_id):
+                raise ValueError(
+                    f"Invalid BigQuery identifier for project_id: {self.project_id!r}"
+                )
+            if not isinstance(region, str) or not _BQ_REGION_IDENT.fullmatch(
+                region
+            ):
+                raise ValueError(
+                    f"Invalid BigQuery identifier for region: {region!r}"
+                )
+
             query = f"""
             SELECT query
             FROM `{self.project_id}.region-{region}.INFORMATION_SCHEMA.JOBS_BY_PROJECT`
-            WHERE destination_table.table_id = '{table_id}'
-            AND destination_table.dataset_id = '{dataset_id}'
+            WHERE destination_table.table_id = @table_id
+            AND destination_table.dataset_id = @dataset_id
             AND statement_type IN ('CREATE_TABLE_AS_SELECT', 'INSERT', 'MERGE', 'UPDATE')
             ORDER BY creation_time DESC
             LIMIT 1
             """
+            job_config = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "table_id", "STRING", table_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "dataset_id", "STRING", dataset_id
+                    ),
+                ]
+            )
             try:
-                query_job = self.client.query(query)
+                query_job = self.client.query(query, job_config=job_config)
                 results = list(query_job.result())
                 if results:
                     sql_query = results[0].query
@@ -187,12 +213,13 @@ class TransformationEnricher:
 
         # Look for SELECT ... AS target_col or SELECT target_col AS ...
         # New pattern: ALSO match 'SELECT ... {target_col},' or 'SELECT ... {target_col} FROM' handles passthrough
-        pattern_as = rf"([^,]*?)\s+as\s+`?\b{target_col}\b`?"
+        escaped_col = re.escape(target_col)
+        pattern_as = rf"([^,]*?)\s+as\s+`?\b{escaped_col}\b`?"
         match = re.search(pattern_as, sql_clean, re.IGNORECASE)
 
         if not match:
             # Fallback for simple passthrough (no AS): SELECT col, or SELECT ... , col, or SELECT col FROM
-            pattern_passthrough = rf"(\b{target_col}\b)(?:,|$|\s+FROM)"
+            pattern_passthrough = rf"(\b{escaped_col}\b)(?:,|$|\s+FROM)"
             match = re.search(pattern_passthrough, sql_clean, re.IGNORECASE)
 
         if match:
@@ -397,6 +424,18 @@ class LineageGraphTraverser:
                     credentials.refresh(auth_req)
                     token = credentials.token
 
+        if (
+            not isinstance(self.location, str)
+            or not re.fullmatch(r"[a-z][a-z0-9-]{0,62}", self.location)
+        ):
+            raise ValueError(f"Invalid GCP location: {self.location!r}")
+        if (
+            not isinstance(self.project_id, str)
+            or not _BQ_PROJECT_IDENT.fullmatch(self.project_id)
+            or ".." in self.project_id
+        ):
+            raise ValueError(f"Invalid GCP project_id: {self.project_id!r}")
+
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=UTF-8",
@@ -409,7 +448,7 @@ class LineageGraphTraverser:
         if fields:
             body[search_type]["field"] = fields
 
-        response = requests.post(url, headers=headers, json=body)
+        response = requests.post(url, headers=headers, json=body, timeout=30)
         response.raise_for_status()
         return response.json().get("links", [])
 

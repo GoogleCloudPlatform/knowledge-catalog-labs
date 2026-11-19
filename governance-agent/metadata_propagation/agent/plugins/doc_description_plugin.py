@@ -300,14 +300,45 @@ class DocDescriptionPlugin(BasePlugin):
             }
         return None
 
-    def _query_datastore(self, query: str) -> str:
-        """Queries the Vertex AI Search DataStore using REST API."""
-        import google.auth
-        from google.auth.transport.requests import AuthorizedSession
+    def _build_datastore_search_url(self) -> str:
+        import re
 
         project_id = self.project_id
         location = "global"
         datastore_id = self.datastore_id
+
+        if (
+            not isinstance(project_id, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,300}", project_id)
+            or ".." in project_id
+        ):
+            raise ValueError(f"Invalid GCP project_id: {project_id!r}")
+
+        if not isinstance(datastore_id, str) or not datastore_id:
+            raise ValueError(f"Invalid datastore_id: {datastore_id!r}")
+
+        if datastore_id.startswith("projects/"):
+            full_path_re = re.compile(
+                r"^projects/[A-Za-z0-9_.:-]+/locations/[a-z0-9-]+(?:/collections/[A-Za-z0-9_-]+)?/dataStores/[A-Za-z0-9_.-]+$"
+            )
+            if not full_path_re.fullmatch(datastore_id) or ".." in datastore_id:
+                raise ValueError(
+                    f"Invalid datastore resource path: {datastore_id!r}"
+                )
+            return f"https://discoveryengine.googleapis.com/v1/{datastore_id}/servingConfigs/default_search:search"
+
+        if (
+            not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", datastore_id)
+            or ".." in datastore_id
+        ):
+            raise ValueError(f"Invalid datastore_id: {datastore_id!r}")
+        return f"https://discoveryengine.googleapis.com/v1/projects/{project_id}/locations/{location}/collections/default_collection/dataStores/{datastore_id}/servingConfigs/default_search:search"
+
+    def _query_datastore(self, query: str) -> str:
+        """Queries the Vertex AI Search DataStore using REST API."""
+        from google.auth.transport.requests import AuthorizedSession
+
+        url = self._build_datastore_search_url()
 
         # Use thread-local storage for session to reuse connections
         if not hasattr(self._thread_local, "session"):
@@ -316,12 +347,6 @@ class DocDescriptionPlugin(BasePlugin):
 
         authed_session = self._thread_local.session
 
-        # Handle full resource path vs short ID
-        if datastore_id.startswith("projects/"):
-            url = f"https://discoveryengine.googleapis.com/v1/{datastore_id}/servingConfigs/default_search:search"
-        else:
-            url = f"https://discoveryengine.googleapis.com/v1/projects/{project_id}/locations/{location}/collections/default_collection/dataStores/{datastore_id}/servingConfigs/default_search:search"
-
         payload = {
             "query": query,
             "pageSize": 10,  # Increase page size to get more snippets across results
@@ -329,7 +354,7 @@ class DocDescriptionPlugin(BasePlugin):
         }
 
         try:
-            response = authed_session.post(url, json=payload)
+            response = authed_session.post(url, json=payload, timeout=30)
             if response.status_code == 200:
                 data = response.json()
                 results = data.get("results", [])
@@ -374,22 +399,15 @@ class DocDescriptionPlugin(BasePlugin):
         """Verifies that the DataStore exists by making a simple search call."""
         from google.auth.transport.requests import AuthorizedSession
 
-        project_id = self.project_id
-        location = "global"
-        datastore_id = self.datastore_id
+        url = self._build_datastore_search_url()
 
         credentials = get_credentials(self.project_id)
         authed_session = AuthorizedSession(credentials)
 
-        if datastore_id.startswith("projects/"):
-            url = f"https://discoveryengine.googleapis.com/v1/{datastore_id}/servingConfigs/default_search:search"
-        else:
-            url = f"https://discoveryengine.googleapis.com/v1/projects/{project_id}/locations/{location}/collections/default_collection/dataStores/{datastore_id}/servingConfigs/default_search:search"
-
         payload = {"query": "test", "pageSize": 1}
 
         try:
-            response = authed_session.post(url, json=payload)
+            response = authed_session.post(url, json=payload, timeout=30)
             if response.status_code == 200:
                 return True
             elif response.status_code == 404:

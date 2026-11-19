@@ -17,9 +17,12 @@ KB_ROOT = pathlib.Path('.').resolve()
 def _safe_path(path: str) -> pathlib.Path:
   '''Ensure the path is within the KB_ROOT to prevent directory traversal.
   '''
-  clean_path = path.lstrip('/')
-  full_path = (KB_ROOT / clean_path).resolve()
-  if not str(full_path).startswith(str(KB_ROOT)):
+  if '\x00' in path:
+    raise ValueError(f'Access denied: Path "{path}" is outside the knowledge base root.')
+  kb_root = KB_ROOT.resolve()
+  clean_path = path.replace('\\', '/').lstrip('/')
+  full_path = (kb_root / clean_path).resolve()
+  if not full_path.is_relative_to(kb_root):
     raise ValueError(f'Access denied: Path "{path}" is outside the knowledge base root.')
   return full_path
 
@@ -35,10 +38,13 @@ def list_contents(path: str = '') -> str:
   if not target_dir or not target_dir.exists() or not target_dir.is_dir():
     return f'Path not found or is not a directory: {path}'
 
+  kb_root = KB_ROOT.resolve()
   lines = []
   for item in target_dir.iterdir():
+    if not item.resolve().is_relative_to(kb_root):
+      continue
     item_type = 'directory' if item.is_dir() else 'file'
-    item_path = str(item.relative_to(KB_ROOT))
+    item_path = str(item.relative_to(kb_root))
     lines.append(f'{item.name} | {item_path} | {item_type}')
   return '\n'.join(lines)
 
@@ -76,6 +82,7 @@ def search_content(query: str, path: str = '') -> t.List[t.Dict[str, t.Any]]:
   except re.error as e:
     return f'Invalid query: {e}'
 
+  kb_root = KB_ROOT.resolve()
   files_to_search = []
   if target_path.is_file():
     if target_path.suffix == '.md':
@@ -84,7 +91,9 @@ def search_content(query: str, path: str = '') -> t.List[t.Dict[str, t.Any]]:
     for root, _, files in os.walk(target_path):
       for file in files:
         if file.endswith('.md'):
-          files_to_search.append(pathlib.Path(root) / file)
+          candidate = (pathlib.Path(root) / file).resolve()
+          if candidate.is_relative_to(kb_root):
+            files_to_search.append(candidate)
 
   for file_path in files_to_search:
     try:
@@ -92,7 +101,7 @@ def search_content(query: str, path: str = '') -> t.List[t.Dict[str, t.Any]]:
         for line_num, line in enumerate(f, 1):
           if pattern.search(line):
             results.append({
-              'file': str(file_path.relative_to(KB_ROOT)),
+              'file': str(file_path.relative_to(kb_root)),
               'line': line_num,
               'content': line.strip()
             })

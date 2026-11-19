@@ -62,7 +62,7 @@ class LineagePlugin(BasePlugin):
 
         if not self._description_propagator:
             self._description_propagator = DescriptionPropagator(
-                self.knowledge_json_path
+                self.project_id, self.location, credentials=creds
             )
 
         if not self._sql_fetcher:
@@ -168,12 +168,12 @@ class LineagePlugin(BasePlugin):
         source = sources[0]  # Default to best by confidence
         if logic:
             logic_lower = logic.lower()
+            import re
+
             for s in sources:
                 src_col = s["source_column"].lower()
                 # Check for exact word match in logic
-                import re
-
-                if re.search(rf"\b{src_col}\b", logic_lower):
+                if re.search(rf"\b{re.escape(src_col)}\b", logic_lower):
                     source = s
                     source["confidence"] = max(source["confidence"], 0.7)
                     break

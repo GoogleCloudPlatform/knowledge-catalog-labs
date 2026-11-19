@@ -1,4 +1,5 @@
 import logging
+import re
 from typing import Any
 
 from google.adk.plugins.base_plugin import BasePlugin
@@ -8,6 +9,12 @@ from google.protobuf.json_format import MessageToDict
 from .context import get_credentials
 
 logger = logging.getLogger(__name__)
+
+# BigQuery standard identifier: letter/underscore then up to 299 word chars.
+# Used to reject lineage-derived values before they reach an f-string query.
+_BQ_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,299}$")
+# GCP project IDs may also contain hyphens and domain prefixes (e.g. org.com:id).
+_BQ_PROJECT_IDENT = re.compile(r"^[A-Za-z0-9_.:-]{1,300}$")
 
 
 class DQPlugin(BasePlugin):
@@ -41,11 +48,30 @@ class DQPlugin(BasePlugin):
         """
         Lightweight fallback to check completeness via BQ query.
         """
+        # `dataset_id`, `table_name` and especially `column_name` can arrive
+        # from Data Lineage `source.field[]` values that any principal with
+        # `datalineage.lineageEvents.create` may register. They must not be
+        # interpolated into SQL unless they are strict BigQuery identifiers.
+        if not isinstance(
+            self.project_id, str
+        ) or not _BQ_PROJECT_IDENT.fullmatch(self.project_id):
+            raise ValueError(
+                f"Invalid BigQuery identifier for project_id: {self.project_id!r}"
+            )
+        for name, val in (
+            ("dataset_id", dataset_id),
+            ("table_name", table_name),
+            ("column_name", column_name),
+        ):
+            if not isinstance(val, str) or not _BQ_IDENT.fullmatch(val):
+                raise ValueError(
+                    f"Invalid BigQuery identifier for {name}: {val!r}"
+                )
         client = self._get_bq_client()
         query = f"""
-        SELECT 
+        SELECT
             COUNT(*) as total,
-            COUNT({column_name}) as non_null
+            COUNT(`{column_name}`) as non_null
         FROM `{self.project_id}.{dataset_id}.{table_name}`
         """
         try:

@@ -21,6 +21,11 @@ COPY metadata_propagation/ ./metadata_propagation/
 COPY glossary_terms.json knowledge_insights.json ./
 COPY unstructured_docs/ ./unstructured_docs/
 
+# Run as a non-root user while keeping /app writable for local cache fallback
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 # Cloud Run defaults: listens on port 8080 (passed via PORT env var)
 ENV PORT=8080
 ENV HOST=0.0.0.0
