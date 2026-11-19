@@ -44,17 +44,18 @@ else
 fi
 
 # 3. Extract environment variables from .env if present
-ENV_VARS_FLAG=""
+ENV_VARS_ARGS=()
+ENV_VARS=""
 if [ -f .env ]; then
   echo "📝 Extracting environment variables from .env..."
-  ENV_VARS=$(grep -v '^#' .env | grep -v '^\s*$' | while read -r line; do
+  ENV_VARS=$(grep -v '^#' .env | grep -v '^\s*$' | while IFS= read -r line; do
     if [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
       echo "$line"
     fi
   done | tr '\n' ',' | sed 's/,$//')
 
   if [ -n "$ENV_VARS" ]; then
-    ENV_VARS_FLAG="--set-env-vars=${ENV_VARS}"
+    ENV_VARS_ARGS=("--set-env-vars=${ENV_VARS}")
   fi
 fi
 
@@ -77,7 +78,7 @@ gcloud run deploy "${SERVICE_NAME}" \
   --port=8080 \
   --memory=2Gi \
   --cpu=2 \
-  ${ENV_VARS_FLAG} \
+  "${ENV_VARS_ARGS[@]}" \
   --allow-unauthenticated
 
 echo "✅ Deployment successful!"

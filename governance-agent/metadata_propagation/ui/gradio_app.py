@@ -178,7 +178,7 @@ def handle_doc_uploads(
         file_path = os.path.realpath(raw_path)
         if not file_path.startswith(temp_root):
             continue
-        if not os.path.exists(file_path):
+        if not os.path.isfile(file_path):
             continue
 
         orig_name = os.path.basename(file_path)
@@ -286,12 +286,24 @@ def clear_all_docs(context_mode):
 def get_active_doc_paths(docs_state: list | None, selected_labels: list | None) -> list[str] | None:
     if not docs_state or not selected_labels:
         return None
+    import pathlib
+
+    upload_root = pathlib.Path(UPLOAD_DIR).resolve()
     selected_set = set(selected_labels)
-    active_paths = [
-        d["path"]
-        for d in docs_state
-        if d.get("label") in selected_set and d.get("path") and os.path.exists(d["path"])
-    ]
+    active_paths = []
+    for d in docs_state:
+        if not isinstance(d, dict) or d.get("label") not in selected_set:
+            continue
+        raw_path = d.get("path")
+        if not isinstance(raw_path, str) or not raw_path or "\x00" in raw_path:
+            continue
+        resolved = pathlib.Path(raw_path).resolve()
+        if (
+            resolved.is_relative_to(upload_root)
+            and resolved.is_file()
+            and resolved.suffix.lower() in ALLOWED_DOC_EXTENSIONS
+        ):
+            active_paths.append(str(resolved))
     return active_paths if active_paths else None
 
 
@@ -2137,13 +2149,21 @@ def create_app():
             and request.url.path.startswith(_SESSION_REQUIRED_PREFIXES)
             and token_dict is None
         ):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=401,
                 content={
                     "detail": "Authentication required: valid Google OAuth session missing."
                 },
             )
-        return await call_next(request)
+        else:
+            response = await call_next(request)
+
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+        response.headers.setdefault(
+            "Referrer-Policy", "strict-origin-when-cross-origin"
+        )
+        return response
 
     session_secret = os.environ.get("SESSION_SECRET_KEY")
     if not session_secret:
@@ -2152,12 +2172,21 @@ def create_app():
             "will not survive restarts or be shared across instances."
         )
         session_secret = secrets.token_urlsafe(32)
+    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "").strip().lower()
+    https_only = (
+        os.environ.get("SESSION_COOKIE_SECURE", "").strip().lower() == "true"
+        or redirect_uri.startswith("https://")
+        or bool(os.environ.get("K_SERVICE"))
+    )
     # Added after the auth middleware so it wraps it (outermost) and the
     # session is populated before enforce_oauth_middleware runs.
     main_app.add_middleware(
         SessionMiddleware,
         secret_key=session_secret,
         session_cookie="steward_session",
+        https_only=https_only,
+        same_site="lax",
+        max_age=8 * 3600,
     )
 
     @main_app.get("/google_login")
@@ -2186,7 +2215,7 @@ def create_app():
 
     @main_app.get("/logout")
     async def logout(request: fastapi.Request):
-        request.session.pop("google_token", None)
+        request.session.clear()
         return RedirectResponse(url="/")
 
     return gr.mount_gradio_app(main_app, demo, path="/")

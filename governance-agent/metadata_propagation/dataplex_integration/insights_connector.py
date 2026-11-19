@@ -17,11 +17,20 @@ class DataInsightsClient:
     Supports both Table-level and Dataset-level insights.
     """
 
-    def __init__(self, project_id: str, location: str = "europe-west1"):
+    def __init__(
+        self,
+        project_id: str,
+        location: str = "europe-west1",
+        credentials: Any | None = None,
+    ):
         self.project_id = project_id
         self.location = location
-        self.dataplex_client = dataplex_v1.DataScanServiceClient()
-        self.bq_client = bigquery.Client(project=project_id)
+        self.dataplex_client = dataplex_v1.DataScanServiceClient(
+            credentials=credentials
+        )
+        self.bq_client = bigquery.Client(
+            project=project_id, credentials=credentials
+        )
 
     def _get_resource_fqn(
         self, dataset_id: str, table_id: str | None = None

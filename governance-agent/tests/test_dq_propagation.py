@@ -125,6 +125,68 @@ class TestDQPropagation(unittest.TestCase):
         trend = self.engine.get_trend(fqn, col)
         self.assertEqual(trend, "stable")
 
+    @patch.object(DQPlugin, "_get_bq_client")
+    def test_check_completeness_bq_valid_identifiers(self, mock_get_bq_client):
+        mock_client = mock_get_bq_client.return_value
+        mock_row = MagicMock(total=10, non_null=8)
+        mock_client.query.return_value.result.return_value = [mock_row]
+
+        score = self.dq_plugin._check_completeness_bq(
+            "retail_ds", "orders_2026", "order_amount"
+        )
+
+        self.assertEqual(score, 0.8)
+        mock_client.query.assert_called_once()
+        sql = mock_client.query.call_args[0][0]
+        self.assertIn("COUNT(`order_amount`) as non_null", sql)
+        self.assertIn("FROM `test-project.retail_ds.orders_2026`", sql)
+
+    @patch.object(DQPlugin, "_get_bq_client")
+    def test_check_completeness_bq_rejects_sqli_and_invalid_identifiers(
+        self, mock_get_bq_client
+    ):
+        invalid_cases = [
+            # SQLi payloads in column_name (lineage source.field[] vector)
+            ("ds", "tab", "1) FROM `p.d.secret`; DROP TABLE x; --"),
+            ("ds", "tab", "col`) UNION SELECT 1, 1 --"),
+            ("ds", "tab", "col; SELECT 1"),
+            ("ds", "tab", "col\n--"),
+            # SQLi payloads in table_name and dataset_id
+            ("ds", "tab` UNION ALL SELECT 1, 1 --", "col"),
+            ("ds`; DROP TABLE x; --", "tab", "col"),
+            # Boundary and type checks
+            ("ds", "tab", ""),
+            ("ds", "tab", "1invalid_leading_digit"),
+            ("ds", "tab", "a" * 301),
+            ("ds", "tab", "has-hyphen"),
+            ("ds", "tab", None),
+        ]
+
+        for ds, tab, col in invalid_cases:
+            with self.subTest(dataset_id=ds, table_name=tab, column_name=col):
+                with self.assertRaises(ValueError):
+                    self.dq_plugin._check_completeness_bq(ds, tab, col)
+
+        bad_project_plugin = DQPlugin("proj`; DROP TABLE x; --", self.location)
+        with self.assertRaises(ValueError):
+            bad_project_plugin._check_completeness_bq("ds", "tab", "col")
+
+        mock_get_bq_client.assert_not_called()
+
+    @patch.object(DQPlugin, "_get_bq_client")
+    @patch.object(DQPlugin, "get_latest_profile_job", return_value=None)
+    @patch.object(DQPlugin, "get_latest_dq_job", return_value=None)
+    def test_fetch_dq_summary_bq_fallback_blocks_injection(
+        self, mock_dq, mock_profile, mock_get_bq_client
+    ):
+        with self.assertRaises(ValueError):
+            self.dq_plugin.fetch_dq_summary(
+                "retail_ds",
+                "orders",
+                "id) FROM `p.d.t` WHERE 1=1 --",
+            )
+        mock_get_bq_client.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

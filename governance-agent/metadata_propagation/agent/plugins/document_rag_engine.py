@@ -167,6 +167,7 @@ class DocumentRAGEngine:
     def _extract_text_via_gemini(self, file_path: str, force_refresh: bool = False) -> str:
         """Uses Gemini to extract text and format as Markdown, with hash-based caching."""
         import hashlib
+        import pathlib
         import re
 
         try:
@@ -176,19 +177,24 @@ class DocumentRAGEngine:
             logger.error(f"Failed to read file: {e}")
             return ""
 
-        # Calculate hash
-        file_hash = hashlib.md5(file_bytes).hexdigest()
+        # Calculate cryptographic hash for cache keying
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
 
         # Cache directory in system temp directory (/tmp/governance_agent_rag_cache)
         cache_dir = os.path.join(tempfile.gettempdir(), "governance_agent_rag_cache")
         os.makedirs(cache_dir, exist_ok=True)
+        try:
+            os.chmod(cache_dir, 0o700)
+        except Exception:
+            pass
+        cache_root = pathlib.Path(cache_dir).resolve()
 
         # Automated TTL purge: remove cached files older than 30 days
         now_ts = time.time()
         ttl_sec = 30 * 86400
         for c_file in os.listdir(cache_dir):
             c_path = os.path.join(cache_dir, c_file)
-            if os.path.isfile(c_path):
+            if os.path.isfile(c_path) and not os.path.islink(c_path):
                 try:
                     if now_ts - os.path.getmtime(c_path) > ttl_sec:
                         os.remove(c_path)
@@ -198,21 +204,30 @@ class DocumentRAGEngine:
 
         raw_base = os.path.basename(file_path)
         clean_base = re.sub(r"^[0-9a-f]{8}_", "", raw_base)
-        cached_path = os.path.join(cache_dir, f"{clean_base}.{file_hash}.md")
+        clean_base = re.sub(r"[^a-zA-Z0-9._-]", "_", clean_base) or "doc"
+        cached_path_obj = (cache_root / f"{clean_base}.{file_hash}.md").resolve()
+        if not cached_path_obj.is_relative_to(cache_root):
+            raise ValueError(f"Cache path resolves outside cache directory: {raw_base!r}")
+        cached_path = str(cached_path_obj)
 
-        # Check clean_base cache path or any existing cache file with the same MD5 hash
+        # Check clean_base cache path or any existing cache file with the same SHA-256 hash
         if not force_refresh:
-            if os.path.exists(cached_path):
+            if cached_path_obj.is_file() and not cached_path_obj.is_symlink():
                 logger.info(f"Found cached Markdown file: {cached_path}")
                 with open(cached_path, encoding="utf-8") as f:
                     return f.read()
             # Also check if any file ending with .{file_hash}.md exists in cache_dir
             for c_file in os.listdir(cache_dir):
                 if c_file.endswith(f".{file_hash}.md"):
-                    found_c_path = os.path.join(cache_dir, c_file)
-                    logger.info(f"Found cached Markdown file by hash: {found_c_path}")
-                    with open(found_c_path, encoding="utf-8") as f:
-                        return f.read()
+                    found_c_path_obj = (cache_root / c_file).resolve()
+                    if (
+                        found_c_path_obj.is_relative_to(cache_root)
+                        and found_c_path_obj.is_file()
+                        and not found_c_path_obj.is_symlink()
+                    ):
+                        logger.info(f"Found cached Markdown file by hash: {found_c_path_obj}")
+                        with open(found_c_path_obj, encoding="utf-8") as f:
+                            return f.read()
 
         logger.info(
             f"Extracting structured governance data via Gemini: {file_path}"
@@ -271,6 +286,10 @@ class DocumentRAGEngine:
             try:
                 with open(cached_path, "w", encoding="utf-8") as f:
                     f.write(response.text)
+                try:
+                    os.chmod(cached_path, 0o600)
+                except Exception:
+                    pass
                 logger.info(f"Saved cached Markdown file: {cached_path}")
             except Exception as e:
                 logger.warning(f"Failed to save cache file: {e}")

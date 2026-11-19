@@ -115,5 +115,57 @@ class TestSQLEnrichment(unittest.TestCase):
         self.assertNotIn("logic: `amount_taxed`", enriched)
 
 
+class TestSQLFetcherSecurity(unittest.TestCase):
+    @unittest.mock.patch(
+        "metadata_propagation.dataplex_integration.lineage_propagation.bigquery.Client"
+    )
+    def test_get_transformation_sql_uses_query_parameters(self, mock_bq_cls):
+        from metadata_propagation.dataplex_integration.lineage_propagation import (
+            SQLFetcher,
+        )
+
+        mock_client = mock_bq_cls.return_value
+        mock_row = MagicMock(query="SELECT 1")
+        mock_client.query.return_value.result.return_value = [mock_row]
+
+        fetcher = SQLFetcher("test-project", "europe-west1")
+        payload_table = "tab' OR 1=1 --"
+        payload_dataset = "ds'; DROP TABLE x; --"
+
+        result = fetcher.get_transformation_sql(payload_dataset, payload_table)
+
+        self.assertEqual(result, "SELECT 1")
+        mock_client.query.assert_called_once()
+        sql = mock_client.query.call_args[0][0]
+        job_config = mock_client.query.call_args[1]["job_config"]
+        self.assertIn("destination_table.table_id = @table_id", sql)
+        self.assertIn("destination_table.dataset_id = @dataset_id", sql)
+        self.assertNotIn(payload_table, sql)
+        self.assertNotIn(payload_dataset, sql)
+        params = {p.name: p.value for p in job_config.query_parameters}
+        self.assertEqual(params["table_id"], payload_table)
+        self.assertEqual(params["dataset_id"], payload_dataset)
+
+    @unittest.mock.patch(
+        "metadata_propagation.dataplex_integration.lineage_propagation.bigquery.Client"
+    )
+    def test_get_transformation_sql_rejects_invalid_project_and_region(
+        self, mock_bq_cls
+    ):
+        from metadata_propagation.dataplex_integration.lineage_propagation import (
+            SQLFetcher,
+        )
+
+        bad_project = SQLFetcher("proj`; DROP TABLE x; --", "us-central1")
+        with self.assertRaises(ValueError):
+            bad_project.get_transformation_sql("ds", "tab")
+
+        bad_region = SQLFetcher("test-project", "us`; DROP TABLE x; --")
+        with self.assertRaises(ValueError):
+            bad_region.get_transformation_sql("ds", "tab")
+
+        mock_bq_cls.return_value.query.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
