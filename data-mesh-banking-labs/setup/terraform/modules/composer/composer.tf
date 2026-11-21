@@ -72,6 +72,17 @@ resource "google_compute_subnetwork" "composer_subnet" {
   region        = var.location
   network       = var.network_id
 
+  secondary_ip_range {
+    range_name    = "composer-pods"
+    ip_cidr_range = "10.3.0.0/16"
+  }
+
+  secondary_ip_range {
+    range_name    = "composer-services"
+    ip_cidr_range = "10.4.0.0/20"
+  }
+
+  private_ip_google_access = true
 }
 
 resource "google_service_account" "composer_service_account" {
@@ -133,7 +144,7 @@ resource "google_composer_environment" "composer_env" {
   config {
 
     software_config {
-      image_version = "composer-2.1.5-airflow-2.3.4"
+      image_version = "composer-2.9.10-airflow-2.9.3"
       #"composer-2.0.7-airflow-2.2.3"
 
       pypi_packages = {
@@ -226,34 +237,15 @@ resource "google_composer_environment" "composer_env" {
       }
     }
 
-    # this is designed to be the smallest cheapest Composer for demo purposes
-    workloads_config {
-      scheduler {
-        cpu        = 4
-        memory_gb  = 10
-        storage_gb = 10
-        count      = 1
-      }
-      web_server {
-        cpu        = 0.5
-        memory_gb  = 1
-        storage_gb = 1
-      }
-      worker {
-        cpu        = 2
-        memory_gb  = 10
-        storage_gb = 10
-        min_count  = 1
-        max_count  = 4
-      }
-    }
-
-    environment_size = "ENVIRONMENT_SIZE_SMALL"
-
     node_config {
       network         = var.network_id
       subnetwork      = google_compute_subnetwork.composer_subnet.id
       service_account = google_service_account.composer_service_account.name
+
+      ip_allocation_policy {
+        cluster_secondary_range_name  = "composer-pods"
+        services_secondary_range_name = "composer-services"
+      }
     }
   }
 
